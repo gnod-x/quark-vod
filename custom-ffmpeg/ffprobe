@@ -60,7 +60,7 @@ while [[ $# -gt 0 ]]; do
       # 动态点播流前置穿透：如果探测目标是 8099 pending 端点，先触发转存并解析出真实直链
       # 确保探针探测到的是最终真实媒体格式，并将结果准确绑定到静态直链缓存
       if [[ "$target" =~ :8099/pending ]] || [[ "$target" =~ /pending\? ]]; then
-        real_url=$(/usr/bin/curl -s -r 0-0 -L -m 30 -o /dev/null -w '%{url_effective}' "$target")
+        real_url=$(/usr/bin/curl -s -r 0-0 -L -m 55 -o /dev/null -w '%{url_effective}' "$target")
         if [[ -n "$real_url" ]] && [[ "$real_url" =~ ^https?:// ]] && [[ ! "$real_url" =~ /pending ]]; then
           target="$real_url"
         fi
