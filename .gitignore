@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.bak*
+.env
+cinema2
+jellyfin2
+data
+logs
+openlist

@@ -1,0 +1,137 @@
+#!/bin/bash
+# Wrapper for Jellyfin FFmpeg to stabilize network stream playback
+# - STRM 直链解析
+# - HTTP 输入注入 reconnect 保活参数
+# - 强制收敛 analyzeduration/probesize（Jellyfin 默认 200M/1G 过大，拖慢网盘流起播）
+
+args=()
+http_input_seen=false
+input_seen=false
+pending_input_format=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -i)
+      target="$2"
+      clean_target=$(echo "$target" | tr -d '"')
+      # STRM 直链解析：读取首行 URL 替代本地路径
+      if [[ "$clean_target" =~ \.strm$ ]] && [ -f "$clean_target" ]; then
+        url=$(head -n 1 "$clean_target" | tr -d '\r\n')
+        if [[ "$url" =~ ^https?:// ]]; then
+          target="$url"
+        fi
+      fi
+
+      # HTTP 输入注入 reconnect 保活（网盘流抗抖动）
+      # ⚠️ 严禁加入 -reconnect_at_eof 1：cinema2 的 CMS 点播源是 PLAYLIST-TYPE:VOD
+      # 的有限长度 m3u8（播完即 EOF）。at_eof 的语义是"读到 EOF 后重连继续读"，
+      # 对直播流是保活，对 VOD 流则变成永远等待不存在的下一个分片——
+      # 2026-10-15 实测：加上它 ffprobe/ffmpeg 40s+ 无输出直至被 timeout 杀死
+      # （stdout 0 字节），去掉后 9s 正常返回 3345B。这是《八佰》《非常杀手》
+      # 点播播放失败的根因（详见 CLAUDE.md 红线 #10 补充）。
+      if [[ "$target" =~ ^https?:// ]] && [[ "$http_input_seen" == "false" ]]; then
+        args+=( "-reconnect" "1" "-reconnect_streamed" "1" \
+                "-reconnect_on_network_error" "1" "-reconnect_delay_max" "5" \
+                "-thread_queue_size" "8192" )
+        http_input_seen=true
+      fi
+
+      # 动态点播流前置穿透：如果输入是 8099 的 pending 拦截服务，直接解析出真实直链
+      # 解决 FFmpeg 内部处理 302 重定向时的 demuxer 报错与 Range 请求丢失
+      if [[ "$target" =~ :8099/pending ]] || [[ "$target" =~ /pending\? ]]; then
+        real_url=$(/usr/bin/curl -s -r 0-0 -L -m 30 -o /dev/null -w '%{url_effective}' "$target")
+        if [[ -n "$real_url" ]] && [[ "$real_url" =~ ^https?:// ]] && [[ ! "$real_url" =~ /pending ]]; then
+          target="$real_url"
+        fi
+      fi
+
+      # 消费前面挂起的首个输入格式：
+      #   HTTP 输入 → 丢弃（无论是 hls 还是 matroska，8099 返回 302 或格式错配会导致秒退 exit 183，ffmpeg 原生自动探测最可靠）
+      #   本地文件 → 保留原语义
+      if [[ -n "$pending_input_format" ]]; then
+        if [[ ! "$target" =~ ^https?:// ]]; then
+          args+=("-f" "$pending_input_format")
+        fi
+        pending_input_format=""
+      fi
+
+      # 混淆文件头（图种伪装）底层自适应防御：
+      # 若目标是以 8 字节 PNG 伪装开头（89504e470d0a1a0a），强制注入 -f matroska/mp4 -skip_initial_bytes 8，
+      # 杜绝 FFmpeg 原生 png_pipe 解复用器误判卡死与内存狂飙。
+      if [[ "$target" =~ ^https?:// ]] && [[ ! "$target" =~ /clean\? ]]; then
+        head_hex=$(/usr/bin/curl -s -r 0-23 -m 2 "$target" 2>/dev/null | od -A n -t x1 2>/dev/null | tr -d ' \n')
+        if [[ "$head_hex" =~ ^89504e470d0a1a0a ]]; then
+          if [[ "$head_hex" =~ 66747970 ]]; then
+            args+=( "-f" "mp4" "-skip_initial_bytes" "8" )
+          else
+            args+=( "-f" "matroska" "-skip_initial_bytes" "8" )
+          fi
+        fi
+      fi
+
+      args+=("-i" "$target")
+      input_seen=true
+      shift 2
+      ;;
+    -f)
+      # ⚠️ 严禁对 HTTP 输入透传输入格式（2026-10-16 修复 -f hls，2026-10-17 扩展为通用输入保护）
+      #
+      # 背景：Jellyfin 对 strm 直链会下发 `-f <format> -i <url>`（把 -f 放在 -i 之前）。
+      # 当 target 是 HTTP（如 8099 返回 302），强加输入格式会导致 demuxer 报错崩溃。
+      # FFmpeg 自身的输入探测极其可靠，无需显式指定输入 -f。
+      #
+      # 注意：命令里通常有两处 -f——一处在首个 -i 之前（输入格式，需对 HTTP 丢弃），
+      # 一处在 -i 之后（HLS 输出格式，必须保留）。故按 input_seen 区分：
+      #   - 见到 -i 之前 → 暂存输入格式（pending_input_format），待 -i 时决策
+      #   - 见到 -i 之后 → 属输出格式，原样保留
+      if [[ "$input_seen" == "false" ]]; then
+        pending_input_format="$2"
+      else
+        args+=("-f" "$2")
+      fi
+      shift 2
+      ;;
+    -analyzeduration)
+      # 收敛过大的探测时间（Jellyfin 默认 200M）。
+      # 2026-10-14 实测：2M 与 32M 识别到的流数完全一致（跨 7 类样本验证），
+      # 但耗时从 6.70s 降至 0.85s——这是 HLS 首片慢的主因。
+      args+=("-analyzeduration" "2M")
+      shift 2
+      ;;
+    -probesize)
+      # 收敛过大的探测尺寸（Jellyfin 默认 1G）。同上，2M 为黄金值。
+      args+=("-probesize" "2M")
+      shift 2
+      ;;
+    -readrate)
+      # 丢弃 readrate 限速（Jellyfin 默认 10）。
+      # 2026-10-14 实测：readrate 会把转码锁在 ~1x 实时，首片因此被迫等满 2s 才写出。
+      # 去掉后首片从 1.83s 降至 1.50s 且更稳定（方差明显减小）。
+      # 风险说明：readrate 本用于防止大文件转码内存爆炸，但 HLS 分片模式下
+      # ffmpeg 是边读边写边丢弃，内存由 max_muxing_queue_size 约束，不会无限增长。
+      shift 2
+      ;;
+    -readrate_catchup)
+      # readrate 的配套参数，一并丢弃
+      shift 2
+      ;;
+    -to)
+      args+=("-to" "$2")
+      shift 2
+      ;;
+    -hls_time)
+      args+=("-hls_time" "$2")
+      shift 2
+      ;;
+    -max_delay)
+      args+=("-max_delay" "$2")
+      shift 2
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+exec /usr/lib/jellyfin-ffmpeg/ffmpeg "${args[@]}"

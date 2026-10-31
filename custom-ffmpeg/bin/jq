@@ -1,0 +1,6 @@
+#!/bin/sh
+# Wrapper: 让自带 jq 无需 LD_LIBRARY_PATH 即可运行
+# 官方 jellyfin 镜像无 jq，此处提供自包含运行环境（详见 CLAUDE.md 红线 #10）
+DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export LD_LIBRARY_PATH="$DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$DIR/jq-bin" "$@"

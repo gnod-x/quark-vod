@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Quark-VOD Engine · 白盒管理控制台</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --err: #ef4444;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 20px;
+      line-height: 1.5;
+    }
+    .container { max-width: 1320px; margin: 0 auto; }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding-bottom: 16px;
+      margin-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 { font-size: 1.35rem; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+    .badge {
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+    .badge-ok { background: rgba(34,197,94,0.18); color: #4ade80; border: 1px solid rgba(34,197,94,0.35); }
+    .badge-err { background: rgba(239,68,68,0.18); color: #f87171; border: 1px solid rgba(239,68,68,0.35); }
+    .badge-warn { background: rgba(245,158,11,0.18); color: #fbbf24; border: 1px solid rgba(245,158,11,0.35); }
+    .nav-links { display: flex; gap: 10px; align-items: center; }
+    .btn {
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      padding: 7px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 500;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn:hover { opacity: 0.92; }
+    .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    .btn-sm { padding: 4px 10px; font-size: 0.78rem; }
+    .btn-danger { background: #dc2626; }
+    .grid-4 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+      margin-bottom: 20px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 18px;
+    }
+    .stat-title { font-size: 0.8rem; color: var(--muted); margin-bottom: 6px; }
+    .stat-val { font-size: 1.55rem; font-weight: 700; }
+    .stat-sub { font-size: 0.78rem; color: var(--muted); margin-top: 4px; }
+    .section-title {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .form-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    input, select, textarea {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 0.88rem;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.84rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    th { color: var(--muted); font-weight: 600; font-size: 0.78rem; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; }
+    .toast {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: #1e293b;
+      border: 1px solid var(--accent);
+      color: var(--text);
+      padding: 10px 16px;
+      border-radius: 8px;
+      display: none;
+      z-index: 999;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>
+      <span>Quark-VOD Engine</span>
+      <span id="readyBadge" class="badge badge-warn">检测中...</span>
+    </h1>
+    <div class="nav-links">
+      <button class="btn btn-outline" onclick="loadOverview()">刷新状态</button>
+      <button class="btn btn-outline" onclick="triggerSelfheal()">触发自愈巡检</button>
+      <button class="btn btn-outline" onclick="checkQuota()">测算网盘容量</button>
+      <a class="btn" href="/docs" target="_blank">Swagger API (/docs)</a>
+    </div>
+  </header>
+
+  <div class="grid-4">
+    <div class="card" style="margin-bottom:0">
+      <div class="stat-title">夸克 Cookie & OpenList 写能力</div>
+      <div class="stat-val" id="capStatus">-</div>
+      <div class="stat-sub" id="capDetail">-</div>
+    </div>
+    <div class="card" style="margin-bottom:0">
+      <div class="stat-title">活跃 Live 直链 / 历史累计播放</div>
+      <div class="stat-val" id="liveCount">-</div>
+      <div class="stat-sub" id="strmCount">-</div>
+    </div>
+    <div class="card" style="margin-bottom:0">
+      <div class="stat-title">前置 4K 锁源审计库</div>
+      <div class="stat-val" id="audit4kCount">-</div>
+      <div class="stat-sub" id="auditDetail">-</div>
+    </div>
+    <div class="card" style="margin-bottom:0">
+      <div class="stat-title">点播网盘递归容量水位</div>
+      <div class="stat-val" id="quotaVal">点击右上测算</div>
+      <div class="stat-sub" id="quotaSub">硬上限 2048 GB / 淘汰目标 1024 GB</div>
+    </div>
+  </div>
+
+  <!-- 白盒搜索与五维打分调试器 -->
+  <div class="card">
+    <div class="section-title">
+      <span>🔍 白盒搜索与五维隔离打分调试器（实时检验 6 节点召回与打分准入 >= 30）</span>
+    </div>
+    <div class="form-row">
+      <input type="text" id="qTitle" placeholder="影片名，例如：凡人修仙传 / 中国机长" style="flex:2; min-width:200px;" />
+      <select id="qCat">
+        <option value="">自动识别分类</option>
+        <option value="国产电影">国产电影</option>
+        <option value="欧美大片">欧美大片</option>
+        <option value="日韩电影">韩国电影/日本电影</option>
+        <option value="国产剧集">国产剧集</option>
+        <option value="热门韩剧">热门韩剧</option>
+        <option value="欧美剧集">欧美剧集</option>
+        <option value="国产动漫">国产动漫</option>
+        <option value="日本动漫">日本动漫</option>
+      </select>
+      <input type="number" id="qSeason" value="0" min="0" style="width:90px" placeholder="季(0=影)" title="季数(电影填0)" />
+      <input type="number" id="qEpisode" value="0" min="0" style="width:90px" placeholder="集(0=影)" title="集数(电影填0)" />
+      <button class="btn" onclick="runSearchDebug()">执行白盒检索</button>
+      <button class="btn btn-outline" onclick="runPreheatFromInput()">一键后台预热转存</button>
+    </div>
+    <div id="searchMeta" style="font-size:0.82rem; color:var(--muted); margin-bottom:8px;"></div>
+    <div style="overflow-x:auto;">
+      <table id="searchTable" style="display:none;">
+        <thead>
+          <tr>
+            <th>得分</th>
+            <th>准入</th>
+            <th>4K标签</th>
+            <th>来源节点</th>
+            <th>候选资源名称</th>
+            <th>夸克分享链接</th>
+          </tr>
+        </thead>
+        <tbody id="searchTbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 最近转存任务流水 -->
+  <div class="card">
+    <div class="section-title">
+      <span>📦 最近点播转存队列与状态机流水（最近 30 条）</span>
+    </div>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>专区 / 片名</th>
+            <th>季/集</th>
+            <th>状态</th>
+            <th>体积</th>
+            <th>播放次数</th>
+            <th>远端路径 / 错误诊断</th>
+            <th>更新时间</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="transferTbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 夸克 Cookie 在线热更新 -->
+  <div class="card">
+    <div class="section-title">
+      <span>🔑 夸克 Web Cookie 在线热更新（免重启持久化至 data/quark_cookie.txt）</span>
+    </div>
+    <div class="form-row">
+      <input type="password" id="newCookie" placeholder="粘贴 pan.quark.cn 的完整 Cookie 字符串（留空则恢复从 OpenList 数据库自动读取）" style="flex:1;" />
+      <button class="btn" onclick="updateCookie()">保存并立即验证</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+function showToast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.display = 'block';
+  setTimeout(() => { el.style.display = 'none'; }, 3500);
+}
+
+function fmtTs(ts) {
+  if (!ts) return '-';
+  const d = new Date(ts * 1000);
+  return d.toLocaleString('zh-CN', { hour12: false });
+}
+
+async function loadOverview() {
+  try {
+    const r = await fetch('/api/admin/overview');
+    const data = await r.json();
+    const cap = data.capability || {};
+    const st = data.stats || {};
+    const aud = data.audit_summary || {};
+    const sm = data.strm_summary || {};
+
+    const rb = document.getElementById('readyBadge');
+    if (cap.ready) {
+      rb.className = 'badge badge-ok';
+      rb.textContent = 'ONLINE · 读写就绪';
+    } else {
+      rb.className = 'badge badge-err';
+      rb.textContent = 'DEGRADED · 需关注';
+    }
+
+    document.getElementById('capStatus').textContent = cap.cookie_alive ? 'Cookie 有效' : 'Cookie 异常';
+    document.getElementById('capDetail').textContent = `${cap.cookie_hint || ''} | OpenList: ${cap.openlist_reason || ''}`;
+    document.getElementById('liveCount').textContent = `${st.done || 0} 部就绪 / ${st.plays || 0} 次播放`;
+    document.getElementById('strmCount').textContent = `已登记 STRM: ${sm.registered || 0} | 已淘汰清理: ${st.cleaned || 0}`;
+    document.getElementById('audit4kCount').textContent = `4K: ${aud.valid_4k || 0} / HD: ${aud.valid_hd || 0}`;
+    document.getElementById('auditDetail').textContent = `无源标记: ${aud.no_source || 0} | 失败待重试: ${st.failed || 0}`;
+
+    const tbody = document.getElementById('transferTbody');
+    tbody.innerHTML = '';
+    (data.recent_transfers || []).forEach(row => {
+      const tr = document.createElement('tr');
+      let badgeCls = 'badge-warn';
+      if (row.status === 'done') badgeCls = 'badge-ok';
+      else if (row.status === 'failed') badgeCls = 'badge-err';
+      const se = row.season > 0 || row.episode > 0 ? `S${String(row.season).padStart(2,'0')}E${String(row.episode).padStart(2,'0')}` : '电影';
+      const detail = row.remote_path || row.error || row.share_url || '-';
+      tr.innerHTML = `
+        <td class="mono">#${row.id}</td>
+        <td><strong>${row.title}</strong><br><span style="color:var(--muted);font-size:0.75rem">${row.cat}</span></td>
+        <td class="mono">${se}</td>
+        <td><span class="badge ${badgeCls}">${row.status}</span></td>
+        <td class="mono">${row.size_gb ? row.size_gb + ' GB' : '-'}</td>
+        <td class="mono">${row.play_count || 0}</td>
+        <td class="mono" style="max-width:360px;word-break:break-all;color:var(--muted)">${detail}</td>
+        <td class="mono" style="color:var(--muted)">${fmtTs(row.updated_at)}</td>
+        <td>
+          <button class="btn btn-outline btn-sm" onclick="preheatRow('${row.cat}','${row.title}',${row.season},${row.episode})">重转</button>
+          <button class="btn btn-danger btn-sm" onclick="resetTransfer(${row.id})">重置</button>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    });
+  } catch (e) {
+    showToast('加载概览失败: ' + e);
+  }
+}
+
+async function runSearchDebug() {
+  const title = document.getElementById('qTitle').value.trim();
+  const cat = document.getElementById('qCat').value;
+  const s = parseInt(document.getElementById('qSeason').value || '0', 10);
+  const e = parseInt(document.getElementById('qEpisode').value || '0', 10);
+  if (!title) { showToast('请输入片名'); return; }
+  document.getElementById('searchMeta').textContent = '正在并发检索 6 大盘搜节点并计算五维隔离得分...';
+  try {
+    const u = `/api/admin/search-debug?title=${encodeURIComponent(title)}&cat=${encodeURIComponent(cat)}&season=${s}&episode=${e}`;
+    const r = await fetch(u);
+    const d = await r.json();
+    const lockInfo = d.locked_share ? ` | 🔒 已锁存最优源: ${d.locked_share.url} (${d.locked_share.is_4k ? '4K' : 'HD'})` : ' | 未锁源';
+    document.getElementById('searchMeta').textContent =
+      `检索耗时: ${d.elapsed_sec}s | 原始候选: ${d.total_candidates} 条 | 合格准入(>=30分): ${d.qualified_count} 条${lockInfo}`;
+    const tbl = document.getElementById('searchTable');
+    const tbody = document.getElementById('searchTbody');
+    tbody.innerHTML = '';
+    tbl.style.display = 'table';
+    (d.candidates || []).forEach(c => {
+      const tr = document.createElement('tr');
+      const cls = c.qualified ? 'badge-ok' : 'badge-err';
+      tr.innerHTML = `
+        <td class="mono"><strong>${c.score}</strong></td>
+        <td><span class="badge ${cls}">${c.qualified ? '准入' : '淘汰'}</span></td>
+        <td>${c.is_4k_hint ? '<span class="badge badge-ok">4K/HDR</span>' : '-'}</td>
+        <td>${c.source || c.engine}</td>
+        <td>${c.name}</td>
+        <td class="mono"><a href="${c.share_url}" target="_blank" style="color:var(--accent)">${c.share_url}</a></td>
+      `;
+      tbody.appendChild(tr);
+    });
+  } catch (err) {
+    showToast('检索异常: ' + err);
+  }
+}
+
+async function runPreheatFromInput() {
+  const title = document.getElementById('qTitle').value.trim();
+  const cat = document.getElementById('qCat').value;
+  const s = parseInt(document.getElementById('qSeason').value || '0', 10);
+  const e = parseInt(document.getElementById('qEpisode').value || '0', 10);
+  if (!title) { showToast('请输入片名'); return; }
+  await preheatRow(cat, title, s, e);
+}
+
+async function preheatRow(cat, title, s, e) {
+  showToast(`已提交预热任务: ${title} S${s}E${e}`);
+  const r = await fetch(`/preheat?cat=${encodeURIComponent(cat)}&t=${encodeURIComponent(title)}&s=${s}&e=${e}`);
+  const d = await r.json();
+  showToast(d.msg || d.status);
+  setTimeout(loadOverview, 1500);
+}
+
+async function resetTransfer(id) {
+  const r = await fetch(`/api/admin/transfer/${id}`, { method: 'DELETE' });
+  const d = await r.json();
+  if (d.ok) {
+    showToast(`记录 #${id} 已重置为 pending`);
+    loadOverview();
+  }
+}
+
+async function triggerSelfheal() {
+  showToast('正在执行全库 live strm 自愈巡检...');
+  const r = await fetch('/api/admin/selfheal', { method: 'POST' });
+  const d = await r.json();
+  showToast(`自愈巡检完成，耗时 ${d.elapsed_sec}s`);
+  loadOverview();
+}
+
+async function checkQuota() {
+  document.getElementById('quotaVal').textContent = '递归统计中...';
+  const r = await fetch('/api/admin/quota');
+  const d = await r.json();
+  if (d.total_gb !== undefined) {
+    document.getElementById('quotaVal').textContent = `${d.total_gb} GB / ${d.quota_limit_gb} GB`;
+    document.getElementById('quotaSub').textContent = `共 ${d.folder_count} 个影片目录`;
+  } else {
+    document.getElementById('quotaVal').textContent = '统计失败';
+  }
+}
+
+async function updateCookie() {
+  const cookie = document.getElementById('newCookie').value;
+  const r = await fetch('/api/admin/cookie', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cookie })
+  });
+  const d = await r.json();
+  showToast(`Cookie 更新结果: ${d.cookie_status} (${d.cookie_hint})`);
+  document.getElementById('newCookie').value = '';
+  loadOverview();
+}
+
+loadOverview();
+</script>
+</body>
+</html>

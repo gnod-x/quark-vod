@@ -1,0 +1,26 @@
+services:
+  quark-vod:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: quark-vod:latest
+    container_name: quark-vod
+    restart: unless-stopped
+    network_mode: host
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    environment:
+      - VOD_HOST=0.0.0.0
+      - VOD_PORT=8099
+      - VOD_BASE_DIR=/home/dong/projects/hometheater
+    volumes:
+      # 挂载代码目录支持免重构镜像秒级热更新，同时保持容器内路径与宿主机 strm_map 100% 对齐
+      - ./app:/app
+      - /home/dong/projects/hometheater:/home/dong/projects/hometheater
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

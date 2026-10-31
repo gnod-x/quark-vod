@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+每日热门资源自动更新、连载追新与存储配额智能淘汰治理器
+========================================================================
+功能：
+  1. 配额控制：单专区上限严格限制为 100 部（连续剧整部算 1 个资源），
+     总片库容量严格收敛在 4GB 元数据以内。
+  2. LRU 智能淘汰：
+     - 白名单保护：已看（plays/UserData）、收藏（Favorites）及港台经典专区绝不删除。
+     - 淘汰对象：零播放、非经典、上架久、热度跌出榜单的旧片。
+  3. 每日拉取：自动从 TMDB Trending/Popular 抓取各大平台最新热播新片入库（纯轻量刮削）。
+  4. 连载追新：自动检索库中连载中（未完结）的热播剧，向 TMDB 同步最新上线的集数，
+     自动生成 pending 占位符与分集元数据，实现无感追剧。
+  5. 联动刷新：自动触发 Jellyfin 媒体库扫描并清理孤立演职员缓存。
+"""
+
+import os
+import sys
+import time
+import shutil
+import sqlite3
+import subprocess
+import urllib.request
+import xml.etree.ElementTree as ET
+
+BASE = "/home/dong/projects/hometheater"
+sys.path.insert(0, os.path.join(BASE, "scripts"))
+import tmdb_populate
+from quark_vod import db as vod_db
+
+CINEMA2 = os.path.join(BASE, "cinema2")
+DATA_DIR = os.path.join(BASE, "data")
+LOG_DIR = os.path.join(BASE, "logs")
+QUARK_DB = os.path.join(DATA_DIR, "quark_plays.db")
+JF_DB = os.path.join(BASE, "jellyfin2/config/data/jellyfin.db")
+
+# ── 配置策略 ──────────────────────────────────────────
+# 单专区最大保留影片/剧集数（超过时触发淘汰，剧集整部算 1 部）
+MAX_PER_CATEGORY = 200
+# 永久保护免淘汰专区（经典永存）
+PROTECTED_CATEGORIES = set()  # 港台经典不设免死保护，所有专区均受配额与淘汰治理
+TV_CATEGORIES = {"国产剧集", "欧美剧集", "热门韩剧", "国产动漫", "日本动漫", "日本剧集", "泰国剧集"}
+
+
+def log(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [DailyPrune] {msg}", flush=True)
+
+
+def get_protected_titles():
+    """获取所有受保护（不可删除）的影片标题集合。除用户收藏（IsFavorite=1）外，其他均不设永久保护。"""
+    protected = set()
+
+    # 仅查询 jellyfin.db 中已收藏的项目（支持电影名称与剧集名称）
+    if os.path.exists(JF_DB):
+        try:
+            con = sqlite3.connect(f"file:{JF_DB}?mode=ro", uri=True)
+            cur = con.cursor()
+            cur.execute("""
+                SELECT b.Name, b.SeriesName FROM BaseItems b
+                JOIN UserData u ON b.Id = u.ItemId
+                WHERE u.IsFavorite = 1
+            """)
+            for row in cur.fetchall():
+                if row[0]:
+                    protected.add(row[0].strip())
+                if row[1]:
+                    protected.add(row[1].strip())
+            con.close()
+        except Exception as e:
+            log(f"读取 Jellyfin UserData 失败: {e}")
+
+    return protected
+
+
+def is_item_active_or_done(full_path, cat, name):
+    """检查目录内是否包含已转存 (done) 的正片或 live 直链，坚决杜绝误删用户已转存/正在观看内容。"""
+    try:
+        for root, _, files in os.walk(full_path):
+            for f in files:
+                if f.endswith(".strm"):
+                    p = os.path.join(root, f)
+                    with open(p, "r", encoding="utf-8", errors="ignore") as fp:
+                        c = fp.read(64)
+                        if "5244" in c or (c.startswith("http") and "/pending" not in c):
+                            return True
+    except Exception:
+        pass
+    return False
+
+
+def prune_category(cat, protected_titles, limit=MAX_PER_CATEGORY):
+    """对单专区执行配额检查与淘汰（一部连续剧算 1 个资源）。"""
+    cat_dir = os.path.join(CINEMA2, cat)
+    if not os.path.isdir(cat_dir):
+        return 0
+
+    if cat in PROTECTED_CATEGORIES:
+        log(f"专区【{cat}】属于经典保护区，跳过淘汰")
+        return 0
+
+    entries = [d for d in os.listdir(cat_dir) if not d.startswith(".")]
+    total = len(entries)
+    if total <= limit:
+        log(f"专区【{cat}】当前 {total} 部，在上限 {limit} 内，无需清理")
+        return 0
+
+    excess = total - limit
+    log(f"专区【{cat}】当前 {total} 部，超出上限 {excess} 部，准备执行淘汰")
+
+    candidates = []
+    for d in entries:
+        full_p = os.path.join(cat_dir, d)
+        if not os.path.isdir(full_p):
+            continue
+
+        clean_name = d.rsplit(" (", 1)[0].strip() if " (" in d else d
+        if d in protected_titles or clean_name in protected_titles:
+            continue
+
+        # 保护已转存/已点播为 live 的影片，仅允许淘汰从未点播过的纯 pending 占位
+        if is_item_active_or_done(full_p, cat, clean_name):
+            continue
+
+        mtime = os.path.getmtime(full_p)
+        candidates.append((mtime, d, full_p))
+
+    candidates.sort(key=lambda x: x[0])
+
+    pruned = 0
+    to_delete = candidates[:excess]
+    for _, name, path in to_delete:
+        try:
+            shutil.rmtree(path)
+            log(f"已淘汰清理老旧资源: 【{cat}】{name}")
+            if os.path.exists(QUARK_DB):
+                try:
+                    c = sqlite3.connect(QUARK_DB)
+                    c.execute("DELETE FROM strm_map WHERE cat=? AND title=?", (cat, name))
+                    c.commit()
+                    c.close()
+                except Exception:
+                    pass
+            pruned += 1
+        except Exception as e:
+            log(f"删除失败 {path}: {e}")
+
+    log(f"专区【{cat}】淘汰完成，共释放 {pruned} 部非热播老旧资源")
+    return pruned
+
+
+def run_pruning():
+    """全库执行存储配额治理。"""
+    log(f"=== 开始执行存储上限 ({MAX_PER_CATEGORY}部/区) 与 LRU 智能淘汰检查 ===")
+    protected = get_protected_titles()
+    log(f"当前共锁定 {len(protected)} 部收藏保护影视（绝不删除）")
+
+    total_pruned = 0
+    if os.path.isdir(CINEMA2):
+        for cat in os.listdir(CINEMA2):
+            if os.path.isdir(os.path.join(CINEMA2, cat)) and not cat.startswith("."):
+                total_pruned += prune_category(cat, protected, limit=MAX_PER_CATEGORY)
+
+    log(f"=== 淘汰清理结束，全库共移除 {total_pruned} 部旧资源 ===")
+    return total_pruned
+
+
+def sync_airing_episodes():
+    """检索本地连载中的热播剧，向 TMDB 差量同步最新上线的集数（纯轻量占位，零预转存）。"""
+    log("=== 开始检查未完结连载剧集的新集数更新 (追新同步) ===")
+    key = tmdb_populate.read_tmdb_key()
+    total_added_eps = 0
+
+    if not os.path.isdir(CINEMA2):
+        return 0
+
+    for cat in os.listdir(CINEMA2):
+        if cat not in TV_CATEGORIES:
+            continue
+        cat_dir = os.path.join(CINEMA2, cat)
+        if not os.path.isdir(cat_dir):
+            continue
+
+        for show_dir_name in os.listdir(cat_dir):
+            if show_dir_name.startswith("."):
+                continue
+            show_path = os.path.join(cat_dir, show_dir_name)
+            if not os.path.isdir(show_path):
+                continue
+
+            nfo_path = os.path.join(show_path, "tvshow.nfo")
+            if not os.path.isfile(nfo_path):
+                continue
+
+            tmdbid = None
+            status = None
+            title = show_dir_name.rsplit(" (", 1)[0].strip() if " (" in show_dir_name else show_dir_name
+            try:
+                tree = ET.parse(nfo_path)
+                root = tree.getroot()
+                tmdbid = root.findtext("tmdbid")
+                status = root.findtext("status")
+            except Exception:
+                continue
+
+            if status == "Ended" or not tmdbid:
+                continue
+
+            try:
+                url = f"https://api.themoviedb.org/3/tv/{tmdbid}?api_key={key}&language=zh-CN"
+                detail = tmdb_populate.http_json(url)
+            except Exception as e:
+                log(f"查询 TMDB 详情失败 《{title}》(id:{tmdbid}): {e}")
+                continue
+
+            latest_status = detail.get("status")
+            if latest_status == "Ended" and status != "Ended":
+                try:
+                    status_node = root.find("status")
+                    if status_node is not None:
+                        status_node.text = "Ended"
+                        tree.write(nfo_path, encoding="utf-8", xml_declaration=True)
+                except Exception:
+                    pass
+
+            seasons = [s for s in detail.get("seasons", []) if s.get("season_number", 0) >= 1]
+            total_show_eps = sum(s.get("episode_count") or 0 for s in seasons)
+            if total_show_eps > 300:
+                continue
+
+            for s in seasons:
+                s_num = s.get("season_number")
+                tmdb_ep_total = s.get("episode_count") or 0
+                if tmdb_ep_total <= 0:
+                    continue
+
+                s_dir = os.path.join(show_path, f"Season {s_num:02d}")
+                os.makedirs(s_dir, exist_ok=True)
+
+                existing_strms = [f for f in os.listdir(s_dir) if f.endswith(".strm")]
+                local_ep_cnt = len(existing_strms)
+
+                if tmdb_ep_total > local_ep_cnt:
+                    diff = tmdb_ep_total - local_ep_cnt
+                    log(f"发现新集上线！《{title}》第 {s_num} 季: 本地 {local_ep_cnt} 集 -> 官方更新至 {tmdb_ep_total} 集 (新增 {diff} 集)")
+
+                    # 同步获取该季分集详情：随新集上线同步提取剧照 (still_path) 与分集剧情
+                    ep_info_map = {}
+                    try:
+                        s_url = f"https://api.themoviedb.org/3/tv/{tmdbid}/season/{s_num}?api_key={key}&language=zh-CN"
+                        s_detail = tmdb_populate.http_json(s_url)
+                        for ep_obj in s_detail.get("episodes", []):
+                            e_no = ep_obj.get("episode_number")
+                            if e_no:
+                                ep_info_map[e_no] = ep_obj
+                    except Exception:
+                        pass
+
+                    created = []
+                    for ep in range(local_ep_cnt + 1, tmdb_ep_total + 1):
+                        ep_data = ep_info_map.get(ep, {})
+                        base_ep = f"{title} - S{s_num:02d}E{ep:02d}"
+                        ep_file = f"{base_ep}.strm"
+                        thumb_file = f"{base_ep}-thumb.jpg"
+                        ep_nfo_file = f"{base_ep}.nfo"
+
+                        ep_path = os.path.join(s_dir, ep_file)
+                        thumb_path = os.path.join(s_dir, thumb_file)
+                        ep_nfo_path = os.path.join(s_dir, ep_nfo_file)
+
+                        # 1. 随追更同步下载分集高清剧照
+                        still_p = ep_data.get("still_path")
+                        if still_p and not os.path.isfile(thumb_path):
+                            tmdb_populate.download_image(f"{tmdb_populate.IMG_BASE}/w500{still_p}", thumb_path)
+
+                        # 2. 随追更同步生成单集 NFO
+                        if not os.path.isfile(ep_nfo_path):
+                            tmdb_populate.gen_episode_nfo(ep_nfo_path, ep_data.get("name"), s_num, ep, ep_data)
+
+                        # 3. 写入占位 strm
+                        if tmdb_populate.write_pending_strm(ep_path, cat, title, s_num, ep):
+                            created.append((cat, title, s_num, ep, ep_path))
+
+                    if created:
+                        try:
+                            con = vod_db._conn()
+                            for c, t, s_idx, e_idx, p in created:
+                                con.execute(
+                                    "INSERT OR REPLACE INTO strm_map (cat, title, season, episode, strm_path) VALUES (?, ?, ?, ?, ?)",
+                                    (c, t, s_idx, e_idx, p)
+                                )
+                            con.commit()
+                        except Exception as err:
+                            log(f"strm_map 登记异常: {err}")
+                        total_added_eps += len(created)
+
+            time.sleep(0.05)
+
+    log(f"=== 连载追新检查完成，全库共追加 {total_added_eps} 个最新集数待播占位 ===")
+    return total_added_eps
+
+
+def run_update():
+    """每日自动拉取 TMDB 最新热映/热播资源（纯轻量刮削，零预转存）。"""
+    log("=== 开始拉取各大平台最新热播影视资源 (TMDB 增量发现) ===")
+    cmd = [sys.executable, os.path.join(BASE, "scripts", "tmdb_populate.py"), "--limit", "15"]
+    try:
+        subprocess.run(cmd, check=True)
+        log("最新热播资源增量抓取完成")
+    except Exception as e:
+        log(f"TMDB 抓取执行失败: {e}")
+
+
+def precheck_newly_added(limit=35):
+    """每日片源存活健康巡检与真 4K 锁源闭环：
+    1. 自动巡检存量已锁定的分享链接，若原作者取消或失效，当场拉黑并自动多源打捞全新活源替换！
+    2. 对当天新上架的新片及未锁定资源进行多源矩阵打捞并锁存 4K 源。
+    """
+    log("=== 开始执行每日片源存活性健康巡检、死链自动换新与增量 4K 锁源 ===")
+    try:
+        from quark_vod.auditor import VodAuditor
+        auditor = VodAuditor()
+        # 1. 存量已锁源每日存活体检与失效自愈换新
+        heal_stats = auditor.check_and_heal_locked_shares(limit=25)
+        log(f"存量锁源自愈巡检完成: 健康={heal_stats.get('healthy')}, 自动换新4K={heal_stats.get('healed_4k')}, 换新高清={heal_stats.get('healed_hd')}")
+        # 2. 增量新片 4K 验票锁源
+        stats = auditor.audit_entire_library(limit=limit)
+        log(f"增量新片 4K 锁源完成: 4K锁源={stats.get('valid_4k')}, 高清={stats.get('valid_hd')}, 无有效源={stats.get('no_source')}")
+        # 3. 网盘点播目录伪装视频（如被分享者改成.mp3/.pdf避审查）智能巡检与格式扶正
+        total_fixed = auditor.fix_disguised_vod_files()
+        log(f"网盘伪装视频巡检与格式扶正完成，当前就绪直链视频: {total_fixed} 个")
+    except Exception as e:
+        log(f"片源前置预检与自愈异常: {e}")
+
+
+def refresh_jellyfin():
+    """通知 Jellyfin 2 扫描新媒体库，并等待扫描真正完成（而非仅 HTTP 204 送达）。
+
+    2026-10-26 补强：/Library/Refresh 只返回 204 表示"已入队"，实际扫描
+    会持续 30~60 分钟（实测 10-26 05:27 入队，06:25 才扫完）。若不等待，
+    后续 update_vod_quota/其它步骤会与扫描并发，且金丝雀抽检在扫描未完成
+    时得到的元数据不可信。
+    轮询 ScheduledTasks 中 RefreshLibrary 的 State，最多等待 REFRESH_WAIT_SECS。
+    """
+    log("通知 Jellyfin2 (8097) 执行媒体库全量刷新...")
+    try:
+        from quark_vod import config as vod_cfg
+        req = urllib.request.Request(f"{vod_cfg.JELLYFIN2_API}/Library/Refresh", data=b"", method="POST")
+        if vod_cfg.JELLYFIN2_KEY:
+            req.add_header("Authorization", f'MediaBrowser Token="{vod_cfg.JELLYFIN2_KEY}"')
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            log(f"Jellyfin 刷新命令已送达: HTTP {resp.status}")
+        _wait_library_refresh(vod_cfg)
+    except Exception as e:
+        log(f"Jellyfin 刷新请求失败: {e}")
+
+
+def _wait_library_refresh(vod_cfg, max_wait=1800, interval=15):
+    """轮询 RefreshLibrary 任务状态直到 Idle（或超时）。"""
+    import json
+    t0 = time.time()
+    seen_running = False
+    while time.time() - t0 < max_wait:
+        try:
+            req = urllib.request.Request(f"{vod_cfg.JELLYFIN2_API}/ScheduledTasks")
+            if vod_cfg.JELLYFIN2_KEY:
+                req.add_header("Authorization", f'MediaBrowser Token="{vod_cfg.JELLYFIN2_KEY}"')
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                tasks = json.loads(resp.read().decode("utf-8"))
+            state = next((t.get("State") for t in tasks if t.get("Key") == "RefreshLibrary"), None)
+            if state == "Running":
+                seen_running = True
+            elif seen_running and state == "Idle":
+                log(f"Jellyfin2 媒体库扫描已完成（耗时 {int(time.time() - t0)}s）")
+                return True
+            elif not seen_running and time.time() - t0 > 60:
+                # 60s 内仍未进入 Running，说明任务已结束或被合并
+                log("Jellyfin2 媒体库扫描未观察到 Running 状态（可能已瞬时完成），继续")
+                return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    log(f"[警告] 等待 Jellyfin2 扫描完成超时（{max_wait}s），继续后续流程")
+    return False
+
+
+def clean_orphan_people():
+    """清理孤立的演职人员头像图片，释放 SSD 空间。"""
+    people_script = os.path.join(BASE, "scripts", "people_manager.py")
+    if os.path.exists(people_script):
+        log("执行演职员目录瘦身治理...")
+        try:
+            env = os.environ.copy()
+            env["JELLYFIN_API_BASE"] = "http://127.0.0.1:8097"
+            env["HOMETHEATER_BASE_DIR"] = BASE
+            subprocess.run([sys.executable, people_script], env=env, timeout=120)
+        except Exception:
+            pass
+
+
+def run_vod_canary_test(sample_count=10):
+    """每日点播金丝雀健康抽检哨兵。
+
+    从库中随机抽取 10 部影视执行轻量解析与连通性自检，监控当日网盘与源站大盘健康度。
+    """
+    import glob
+    import random
+    import urllib.parse
+    log(f"=== [Canary] 开始执行点播链路金丝雀自动健康抽检 (随机抽检 {sample_count} 部) ===")
+    # 2026-10-26 修复：此前从 5.2 万个 strm 中完全随机抽样，其中 99.9% 是 pending，
+    # 于是抽到活链的概率极低，日可用率长期被 pending 的"能否 resolve 到源"污染，
+    # 无法反映 DirectPlay 活链的真实健康度。现拆成两组各自抽样：
+    #   A 组（活链）：实测 Range 可达性，这是播放时真正走的路径；
+    #   B 组（pending）：实测能否 resolve 到可用源，反映搜索侧健康度。
+    all_strms = glob.glob(f"{CINEMA2}/**/*.strm", recursive=True)
+    if not all_strms:
+        log("[Canary] 库中无 strm 文件，跳过抽检")
+        return
+
+    live_strms, pending_strms = [], []
+    for sp in all_strms:
+        try:
+            with open(sp, "r", encoding="utf-8", errors="ignore") as fp:
+                line = fp.readline().strip()
+        except Exception:
+            continue
+        if ":5244/d/" in line or "/夸克" in line or ":8099/clean" in line:
+            live_strms.append(sp)
+        elif ":8099/pending" in line:
+            pending_strms.append(sp)
+
+    half = max(1, sample_count // 2)
+    sample = random.sample(live_strms, min(half, len(live_strms))) + \
+             random.sample(pending_strms, min(sample_count - half, len(pending_strms)))
+    success = 0
+    from quark_vod import search as search_mod
+
+    for sp in sample:
+        try:
+            with open(sp, "r", encoding="utf-8") as fp:
+                line = fp.readline().strip()
+
+            if ":5244/d/" in line or "/夸克" in line or ":8099/clean" in line:
+                # 针对已激活直链：单字节 Range 探测
+                req = urllib.request.Request(line, headers={"User-Agent": "curl/8.14.1", "Range": "bytes=0-0"})
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    if resp.status in (200, 206):
+                        success += 1
+            elif ".m3u8" in line:
+                if search_mod.is_m3u8_alive(line):
+                    success += 1
+            elif ":8099/pending" in line:
+                # 针对未激活资源：轻量解析是否有可用源
+                parsed = urllib.parse.urlparse(line)
+                q = urllib.parse.parse_qs(parsed.query)
+                cat = (q.get("cat") or [""])[0]
+                t = (q.get("t") or [""])[0]
+                s = int((q.get("s") or ["0"])[0])
+                e = int((q.get("e") or ["0"])[0])
+                res, u = search_mod.resolve_for_play(cat, t, s, e, prefer_panshare=True)
+                if res is not None:
+                    success += 1
+        except Exception:
+            pass
+
+    rate = (success / len(sample)) * 100 if sample else 0
+    log(f"[Canary] 金丝雀抽检完成: 成功 {success}/{len(sample)} 部 "
+        f"(活链 {len(live_strms)} / pending {len(pending_strms)} 各半抽样) 可用率: {rate:.1f}%)")
+    if rate < 70.0:
+        log(f"[Canary 警告] 点播链路可用率低于 70%，请关注源站搜索可用性或网盘 Cookies！")
+
+
+def main():
+    import fcntl
+    lock_path = os.path.join(DATA_DIR, "vod_maintenance.lock")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    lock_fp = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX)
+    except Exception:
+        pass
+
+    try:
+        # 0. 全库影视分类精准度治理与重名消歧（如《凡人修仙传》真人剧 vs 动画版）
+        try:
+            import category_governor
+            category_governor.run_governance(dry_run=False)
+        except Exception as e:
+            log(f"分类治理与重名消歧执行异常: {e}")
+
+        # 1. 检查配额并执行 LRU 淘汰（单区上限 200 部）
+        run_pruning()
+        # 2. 增量拉取各大平台最新上映/热播资源
+        run_update()
+        # 3. 连载剧集增量追新同步（自动追加新上线集数，同步下载剧照与NFO）
+        sync_airing_episodes()
+        # 4. 前置 4K 验票与锁源（确保新入库影视落地即可播）
+        precheck_newly_added(limit=30)
+        # 5. 刷新影院并清理孤立头像
+        refresh_jellyfin()
+        clean_orphan_people()
+        # 6. 金丝雀点播链路健康自动抽检
+        run_vod_canary_test(sample_count=10)
+        log("每日影视更新、连载追新、片源预检与存储治理全部顺利完成！")
+    finally:
+        try:
+            fcntl.flock(lock_fp, fcntl.LOCK_UN)
+            lock_fp.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
+

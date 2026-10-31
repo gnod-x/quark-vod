@@ -1,0 +1,223 @@
+#!/bin/bash
+# High-Performance Wrapper for Jellyfin FFprobe
+# - 强制收敛探测参数（analyzeduration/probesize），规避网盘流 150s 阻塞
+# - MD5 缓存 + 原子写入，命中后毫秒级返回
+# - 探测失败/超时输出最小合法 JSON，绝不向 Jellyfin 吐空 stdout（避免 JsonException）
+# - 附件流过滤（保留 ass/ssa 内嵌字幕）
+
+PROBE_BIN="/usr/lib/jellyfin-ffmpeg/ffprobe"
+JQ_BIN="/custom-ffmpeg/bin/jq"
+CACHE_DIR="/cache/ffprobe_cache"
+export LD_LIBRARY_PATH="/custom-ffmpeg/bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# 探测预算：19.4G BluRay Remux 需读 ~5MB，OpenList 出口 ~470KB/s => 冷探测 9~25s
+# 留足抖动余量，宁慢勿杀（被杀=空 stdout=Jellyfin 播放失败）
+PROBE_TIMEOUT=120
+# 冷探测失败后的重试次数（网盘瞬时抖动）
+PROBE_RETRIES=2
+# 强制注入的探测收敛值。
+# 2026-10-14 实测：OpenList 出口 ~470KB/s，probesize 与冷探测耗时近似线性：
+#   1M=0.58s  2M=0.85s  3M=1.93s  5M=2.41s  8M=3.60s  16M=4.55s  32M=6.70s
+# 跨 7 类样本（港片 Remux / 4K HDR / 普通剧集 / 动漫）验证：1M 与 32M 识别到的流数完全一致。
+# 取 2M 作黄金值：比 1M 略留复杂封装余量，耗时仅为 32M 的 1/16。
+FORCE_ANALYZEDURATION="2M"
+FORCE_PROBESIZE="2M"
+
+args=()
+http_input_seen=false
+is_json=false
+input_target=""
+source_strm=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -i)
+      target="$2"
+      clean_target=$(echo "$target" | tr -d '"')
+      # STRM 直链解析：读取首行 URL 替代本地路径
+      if [[ "$clean_target" =~ \.strm$ ]] && [ -f "$clean_target" ]; then
+        source_strm="$clean_target"
+        url=$(head -n 1 "$clean_target" | tr -d '\r\n')
+        if [[ "$url" =~ ^https?:// ]]; then
+          target="$url"
+        fi
+      fi
+
+      # HTTP 输入注入 reconnect 保活参数
+      # ⚠️ 严禁加入 -reconnect_at_eof 1：cinema2 的 CMS 点播源是 PLAYLIST-TYPE:VOD
+      # 的有限长度 m3u8（播完即 EOF）。at_eof 的语义是"读到 EOF 后重连继续读"，
+      # 对直播流是保活，对 VOD 流则变成永远等待不存在的下一个分片——
+      # 2026-10-15 实测：加上它 ffprobe 40s+ 无输出直至被 PROBE_TIMEOUT 杀死
+      # （stdout 0 字节 → 只能吐兜底 JSON → Jellyfin 记 "ffprobe failed - streams
+      # and format are both null" → 前端黑屏）。去掉后 9s 正常返回 3345B。
+      # 这是《八佰》《非常杀手》点播播放失败的根因（详见 CLAUDE.md 红线 #10）。
+      if [[ "$target" =~ ^https?:// ]] && [[ "$http_input_seen" == "false" ]]; then
+        args+=( "-reconnect" "1" "-reconnect_streamed" "1" \
+                "-reconnect_on_network_error" "1" "-reconnect_delay_max" "3" )
+        http_input_seen=true
+      fi
+
+      # 动态点播流前置穿透：如果探测目标是 8099 pending 端点，先触发转存并解析出真实直链
+      # 确保探针探测到的是最终真实媒体格式，并将结果准确绑定到静态直链缓存
+      if [[ "$target" =~ :8099/pending ]] || [[ "$target" =~ /pending\? ]]; then
+        real_url=$(/usr/bin/curl -s -r 0-0 -L -m 30 -o /dev/null -w '%{url_effective}' "$target")
+        if [[ -n "$real_url" ]] && [[ "$real_url" =~ ^https?:// ]] && [[ ! "$real_url" =~ /pending ]]; then
+          target="$real_url"
+        fi
+      fi
+
+      # 混淆文件头（图种伪装）底层自适应防御：
+      # 若目标是以 8 字节 PNG 伪装开头（89504e470d0a1a0a），强制丢弃 png_pipe 诱导，
+      # 注入 -f matroska/mp4 -skip_initial_bytes 8，杜绝 120s 超时与内存狂飙。
+      if [[ "$target" =~ ^https?:// ]] && [[ ! "$target" =~ /clean\? ]]; then
+        head_hex=$(/usr/bin/curl -s -r 0-23 -m 2 "$target" 2>/dev/null | od -A n -t x1 2>/dev/null | tr -d ' \n')
+        if [[ "$head_hex" =~ ^89504e470d0a1a0a ]]; then
+          if [[ "$head_hex" =~ 66747970 ]]; then
+            args+=( "-f" "mp4" "-skip_initial_bytes" "8" )
+          else
+            args+=( "-f" "matroska" "-skip_initial_bytes" "8" )
+          fi
+        fi
+      fi
+
+      input_target="$target"
+      args+=("-i" "$target")
+      shift 2
+      ;;
+    -analyzeduration)
+      args+=("-analyzeduration" "$FORCE_ANALYZEDURATION")
+      shift 2
+      ;;
+    -probesize)
+      args+=("-probesize" "$FORCE_PROBESIZE")
+      shift 2
+      ;;
+    -print_format)
+      [[ "$2" == "json" ]] && is_json=true
+      args+=("-print_format" "$2")
+      shift 2
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# Jellyfin 探测调用不传 analyzeduration/probesize 时，主动补齐（核心修复点）
+if [[ "$http_input_seen" == "true" ]]; then
+  has_analyzeduration=false
+  has_probesize=false
+  for a in "${args[@]}"; do
+    [[ "$a" == "-analyzeduration" ]] && has_analyzeduration=true
+    [[ "$a" == "-probesize" ]] && has_probesize=true
+  done
+  [[ "$has_analyzeduration" == "false" ]] && args+=("-analyzeduration" "$FORCE_ANALYZEDURATION")
+  [[ "$has_probesize" == "false" ]] && args+=("-probesize" "$FORCE_PROBESIZE")
+fi
+
+# 缓存标识计算（防假元数据污染铁律）：
+# 1. 动态点播流（8099 pending）：具有按需转存触发职责与状态转换特性，严禁读写任何静态缓存！
+if [[ "$target" =~ :8099/pending ]] || [[ "$target" =~ /pending\? ]]; then
+  CACHE_IDENT=""
+elif [[ -n "$target" ]] && [[ "$target" =~ ^https?:// ]]; then
+  if [[ "$target" =~ /clean\? ]] || [[ "$target" =~ :8099/clean ]]; then
+    # 零拷贝平移流清洗端点：真实媒体文件身份全在 url= 参数中，严禁截断丢弃！
+    CACHE_IDENT="clean:${target}"
+  else
+    # 2. 静态直链（OpenList 等网盘直链）：按文件实际 URL（去临时鉴权串）作为全局唯一缓存标识
+    base_url=$(echo "$target" | cut -d'?' -f1)
+    CACHE_IDENT="url:${base_url}"
+  fi
+elif [[ -n "$source_strm" ]]; then
+  CACHE_IDENT="strm:${source_strm}"
+elif [[ -n "$input_target" ]]; then
+  base_url=$(echo "$input_target" | cut -d'?' -f1)
+  CACHE_IDENT="url:${base_url}"
+else
+  CACHE_IDENT=""
+fi
+
+# JSON 合法性校验（优先内置 jq，缺失时降级 grep，绝不让缓存被判死）
+json_is_valid() {
+  local f="$1"
+  [ -s "$f" ] || return 1
+  if [ -x "$JQ_BIN" ]; then
+    "$JQ_BIN" -e . "$f" >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  # 降级：至少是 { 开头且含 "streams"
+  head -c 1 "$f" 2>/dev/null | grep -q '{' && grep -q '"streams"' "$f" 2>/dev/null
+}
+
+write_atomic_cache() {
+  local target_file="$1"
+  local content="$2"
+  local tmp_file="${target_file}.$$.$RANDOM.tmp"
+  if printf '%s' "$content" > "$tmp_file" 2>/dev/null; then
+    mv -f "$tmp_file" "$target_file" 2>/dev/null || rm -f "$tmp_file" 2>/dev/null
+  fi
+}
+
+# 过滤附件流（字体等大体积附件），完整保留 ass/ssa 字幕流
+filter_attachments() {
+  local raw="$1"
+  if [ -x "$JQ_BIN" ]; then
+    local filtered
+    filtered=$(printf '%s' "$raw" | "$JQ_BIN" -c '.streams |= map(select(.codec_type != "attachment"))' 2>/dev/null)
+    if [ -n "$filtered" ] && [ "$filtered" != "null" ]; then
+      printf '%s' "$filtered"
+      return 0
+    fi
+  fi
+  printf '%s' "$raw"
+}
+
+if [[ "$is_json" == "true" ]] && [[ -n "$CACHE_IDENT" ]]; then
+  mkdir -p "$CACHE_DIR" 2>/dev/null
+  CACHE_KEY=$(echo -n "$CACHE_IDENT" | md5sum | awk '{print $1}')
+  CACHE_FILE="$CACHE_DIR/${CACHE_KEY}.json"
+
+  # 缓存命中：合法即返回
+  if [ -s "$CACHE_FILE" ] && json_is_valid "$CACHE_FILE"; then
+    cat "$CACHE_FILE"
+    exit 0
+  fi
+  # 损坏/半成品缓存：清除后重建（仅在确有不合法时执行，不再无条件删）
+  [ -f "$CACHE_FILE" ] && rm -f "$CACHE_FILE" 2>/dev/null
+
+  # 带重试的探测
+  raw_json=""
+  probe_status=1
+  for attempt in $(seq 1 "$PROBE_RETRIES"); do
+    raw_json=$(/usr/bin/timeout "$PROBE_TIMEOUT" "$PROBE_BIN" "${args[@]}" 2>/dev/null)
+    probe_status=$?
+    [ $probe_status -eq 0 ] && [ -n "$raw_json" ] && break
+    # 失败退避 2s 再试（网盘瞬时抖动）
+    [ "$attempt" -lt "$PROBE_RETRIES" ] && sleep 2
+  done
+
+  if [ -n "$raw_json" ] && [ $probe_status -eq 0 ]; then
+    # 探测成功：过滤附件流并写入缓存
+    filtered_json=$(filter_attachments "$raw_json")
+    # 防御：过滤结果不含有效流信息时不入缓存，避免污染
+    if printf '%s' "$filtered_json" | grep -q '"streams"'; then
+      write_atomic_cache "$CACHE_FILE" "$filtered_json"
+    fi
+    echo "$filtered_json"
+    exit 0
+  elif [ -n "$raw_json" ]; then
+    # 探测有输出但退出码非 0：内容多半是空对象（文件不存在/网盘拒绝）
+    # 此时绝不写缓存（避免把无效结果固化），直接透传给 Jellyfin
+    printf '%s' "$raw_json"
+    exit 0
+  fi
+
+  # 探测彻底失败（超时/网络错误）：输出最小合法 JSON，让 Jellyfin 走降级逻辑
+  # 而非抛 JsonException 导致播放直接失败
+  echo '{"streams":[],"format":{"format_name":"unknown"}}'
+  exit 0
+fi
+
+# 非 JSON 探测请求：直接透传
+exec /usr/bin/timeout "$PROBE_TIMEOUT" "$PROBE_BIN" "${args[@]}"
