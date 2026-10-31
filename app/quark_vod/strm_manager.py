@@ -15,12 +15,68 @@ strm 生命周期管理
 """
 
 import os
+import queue
+import threading
+import time
 
 from . import config
 from . import db
 from . import cleaner
 
 PENDING_PREFIX = f"{config.PENDING_BASE_URL}/pending"
+
+# 后台限流刷新队列（解决全季 40 集连带激活时并发发起 40 个 FullRefresh 挤占首播带宽）
+_refresh_queue: "queue.Queue[str]" = queue.Queue()
+_refresh_worker_started = False
+_refresh_worker_lock = threading.Lock()
+
+
+def _do_jellyfin_refresh_sync(strm_path: str):
+    """同步执行单个条目的 Jellyfin2 流信息刷新（免锁只读查询 + ReplaceAllMetadata=false）。"""
+    try:
+        from contextlib import closing
+        import urllib.request
+        import sqlite3
+        if not strm_path or not os.path.isfile(strm_path):
+            return
+        container_path = strm_path.replace(config.CINEMA2_DIR, "/cinema2")
+        with closing(sqlite3.connect(f"file:{config.JELLYFIN2_DB}?mode=ro&immutable=1", uri=True)) as con:
+            cur = con.cursor()
+            row = cur.execute("SELECT Id FROM BaseItems WHERE Path = ? LIMIT 1", (container_path,)).fetchone()
+        if not row or not row[0]:
+            return
+        item_id = row[0]
+        url = (f"{config.JELLYFIN2_API}/Items/{item_id}/Refresh"
+               f"?MetadataRefreshMode=FullRefresh&ImageRefreshMode=None"
+               f"&ReplaceAllMetadata=false&ReplaceAllImages=false")
+        req = urllib.request.Request(url, data=b"", method="POST")
+        if config.JELLYFIN2_KEY:
+            req.add_header("Authorization", f'MediaBrowser Token="{config.JELLYFIN2_KEY}"')
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            pass
+    except Exception:
+        pass
+
+
+def _ensure_refresh_worker():
+    global _refresh_worker_started
+    with _refresh_worker_lock:
+        if _refresh_worker_started:
+            return
+        _refresh_worker_started = True
+
+        def _worker():
+            while True:
+                p = _refresh_queue.get()
+                try:
+                    _do_jellyfin_refresh_sync(p)
+                except Exception:
+                    pass
+                finally:
+                    _refresh_queue.task_done()
+                time.sleep(1.5)  # 限流：每 1.5s 串行刷新一集，保护首播带宽与 Jellyfin2 CPU
+
+        threading.Thread(target=_worker, daemon=True, name="jf2-refresh-limiter").start()
 
 
 def strm_path_for(cat, title, season, episode):
@@ -230,7 +286,7 @@ def restore_pending(path, cat, title, season, episode):
     return True
 
 
-def activate(cat, title, season, episode, direct_url):
+def activate(cat, title, season, episode, direct_url, background_batch=False):
     """转存成功后：登记 strm_map + 写 live + 同步 DB 记录状态。
 
     具备工业级标题脱水与四级自适应定位容错能力：
@@ -293,7 +349,7 @@ def activate(cat, title, season, episode, direct_url):
         pass
 
     changed = write_live(path, direct_url)
-    trigger_jellyfin_refresh_item(path)
+    trigger_jellyfin_refresh_item(path, throttled=background_batch)
 
     # 同一部片可能存在于多个专区（实测《霸王别姬》同时在 国产电影/ 与 港台经典/），
     # 必须把【所有】专区下的 strm 一并回写。
@@ -310,7 +366,7 @@ def activate(cat, title, season, episode, direct_url):
             seen_paths.add(ap)
             try:
                 if write_live(p, direct_url):
-                    trigger_jellyfin_refresh_item(p)
+                    trigger_jellyfin_refresh_item(p, throttled=True)
             except Exception:
                 pass
 
@@ -366,36 +422,19 @@ def _sync_transfer_done(cat, title_candidates, season, episode):
               f"S{season}E{episode}: {e}", flush=True)
 
 
-def trigger_jellyfin_refresh_item(strm_path):
-    """异步通知 Jellyfin2 刷新单个条目的媒体流信息（保障 DirectPlay，杜绝未知流强制转码）。"""
+def trigger_jellyfin_refresh_item(strm_path, throttled=False):
+    """异步通知 Jellyfin2 刷新单个条目的媒体流信息（保障 DirectPlay，杜绝未知流强制转码）。
+
+    throttled=True 时走后台串行限流队列（间隔 1.5s），防止整季 40 集连带激活时
+    40 个并发 FullRefresh 挤占当前首播集的网络带宽与 Jellyfin2 CPU。
+    """
     if not strm_path or not os.path.isfile(strm_path):
         return
-
-    def _bg_refresh():
-        try:
-            import urllib.request
-            import sqlite3
-            container_path = strm_path.replace(config.CINEMA2_DIR, "/cinema2")
-            con = sqlite3.connect(f"file:{config.JELLYFIN2_DB}?mode=ro", uri=True)
-            cur = con.cursor()
-            row = cur.execute("SELECT Id FROM BaseItems WHERE Path = ? LIMIT 1", (container_path,)).fetchone()
-            con.close()
-            if not row or not row[0]:
-                return
-            item_id = row[0]
-            url = (f"{config.JELLYFIN2_API}/Items/{item_id}/Refresh"
-                   f"?MetadataRefreshMode=FullRefresh&ImageRefreshMode=None"
-                   f"&ReplaceAllMetadata=false&ReplaceAllImages=false")
-            req = urllib.request.Request(url, data=b"", method="POST")
-            if config.JELLYFIN2_KEY:
-                req.add_header("Authorization", f'MediaBrowser Token="{config.JELLYFIN2_KEY}"')
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                pass
-        except Exception:
-            pass
-
-    import threading
-    threading.Thread(target=_bg_refresh, daemon=True).start()
+    if throttled:
+        _ensure_refresh_worker()
+        _refresh_queue.put(strm_path)
+        return
+    threading.Thread(target=_do_jellyfin_refresh_sync, args=(strm_path,), daemon=True).start()
 
 
 def _strm_path_by_title(title, season, episode, cat=None):

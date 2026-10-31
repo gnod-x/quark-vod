@@ -807,10 +807,10 @@ class QuarkTransfer:
                                 db.upsert_transfer(cat, title, season, other_ep,
                                                    status="done", remote_path=other_rpath,
                                                    file_size=other_vid.get("size") or 0, error=None)
-                                # 拼接播放直链并原子激活对应集数的 strm
+                                # 拼接播放直链并原子激活对应集数的 strm（后台限流刷新，不抢首播带宽）
                                 enc = urllib.parse.quote(config.play_path(other_rpath))
                                 d_url = f"{config.OPENLIST_PUBLIC}/d{enc}"
-                                strm_manager.activate(cat, title, season, other_ep, d_url)
+                                strm_manager.activate(cat, title, season, other_ep, d_url, background_batch=True)
                                 print(f"[{config.SERVICE_NAME}] [整季连带激活] {title} S{season}E{other_ep} -> {d_url}", flush=True)
                             except Exception:
                                 pass

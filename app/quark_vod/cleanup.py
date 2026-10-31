@@ -35,24 +35,24 @@ PROTECTED_CATEGORIES = set()  # 港台经典不设免死保护，所有专区均
 
 def get_protected_titles():
     """获取所有受保护（不可被网盘配额清理删除）的影片标题集合。仅收藏（Favorites）项目享有永久豁免。"""
+    from contextlib import closing
     protected = set()
 
-    # 查询 jellyfin.db 中已收藏的条目（包含电影与剧集）
+    # 查询 jellyfin.db 中已收藏的条目（包含电影与剧集，免锁只读）
     if os.path.exists(JF_DB):
         try:
-            con = sqlite3.connect(f"file:{JF_DB}?mode=ro", uri=True)
-            cur = con.cursor()
-            cur.execute("""
-                SELECT b.Name, b.SeriesName FROM BaseItems b
-                JOIN UserData u ON b.Id = u.ItemId
-                WHERE u.IsFavorite = 1
-            """)
-            for row in cur.fetchall():
-                if row[0]:
-                    protected.add(row[0].strip())
-                if row[1]:
-                    protected.add(row[1].strip())
-            con.close()
+            with closing(sqlite3.connect(f"file:{JF_DB}?mode=ro&immutable=1", uri=True)) as con:
+                cur = con.cursor()
+                cur.execute("""
+                    SELECT b.Name, b.SeriesName FROM BaseItems b
+                    JOIN UserData u ON b.Id = u.ItemId
+                    WHERE u.IsFavorite = 1
+                """)
+                for row in cur.fetchall():
+                    if row[0]:
+                        protected.add(row[0].strip())
+                    if row[1]:
+                        protected.add(row[1].strip())
         except Exception as e:
             print(f"[cleanup] 读取 Jellyfin UserData 失败: {e}", flush=True)
 
@@ -421,6 +421,73 @@ def clean_mismatched_short_dramas(dry_run=False, verbose=True):
     return cleaned_count
 
 
+def prune_jellyfin2_orphan_metadata(dry_run=False, verbose=True):
+    """清理 jellyfin2/config/metadata/library 下未被 BaseItemImageInfos 引用的历史孤儿图片。
+
+    背景（2026-10-31 专项治理）：
+    backfill_episode_thumbs 将单集剧照迁入 /cinema2/*-thumb.jpg 后，Jellyfin2 更新了
+    BaseItemImageInfos 指向本地剧照，但未删除 /config/metadata/library/<xx>/<guid>/poster.jpg
+    下的旧副本，导致堆积 18,975 个僵尸图片文件（5.33 GB）。
+    """
+    from contextlib import closing
+    lib_dir = os.path.join(config.BASE_DIR, "jellyfin2/config/metadata/library")
+    if not os.path.exists(JF_DB) or not os.path.isdir(lib_dir):
+        return 0, 0
+
+    try:
+        with closing(sqlite3.connect(f"file:{JF_DB}?mode=ro&immutable=1", uri=True)) as con:
+            cur = con.cursor()
+            referenced = set()
+            for (p,) in cur.execute(
+                "SELECT Path FROM BaseItemImageInfos WHERE Path LIKE '%/metadata/library/%'"
+            ).fetchall():
+                if p:
+                    referenced.add(
+                        p.replace("/config/", os.path.join(config.BASE_DIR, "jellyfin2/config/"))
+                    )
+    except Exception as e:
+        print(f"[cleanup] 读取 BaseItemImageInfos 失败，跳过孤儿元数据清理: {e}", flush=True)
+        return 0, 0
+
+    # 安全阈值保护：若数据库读取异常导致 referenced 过少，拒绝清理
+    if len(referenced) < 100:
+        return 0, 0
+
+    removed_files = 0
+    removed_bytes = 0
+    removed_dirs = 0
+
+    for root, dirs, files in os.walk(lib_dir, topdown=False):
+        for fn in files:
+            fp = os.path.join(root, fn)
+            if fp not in referenced:
+                try:
+                    sz = os.path.getsize(fp)
+                    if not dry_run:
+                        os.remove(fp)
+                    removed_files += 1
+                    removed_bytes += sz
+                except OSError:
+                    pass
+        # 若子目录已空则顺带移除空目录
+        if root != lib_dir and not dry_run:
+            try:
+                if not os.listdir(root):
+                    os.rmdir(root)
+                    removed_dirs += 1
+            except OSError:
+                pass
+
+    if verbose and (removed_files > 0 or dry_run):
+        mb = round(removed_bytes / (1024 * 1024), 2)
+        print(
+            f"[cleanup] Jellyfin2 孤儿元数据清理: {'(预演) ' if dry_run else ''}"
+            f"移除文件 {removed_files} 个 ({mb} MB), 清理空目录 {removed_dirs} 个",
+            flush=True,
+        )
+    return removed_files, removed_bytes
+
+
 def main():
     import sys
     import fcntl
@@ -446,7 +513,10 @@ def main():
         # 2. 执行 2TB 容量配额检测与 LRU 智能淘汰
         enforce_vod_quota(ol=ol, dry_run=dry, verbose=True)
 
-        # 3. 如果非仅配额检查，顺带执行过期队列表的清理
+        # 3. 清理 Jellyfin2 metadata/library 下的孤儿图片缓存
+        prune_jellyfin2_orphan_metadata(dry_run=dry, verbose=True)
+
+        # 4. 如果非仅配额检查，顺带执行过期队列表的清理
         if not enforce_quota_only:
             ok, fail, skip = run_cleanup(dry_run=dry)
             print(f"[cleanup] 到期清理完成: 成功 {ok} 失败 {fail} 跳过 {skip}", flush=True)

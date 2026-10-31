@@ -1,4 +1,8 @@
-.PHONY: up down restart build logs status test
+.PHONY: up down restart build logs status test sync
+
+sync:
+	@cp -f /home/dong/projects/quark-vod/app/quark_vod/*.py /home/dong/projects/hometheater/scripts/quark_vod/
+	@echo "[OK] Synced quark_vod modules to hometheater/scripts/quark_vod"
 
 up:
 	docker compose up -d
@@ -6,7 +10,7 @@ up:
 build:
 	docker compose build quark-vod && docker compose up -d
 
-restart:
+restart: sync
 	docker compose restart quark-vod
 
 down:
@@ -29,3 +33,4 @@ test:
 	@curl -sf http://127.0.0.1:8099/docs >/dev/null && echo "[PASS] 5. 8099 /docs Swagger UI reachable"
 	@python3 -c "import urllib.request, json, sys; d=json.loads(urllib.request.urlopen('http://127.0.0.1:8099/capability').read()); print('[PASS] 6. Capability ready:', d) if d.get('ready') else sys.exit(1)"
 	@python3 -m py_compile app/main.py app/quark_vod/*.py app/jobs/*.py && echo "[PASS] 7. All Python modules compile cleanly"
+	@diff -q /home/dong/projects/quark-vod/app/quark_vod/strm_manager.py /home/dong/projects/hometheater/scripts/quark_vod/strm_manager.py >/dev/null && echo "[PASS] 8. quark_vod dual-directory in sync" || (echo "[FAIL] 8. quark_vod drift detected!" && exit 1)

@@ -78,6 +78,6 @@ make test       # 运行自动化验收测试套件
 
 1. **能耗红线**：严禁唤醒 GTX 1050 独显（必须保持 `D3cold`）；容器必须声明 `deploy.resources.limits.memory: 256M`。
 2. **读写分离红线**：写入与清理走 `/夸克网盘` (Web Cookie)，播放直链统一經 `config.play_path()` 走 `/夸克` (QuarkTV)。
-3. **免锁读取红线**：读取 OpenList `data.db` 必须带 `?mode=ro&immutable=1` 并包裹在 `closing()` 中立即释放句柄。
-4. **元数据保护红线**：`trigger_jellyfin_refresh_item` 必须保持 `ReplaceAllMetadata=false`，防止覆盖 Jellyfin2 中已同步的 AI 精修简介。
-5. **双向同步契约**：对 `app/quark_vod/` 核心模块做修改后，如需同步回原仓库脚本，确保 `make test` 与 `hometheater/CLAUDE.md` 验证清单全部通过。
+3. **免锁读取红线**：读取 OpenList `data.db` 与 `jellyfin2/config/data/jellyfin.db` 必须带 `?mode=ro&immutable=1` 并包裹在 `closing()` 中立即释放句柄。
+4. **元数据保护与限流红线**：`trigger_jellyfin_refresh_item` 必须保持 `ReplaceAllMetadata=false`，防止覆盖 Jellyfin2 中已同步的 AI 精修简介；整季连带激活（`background_batch=True`）自动走 1.5s 间隔串行队列，严禁并发风暴抢占首播带宽。
+5. **双向同步契约**：`make restart` 自动触发 `make sync` 将 `app/quark_vod/*.py` 同步至 `/home/dong/projects/hometheater/scripts/quark_vod/`，并由 `make test` 第 8 项強制校验零漂移。

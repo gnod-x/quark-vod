@@ -50,24 +50,24 @@ def log(msg):
 
 def get_protected_titles():
     """获取所有受保护（不可删除）的影片标题集合。除用户收藏（IsFavorite=1）外，其他均不设永久保护。"""
+    from contextlib import closing
     protected = set()
 
-    # 仅查询 jellyfin.db 中已收藏的项目（支持电影名称与剧集名称）
+    # 仅查询 jellyfin.db 中已收藏的项目（支持电影名称与剧集名称，免锁只读）
     if os.path.exists(JF_DB):
         try:
-            con = sqlite3.connect(f"file:{JF_DB}?mode=ro", uri=True)
-            cur = con.cursor()
-            cur.execute("""
-                SELECT b.Name, b.SeriesName FROM BaseItems b
-                JOIN UserData u ON b.Id = u.ItemId
-                WHERE u.IsFavorite = 1
-            """)
-            for row in cur.fetchall():
-                if row[0]:
-                    protected.add(row[0].strip())
-                if row[1]:
-                    protected.add(row[1].strip())
-            con.close()
+            with closing(sqlite3.connect(f"file:{JF_DB}?mode=ro&immutable=1", uri=True)) as con:
+                cur = con.cursor()
+                cur.execute("""
+                    SELECT b.Name, b.SeriesName FROM BaseItems b
+                    JOIN UserData u ON b.Id = u.ItemId
+                    WHERE u.IsFavorite = 1
+                """)
+                for row in cur.fetchall():
+                    if row[0]:
+                        protected.add(row[0].strip())
+                    if row[1]:
+                        protected.add(row[1].strip())
         except Exception as e:
             log(f"读取 Jellyfin UserData 失败: {e}")
 

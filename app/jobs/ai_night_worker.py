@@ -502,20 +502,20 @@ def _sync_nfo_to_jellyfin2(nfo_path, final_plot, all_tags):
     if not vod_cfg.JELLYFIN2_KEY or not os.path.exists(vod_cfg.JELLYFIN2_DB):
         return False
     try:
+        from contextlib import closing
         item_dir = os.path.dirname(nfo_path).replace(vod_cfg.CINEMA2_DIR, "/cinema2")
-        con = sqlite3.connect(f"file:{vod_cfg.JELLYFIN2_DB}?mode=ro", uri=True)
-        cur = con.cursor()
-        if nfo_path.endswith("tvshow.nfo"):
-            row = cur.execute(
-                "SELECT Id FROM BaseItems WHERE Path = ? AND Type LIKE '%Series' LIMIT 1",
-                (item_dir,)
-            ).fetchone()
-        else:
-            row = cur.execute(
-                "SELECT Id FROM BaseItems WHERE Path LIKE ? AND Type LIKE '%Movie' LIMIT 1",
-                (item_dir + "/%",)
-            ).fetchone()
-        con.close()
+        with closing(sqlite3.connect(f"file:{vod_cfg.JELLYFIN2_DB}?mode=ro&immutable=1", uri=True)) as con:
+            cur = con.cursor()
+            if nfo_path.endswith("tvshow.nfo"):
+                row = cur.execute(
+                    "SELECT Id FROM BaseItems WHERE Path = ? AND Type LIKE '%Series' LIMIT 1",
+                    (item_dir,)
+                ).fetchone()
+            else:
+                row = cur.execute(
+                    "SELECT Id FROM BaseItems WHERE Path LIKE ? AND Type LIKE '%Movie' LIMIT 1",
+                    (item_dir + "/%",)
+                ).fetchone()
         if not row or not row[0]:
             return False
         item_id = row[0]
@@ -661,18 +661,18 @@ def run_enrich_peoples_knowledge():
     if not os.path.exists(jf_db):
         return
 
-    con = sqlite3.connect(f"file:{jf_db}?mode=ro", uri=True)
-    cur = con.cursor()
-    # 查询 BaseItems 中所有人物条目，并按参演作品热度降序排序
-    people_rows = cur.execute("""
-        SELECT b.Id, b.Name, b.Overview, COUNT(p.Id) as work_count
-        FROM BaseItems b
-        LEFT JOIN Peoples p ON b.Name = p.Name
-        WHERE b.Type = 'MediaBrowser.Controller.Entities.Person'
-        GROUP BY b.Id, b.Name
-        ORDER BY work_count DESC
-    """).fetchall()
-    con.close()
+    from contextlib import closing
+    with closing(sqlite3.connect(f"file:{jf_db}?mode=ro&immutable=1", uri=True)) as con:
+        cur = con.cursor()
+        # 查询 BaseItems 中所有人物条目，并按参演作品热度降序排序
+        people_rows = cur.execute("""
+            SELECT b.Id, b.Name, b.Overview, COUNT(p.Id) as work_count
+            FROM BaseItems b
+            LEFT JOIN Peoples p ON b.Name = p.Name
+            WHERE b.Type = 'MediaBrowser.Controller.Entities.Person'
+            GROUP BY b.Id, b.Name
+            ORDER BY work_count DESC
+        """).fetchall()
 
     log(f"当前 Jellyfin2 数据库共登记演职人员: {len(people_rows)} 位 (已按作品热度排序)")
 
