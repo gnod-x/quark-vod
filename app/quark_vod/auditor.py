@@ -24,7 +24,7 @@ import urllib.parse
 from . import config
 from . import db
 from . import search as search_mod
-from .transfer import QuarkTransfer, TransferFailed, QUARK_SHARE_DETAIL, VIDEO_EXTS
+from .transfer import QuarkTransfer, TransferFailed, QUARK_SHARE_DETAIL, is_candidate_video
 from .openlist_client import OpenListClient
 
 # 4K / 超高清正片识别正则
@@ -111,8 +111,7 @@ class VodAuditor:
             for fit in inspect_items:
                 fname = fit.get("file_name", "")
                 fsize = fit.get("size", 0) or 0
-                ext = ("." + fname.rsplit(".", 1)[1].lower()) if "." in fname else ""
-                if ext in VIDEO_EXTS:
+                if not fit.get("dir") and is_candidate_video(fname, fsize):
                     ep_no = self.tr.extract_episode_num(fname, season=season)
                     if ep_no and ep_no > 0:
                         is_single_4k = is_4k_pack or is_4k_candidate(fname, fsize, is_series=True)
@@ -213,8 +212,7 @@ class VodAuditor:
             for fit in inspect_items:
                 fname = fit.get("file_name", "")
                 fsize = fit.get("size", 0) or 0
-                ext = ("." + fname.rsplit(".", 1)[1].lower()) if "." in fname else ""
-                if ext in VIDEO_EXTS:
+                if not fit.get("dir") and is_candidate_video(fname, fsize):
                     video_fits.append((fname, fsize))
                     if is_4k_candidate(fname, fsize, is_series=False):
                         is_4k = True

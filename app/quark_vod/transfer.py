@@ -41,6 +41,23 @@ QUARK_TASK = "https://drive.quark.cn/1/clouddrive/task?pr=ucpro&fr=pc"
 QUARK_FILE_RENAME = "https://drive.quark.cn/1/clouddrive/file/rename?pr=ucpro&fr=pc"
 
 VIDEO_EXTS = {".mp4", ".mkv", ".ts", ".m2ts", ".avi", ".mov", ".flv", ".wmv"}
+# 规避审查的伪装后缀（"" 表示无后缀），与 sniff_and_fix_file 的兜底扶正口径保持一致
+DISGUISE_EXTS = {".mp3", ".pdf", ".txt", ".apk", ".mkv1", ".mp41", ""}
+DISGUISE_MIN_SIZE = 200 * 1024 * 1024
+
+
+def is_candidate_video(name, size=0):
+    """验票/预检阶段判定分享包内条目是否为候选视频。
+
+    2026-11-04 修复：原实现只认 VIDEO_EXTS，分享包把正片伪装成 E28.mp3 (1.5GB) 时，
+    验票直接判「未找到 S01E28」拒绝转存，转存后的 sniff_and_fix_file 扶正逻辑根本没机会执行
+    （实测《嫁金钗》E27~E30 必现 503）。伪装后缀且体积 > 200MB 一律视为候选视频放行，
+    真实格式由转存后的魔数嗅探扶正。
+    """
+    ext = ("." + name.rsplit(".", 1)[1].lower()) if "." in name else ""
+    if ext in VIDEO_EXTS:
+        return True
+    return ext in DISGUISE_EXTS and (size or 0) > DISGUISE_MIN_SIZE
 
 
 def is_poisoned_fake_header(header_bytes):
@@ -379,7 +396,7 @@ class QuarkTransfer:
                 correct_ext = ".mkv"
             elif ext in {".mp41"}:
                 correct_ext = ".mp4"
-            elif ext in {".mp3", ".pdf", ".txt", ".apk"} and size > 200 * 1024 * 1024:
+            elif ext in DISGUISE_EXTS and size > DISGUISE_MIN_SIZE:
                 # 常见规避和谐伪装，默认为 .mkv
                 correct_ext = ".mkv"
 
@@ -672,7 +689,7 @@ class QuarkTransfer:
 
             valid_vids = [
                 fit for fit in inspect_items
-                if any(fit.get("file_name", "").lower().endswith(ext) for ext in VIDEO_EXTS)
+                if not fit.get("dir") and is_candidate_video(fit.get("file_name", ""), fit.get("size"))
             ]
             if not valid_vids:
                 raise TransferFailed("分享包内未包含任何标准视频文件，拒绝转存")
