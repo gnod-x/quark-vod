@@ -2,266 +2,918 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <title>Quark-VOD Engine · 白盒管理控制台</title>
   <style>
     :root {
       --bg: #0f172a;
       --card: #1e293b;
+      --card-hover: #24344d;
       --border: #334155;
+      --border-subtle: #253347;
       --text: #f1f5f9;
       --muted: #94a3b8;
       --accent: #38bdf8;
+      --accent-glow: rgba(56, 189, 248, 0.15);
       --ok: #22c55e;
+      --ok-bg: rgba(34, 197, 94, 0.15);
       --warn: #f59e0b;
+      --warn-bg: rgba(245, 158, 11, 0.15);
       --err: #ef4444;
+      --err-bg: rgba(239, 68, 68, 0.15);
+      --radius: 10px;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    html, body {
       background: var(--bg);
       color: var(--text);
-      padding: 20px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
       line-height: 1.5;
+      overflow-x: hidden;
+      width: 100%;
     }
-    .container { max-width: 1320px; margin: 0 auto; }
+
+    body {
+      padding: 16px;
+    }
+
+    @media (min-width: 768px) {
+      body {
+        padding: 24px;
+      }
+    }
+
+    .container {
+      max-width: 1320px;
+      margin: 0 auto;
+      width: 100%;
+    }
+
+    /* 头部导航与操作区 */
     header {
       display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
+      flex-direction: column;
       gap: 12px;
       padding-bottom: 16px;
-      margin-bottom: 20px;
+      margin-bottom: 18px;
       border-bottom: 1px solid var(--border);
     }
-    header h1 { font-size: 1.35rem; font-weight: 700; display: flex; align-items: center; gap: 10px; }
-    .badge {
-      padding: 3px 10px;
-      border-radius: 999px;
-      font-size: 0.78rem;
-      font-weight: 600;
+
+    @media (min-width: 768px) {
+      header {
+        flex-direction: row;
+        justify-content: space-between;
+        align-items: center;
+      }
     }
-    .badge-ok { background: rgba(34,197,94,0.18); color: #4ade80; border: 1px solid rgba(34,197,94,0.35); }
-    .badge-err { background: rgba(239,68,68,0.18); color: #f87171; border: 1px solid rgba(239,68,68,0.35); }
-    .badge-warn { background: rgba(245,158,11,0.18); color: #fbbf24; border: 1px solid rgba(245,158,11,0.35); }
-    .nav-links { display: flex; gap: 10px; align-items: center; }
+
+    .brand-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    header h1 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    @media (min-width: 768px) {
+      header h1 { font-size: 1.35rem; }
+    }
+
+    .nav-links {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 8px;
+      width: 100%;
+    }
+
+    @media (min-width: 560px) {
+      .nav-links {
+        display: flex;
+        flex-wrap: wrap;
+        width: auto;
+      }
+    }
+
+    /* 通用按钮 */
     .btn {
       background: #2563eb;
       color: #fff;
-      border: none;
-      padding: 7px 14px;
-      border-radius: 6px;
+      border: 1px solid transparent;
+      padding: 8px 14px;
+      border-radius: 8px;
       cursor: pointer;
       font-size: 0.85rem;
       font-weight: 500;
       text-decoration: none;
       display: inline-flex;
       align-items: center;
+      justify-content: center;
       gap: 6px;
+      transition: all 0.15s ease;
+      touch-action: manipulation;
+      min-height: 38px;
+      white-space: nowrap;
     }
-    .btn:hover { opacity: 0.92; }
-    .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
-    .btn-sm { padding: 4px 10px; font-size: 0.78rem; }
-    .btn-danger { background: #dc2626; }
+
+    .btn:hover { opacity: 0.92; transform: translateY(-1px); }
+    .btn:active { transform: translateY(0); opacity: 0.85; }
+    .btn-outline {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    .btn-outline:hover {
+      background: rgba(255, 255, 255, 0.08);
+      border-color: var(--muted);
+    }
+    .btn-sm {
+      padding: 5px 10px;
+      font-size: 0.78rem;
+      min-height: 32px;
+      border-radius: 6px;
+    }
+    .btn-danger { background: #dc2626; color: #fff; }
+    .btn-danger:hover { background: #ef4444; }
+
+    /* 徽标 */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+    .badge-ok { background: var(--ok-bg); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.35); }
+    .badge-err { background: var(--err-bg); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.35); }
+    .badge-warn { background: var(--warn-bg); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); }
+    .badge-tag { background: rgba(56, 189, 248, 0.12); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.25); }
+
+    /* 顶部 4 大核心指标卡片 */
     .grid-4 {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 14px;
-      margin-bottom: 20px;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+      margin-bottom: 16px;
     }
+
+    @media (min-width: 900px) {
+      .grid-4 {
+        grid-template-columns: repeat(4, 1fr);
+        gap: 14px;
+        margin-bottom: 20px;
+      }
+    }
+
     .card {
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 16px;
-      margin-bottom: 18px;
+      border-radius: var(--radius);
+      padding: 14px;
+      margin-bottom: 16px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+      position: relative;
     }
-    .stat-title { font-size: 0.8rem; color: var(--muted); margin-bottom: 6px; }
-    .stat-val { font-size: 1.55rem; font-weight: 700; }
-    .stat-sub { font-size: 0.78rem; color: var(--muted); margin-top: 4px; }
+
+    @media (min-width: 768px) {
+      .card {
+        padding: 18px;
+        margin-bottom: 20px;
+      }
+    }
+
+    .stat-card {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 95px;
+    }
+
+    .stat-title {
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-bottom: 4px;
+      font-weight: 500;
+    }
+
+    .stat-val {
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: var(--text);
+      word-break: break-word;
+    }
+
+    @media (min-width: 768px) {
+      .stat-title { font-size: 0.8rem; }
+      .stat-val { font-size: 1.45rem; }
+    }
+
+    .stat-sub {
+      font-size: 0.72rem;
+      color: var(--muted);
+      margin-top: 4px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* 区块标题与视图切换按钮 */
     .section-title {
-      font-size: 1rem;
+      font-size: 0.95rem;
       font-weight: 600;
       margin-bottom: 12px;
       display: flex;
       justify-content: space-between;
       align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
     }
+
+    @media (min-width: 768px) {
+      .section-title { font-size: 1.05rem; }
+    }
+
+    .view-switcher {
+      display: inline-flex;
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 2px;
+      gap: 2px;
+    }
+
+    .view-btn {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      font-size: 0.74rem;
+      padding: 4px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-weight: 500;
+    }
+
+    .view-btn.active {
+      background: #2563eb;
+      color: #fff;
+    }
+
+    /* 表单组件 */
     .form-row {
       display: flex;
-      flex-wrap: wrap;
+      flex-direction: column;
       gap: 10px;
       margin-bottom: 12px;
     }
+
+    @media (min-width: 768px) {
+      .form-row {
+        flex-direction: row;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+    }
+
+    .form-subgroup {
+      display: flex;
+      gap: 8px;
+      width: 100%;
+    }
+
+    @media (min-width: 768px) {
+      .form-subgroup {
+        width: auto;
+      }
+    }
+
     input, select, textarea {
       background: #0f172a;
       border: 1px solid var(--border);
       color: var(--text);
       padding: 8px 12px;
-      border-radius: 6px;
+      border-radius: 8px;
       font-size: 0.88rem;
+      width: 100%;
+      outline: none;
+      transition: border-color 0.15s ease;
+      min-height: 40px;
     }
+
+    input:focus, select:focus, textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px var(--accent-glow);
+    }
+
+    /* 表格视图通用样式 (桌面优先，且带截断保护) */
+    .table-container {
+      width: 100%;
+      overflow-x: auto;
+      border-radius: 8px;
+      border: 1px solid var(--border-subtle);
+      -webkit-overflow-scrolling: touch;
+    }
+
     table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 0.84rem;
+      font-size: 0.82rem;
+      table-layout: fixed;
+      min-width: 820px;
     }
+
     th, td {
       text-align: left;
-      padding: 9px 10px;
+      padding: 10px 10px;
       border-bottom: 1px solid var(--border);
       vertical-align: middle;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
-    th { color: var(--muted); font-weight: 600; font-size: 0.78rem; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; }
+
+    th {
+      background: #172235;
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    tbody tr:hover {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.78rem;
+    }
+
+    /* 移动端专属卡片列表布局 (核心优化：彻底解决字长变形) */
+    .mobile-cards-container {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .vod-card {
+      background: #172235;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      position: relative;
+      transition: border-color 0.15s ease;
+    }
+
+    .vod-card:hover {
+      border-color: #475569;
+    }
+
+    .vod-card-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+    }
+
+    .vod-card-title-group {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      flex: 1;
+      min-width: 0;
+    }
+
+    .vod-card-id {
+      font-size: 0.72rem;
+      font-family: ui-monospace, monospace;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.06);
+      padding: 1px 6px;
+      border-radius: 4px;
+    }
+
+    .vod-card-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--text);
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      line-height: 1.35;
+    }
+
+    .vod-card-cat {
+      font-size: 0.7rem;
+      background: rgba(56, 189, 248, 0.12);
+      color: var(--accent);
+      padding: 1px 6px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+
+    .vod-card-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 12px;
+      font-size: 0.75rem;
+      color: var(--muted);
+      background: rgba(15, 23, 42, 0.45);
+      padding: 6px 10px;
+      border-radius: 6px;
+    }
+
+    .vod-card-meta span {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    /* 路径与长诊断信息框：多行折行、可折叠、不破版 */
+    .vod-detail-box {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.74rem;
+      line-height: 1.45;
+      color: #cbd5e1;
+      background: #0f172a;
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      padding: 8px 10px;
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      position: relative;
+    }
+
+    .vod-detail-clamped {
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      cursor: pointer;
+    }
+
+    .vod-detail-box.expanded .vod-detail-clamped {
+      display: block;
+      -webkit-line-clamp: unset;
+      overflow: visible;
+    }
+
+    .vod-detail-toggle {
+      font-size: 0.68rem;
+      color: var(--accent);
+      margin-top: 4px;
+      cursor: pointer;
+      display: inline-block;
+      user-select: none;
+    }
+
+    .vod-card-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      align-items: center;
+      padding-top: 4px;
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .vod-card-actions .btn {
+      flex: 1;
+      min-height: 34px;
+      font-size: 0.78rem;
+    }
+
+    @media (min-width: 500px) {
+      .vod-card-actions .btn {
+        flex: 0 0 auto;
+      }
+    }
+
+    /* 搜索候选资源卡片 */
+    .candidate-card {
+      background: #172235;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .candidate-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .candidate-name {
+      font-size: 0.86rem;
+      font-weight: 600;
+      color: var(--text);
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      line-height: 1.4;
+    }
+
+    .candidate-link {
+      font-size: 0.74rem;
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .candidate-link:hover { text-decoration: underline; }
+
+    /* 全局轻提示 */
     .toast {
       position: fixed;
-      bottom: 20px;
-      right: 20px;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
       background: #1e293b;
       border: 1px solid var(--accent);
       color: var(--text);
-      padding: 10px 16px;
-      border-radius: 8px;
+      padding: 10px 18px;
+      border-radius: 30px;
+      font-size: 0.84rem;
       display: none;
-      z-index: 999;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+      z-index: 9999;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+      max-width: 90vw;
+      text-align: center;
+      animation: fadeIn 0.2s ease;
     }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translate(-50%, 10px); }
+      to { opacity: 1; transform: translate(-50%, 0); }
+    }
+
+    /* 辅助类 */
+    .hidden { display: none !important; }
+    .text-muted { color: var(--muted); }
   </style>
 </head>
 <body>
 <div class="container">
+
+  <!-- 头部与快捷导航 -->
   <header>
-    <h1>
-      <span>Quark-VOD Engine</span>
+    <div class="brand-wrap">
+      <h1>
+        <span>🎬 Quark-VOD Engine</span>
+      </h1>
       <span id="readyBadge" class="badge badge-warn">检测中...</span>
-    </h1>
+    </div>
     <div class="nav-links">
-      <button class="btn btn-outline" onclick="loadOverview()">刷新状态</button>
-      <button class="btn btn-outline" onclick="triggerSelfheal()">触发自愈巡检</button>
-      <button class="btn btn-outline" onclick="checkQuota()">测算网盘容量</button>
-      <a class="btn" href="/docs" target="_blank">Swagger API (/docs)</a>
+      <button class="btn btn-outline btn-sm" onclick="loadOverview()">🔄 刷新状态</button>
+      <button class="btn btn-outline btn-sm" onclick="triggerSelfheal()">🩺 自愈巡检</button>
+      <button class="btn btn-outline btn-sm" onclick="checkQuota()">📊 测算水位</button>
+      <a class="btn btn-sm" href="/docs" target="_blank">📖 API /docs</a>
     </div>
   </header>
 
+  <!-- 4 大核心指标卡片 -->
   <div class="grid-4">
-    <div class="card" style="margin-bottom:0">
-      <div class="stat-title">夸克 Cookie & OpenList 写能力</div>
-      <div class="stat-val" id="capStatus">-</div>
-      <div class="stat-sub" id="capDetail">-</div>
+    <div class="card stat-card" style="margin-bottom:0">
+      <div>
+        <div class="stat-title">夸克 Cookie & 写入</div>
+        <div class="stat-val" id="capStatus">-</div>
+      </div>
+      <div class="stat-sub" id="capDetail" title="-">-</div>
     </div>
-    <div class="card" style="margin-bottom:0">
-      <div class="stat-title">活跃 Live 直链 / 历史累计播放</div>
-      <div class="stat-val" id="liveCount">-</div>
-      <div class="stat-sub" id="strmCount">-</div>
+    <div class="card stat-card" style="margin-bottom:0">
+      <div>
+        <div class="stat-title">就绪直链 / 累计播放</div>
+        <div class="stat-val" id="liveCount">-</div>
+      </div>
+      <div class="stat-sub" id="strmCount" title="-">-</div>
     </div>
-    <div class="card" style="margin-bottom:0">
-      <div class="stat-title">前置 4K 锁源审计库</div>
-      <div class="stat-val" id="audit4kCount">-</div>
-      <div class="stat-sub" id="auditDetail">-</div>
+    <div class="card stat-card" style="margin-bottom:0">
+      <div>
+        <div class="stat-title">4K 锁源审计库</div>
+        <div class="stat-val" id="audit4kCount">-</div>
+      </div>
+      <div class="stat-sub" id="auditDetail" title="-">-</div>
     </div>
-    <div class="card" style="margin-bottom:0">
-      <div class="stat-title">点播网盘递归容量水位</div>
-      <div class="stat-val" id="quotaVal">点击右上测算</div>
-      <div class="stat-sub" id="quotaSub">硬上限 2048 GB / 淘汰目标 1024 GB</div>
+    <div class="card stat-card" style="margin-bottom:0">
+      <div>
+        <div class="stat-title">网盘递归容量水位</div>
+        <div class="stat-val" id="quotaVal" style="font-size:1.1rem">待测算</div>
+      </div>
+      <div class="stat-sub" id="quotaSub" title="上限 2048 GB / 淘汰 1024 GB">上限 2048GB</div>
     </div>
   </div>
 
-  <!-- 白盒搜索与五维打分调试器 -->
+  <!-- 白盒搜索与五维隔离打分调试器 -->
   <div class="card">
     <div class="section-title">
-      <span>🔍 白盒搜索与五维隔离打分调试器（实时检验 6 节点召回与打分准入 >= 30）</span>
+      <span>🔍 白盒搜索与五维打分调试</span>
+      <div class="view-switcher" id="searchViewSwitcher">
+        <button class="view-btn active" id="btnSearchCard" onclick="setSearchViewMode('card')">📱 卡片</button>
+        <button class="view-btn" id="btnSearchTable" onclick="setSearchViewMode('table')">📋 表格</button>
+      </div>
     </div>
+    
     <div class="form-row">
-      <input type="text" id="qTitle" placeholder="影片名，例如：凡人修仙传 / 中国机长" style="flex:2; min-width:200px;" />
-      <select id="qCat">
-        <option value="">自动识别分类</option>
-        <option value="国产电影">国产电影</option>
-        <option value="欧美大片">欧美大片</option>
-        <option value="日韩电影">韩国电影/日本电影</option>
-        <option value="国产剧集">国产剧集</option>
-        <option value="热门韩剧">热门韩剧</option>
-        <option value="欧美剧集">欧美剧集</option>
-        <option value="国产动漫">国产动漫</option>
-        <option value="日本动漫">日本动漫</option>
-      </select>
-      <input type="number" id="qSeason" value="0" min="0" style="width:90px" placeholder="季(0=影)" title="季数(电影填0)" />
-      <input type="number" id="qEpisode" value="0" min="0" style="width:90px" placeholder="集(0=影)" title="集数(电影填0)" />
-      <button class="btn" onclick="runSearchDebug()">执行白盒检索</button>
-      <button class="btn btn-outline" onclick="runPreheatFromInput()">一键后台预热转存</button>
+      <input type="text" id="qTitle" placeholder="输入影片名，例如：凡人修仙传 / 繁花 / 哪吒" style="flex:2;" />
+      
+      <div class="form-subgroup">
+        <select id="qCat" style="flex:1;">
+          <option value="">自动识别分类</option>
+          <option value="国产剧集">国产剧集</option>
+          <option value="国产电影">国产电影</option>
+          <option value="欧美大片">欧美大片</option>
+          <option value="欧美剧集">欧美剧集</option>
+          <option value="热门韩剧">热门韩剧</option>
+          <option value="日韩电影">日韩电影</option>
+          <option value="国产动漫">国产动漫</option>
+          <option value="日本动漫">日本动漫</option>
+        </select>
+        <input type="number" id="qSeason" value="0" min="0" style="width:75px;" placeholder="季" title="季数 (电影填0)" />
+        <input type="number" id="qEpisode" value="0" min="0" style="width:75px;" placeholder="集" title="集数 (电影填0)" />
+      </div>
+
+      <div class="form-subgroup">
+        <button class="btn" style="flex:1;" onclick="runSearchDebug()">🔎 盘搜打分</button>
+        <button class="btn btn-outline" style="flex:1;" onclick="runPreheatFromInput()">⚡ 一键预热</button>
+      </div>
     </div>
-    <div id="searchMeta" style="font-size:0.82rem; color:var(--muted); margin-bottom:8px;"></div>
-    <div style="overflow-x:auto;">
-      <table id="searchTable" style="display:none;">
+
+    <div id="searchMeta" style="font-size:0.78rem; color:var(--muted); margin-bottom:10px; word-break:break-all;"></div>
+    
+    <!-- 桌面表格视图 -->
+    <div id="searchTableWrapper" class="table-container hidden">
+      <table>
         <thead>
           <tr>
-            <th>得分</th>
-            <th>准入</th>
-            <th>4K标签</th>
-            <th>来源节点</th>
-            <th>候选资源名称</th>
-            <th>夸克分享链接</th>
+            <th style="width:70px;">得分</th>
+            <th style="width:75px;">准入</th>
+            <th style="width:85px;">4K标签</th>
+            <th style="width:100px;">来源节点</th>
+            <th style="min-width:240px;">候选资源名称</th>
+            <th style="width:180px;">分享链接</th>
           </tr>
         </thead>
         <tbody id="searchTbody"></tbody>
       </table>
     </div>
+
+    <!-- 移动端卡片视图 -->
+    <div id="searchCardsWrapper" class="mobile-cards-container hidden"></div>
   </div>
 
-  <!-- 最近转存任务流水 -->
+  <!-- 最近点播转存流水（核心优化区） -->
   <div class="card">
     <div class="section-title">
-      <span>📦 最近点播转存队列与状态机流水（最近 30 条）</span>
+      <span>📦 最近转存任务队列流水（前 30 条）</span>
+      <div class="view-switcher" id="transferViewSwitcher">
+        <button class="view-btn active" id="btnTransferCard" onclick="setTransferViewMode('card')">📱 卡片</button>
+        <button class="view-btn" id="btnTransferTable" onclick="setTransferViewMode('table')">📋 表格</button>
+      </div>
     </div>
-    <div style="overflow-x:auto;">
+
+    <!-- 桌面表格视图 (带列宽控制与防止被超长字符撑爆) -->
+    <div id="transferTableWrapper" class="table-container hidden">
       <table>
         <thead>
           <tr>
-            <th>ID</th>
-            <th>专区 / 片名</th>
-            <th>季/集</th>
-            <th>状态</th>
-            <th>体积</th>
-            <th>播放次数</th>
-            <th>远端路径 / 错误诊断</th>
-            <th>更新时间</th>
-            <th>操作</th>
+            <th style="width:55px;">ID</th>
+            <th style="width:170px;">专区 / 片名</th>
+            <th style="width:75px;">季/集</th>
+            <th style="width:75px;">状态</th>
+            <th style="width:75px;">体积</th>
+            <th style="width:65px;">播放</th>
+            <th style="min-width:220px;">远端路径 / 错误诊断</th>
+            <th style="width:130px;">更新时间</th>
+            <th style="width:115px; text-align:center;">操作</th>
           </tr>
         </thead>
         <tbody id="transferTbody"></tbody>
       </table>
     </div>
+
+    <!-- 移动端卡片视图 (手机端默认) -->
+    <div id="transferCardsWrapper" class="mobile-cards-container"></div>
   </div>
 
   <!-- 夸克 Cookie 在线热更新 -->
   <div class="card">
     <div class="section-title">
-      <span>🔑 夸克 Web Cookie 在线热更新（免重启持久化至 data/quark_cookie.txt）</span>
+      <span>🔑 夸克 Web Cookie 在线热更新</span>
     </div>
     <div class="form-row">
-      <input type="password" id="newCookie" placeholder="粘贴 pan.quark.cn 的完整 Cookie 字符串（留空则恢复从 OpenList 数据库自动读取）" style="flex:1;" />
-      <button class="btn" onclick="updateCookie()">保存并立即验证</button>
+      <input type="password" id="newCookie" placeholder="粘贴 pan.quark.cn 完整 Cookie 字符串（留空自动读取 OpenList）" style="flex:1;" />
+      <button class="btn" onclick="updateCookie()" style="white-space:nowrap;">💾 保存并验证</button>
     </div>
   </div>
+
 </div>
 
 <div id="toast" class="toast"></div>
 
 <script>
+// 全局状态与缓存
+let lastTransfersData = [];
+let lastCandidatesData = [];
+let transferViewMode = localStorage.getItem('vod_view_mode') || (window.innerWidth <= 768 ? 'card' : 'table');
+let searchViewMode = window.innerWidth <= 768 ? 'card' : 'table';
+
 function showToast(msg) {
   const el = document.getElementById('toast');
   el.textContent = msg;
   el.style.display = 'block';
-  setTimeout(() => { el.style.display = 'none'; }, 3500);
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.style.display = 'none'; }, 3200);
 }
 
 function fmtTs(ts) {
   if (!ts) return '-';
   const d = new Date(ts * 1000);
-  return d.toLocaleString('zh-CN', { hour12: false });
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${m}-${day} ${hh}:${mm}`;
 }
 
+function copyText(txt) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(txt).then(() => showToast('已复制到剪贴板'));
+  } else {
+    const t = document.createElement('textarea');
+    t.value = txt;
+    document.body.appendChild(t);
+    t.select();
+    document.execCommand('copy');
+    document.body.removeChild(t);
+    showToast('已复制到剪贴板');
+  }
+}
+
+function setTransferViewMode(mode) {
+  transferViewMode = mode;
+  localStorage.setItem('vod_view_mode', mode);
+  
+  const btnCard = document.getElementById('btnTransferCard');
+  const btnTable = document.getElementById('btnTransferTable');
+  const tblWrap = document.getElementById('transferTableWrapper');
+  const crdWrap = document.getElementById('transferCardsWrapper');
+
+  if (mode === 'card') {
+    btnCard.classList.add('active');
+    btnTable.classList.remove('active');
+    tblWrap.classList.add('hidden');
+    crdWrap.classList.remove('hidden');
+  } else {
+    btnTable.classList.add('active');
+    btnCard.classList.remove('active');
+    crdWrap.classList.add('hidden');
+    tblWrap.classList.remove('hidden');
+  }
+  renderTransfers();
+}
+
+function setSearchViewMode(mode) {
+  searchViewMode = mode;
+  const btnCard = document.getElementById('btnSearchCard');
+  const btnTable = document.getElementById('btnSearchTable');
+  const tblWrap = document.getElementById('searchTableWrapper');
+  const crdWrap = document.getElementById('searchCardsWrapper');
+
+  if (mode === 'card') {
+    btnCard.classList.add('active');
+    btnTable.classList.remove('active');
+    tblWrap.classList.add('hidden');
+    if (lastCandidatesData.length > 0) crdWrap.classList.remove('hidden');
+  } else {
+    btnTable.classList.add('active');
+    btnCard.classList.remove('active');
+    crdWrap.classList.add('hidden');
+    if (lastCandidatesData.length > 0) tblWrap.classList.remove('hidden');
+  }
+  renderSearchCandidates();
+}
+
+// 渲染转存队列列表
+function renderTransfers() {
+  const rows = lastTransfersData || [];
+  const tbody = document.getElementById('transferTbody');
+  const cardsWrap = document.getElementById('transferCardsWrapper');
+
+  tbody.innerHTML = '';
+  cardsWrap.innerHTML = '';
+
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:24px;">暂无转存记录</td></tr>';
+    cardsWrap.innerHTML = '<div style="text-align:center;color:var(--muted);padding:24px;">暂无转存记录</div>';
+    return;
+  }
+
+  rows.forEach(row => {
+    let badgeCls = 'badge-warn';
+    if (row.status === 'done') badgeCls = 'badge-ok';
+    else if (row.status === 'failed') badgeCls = 'badge-err';
+
+    const isTv = row.season > 0 || row.episode > 0;
+    const seText = isTv ? `S${String(row.season).padStart(2,'0')}E${String(row.episode).padStart(2,'0')}` : '电影';
+    const detail = row.remote_path || row.error || row.share_url || '-';
+    const safeTitle = (row.title || '').replace(/'/g, "\\'");
+    const safeCat = (row.cat || '').replace(/'/g, "\\'");
+
+    // 1. 表格视图项 (带截断与浮动提示)
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="mono">#${row.id}</td>
+      <td title="${row.title}">
+        <strong style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${row.title}</strong>
+        <span style="color:var(--muted);font-size:0.72rem">${row.cat}</span>
+      </td>
+      <td class="mono">${seText}</td>
+      <td><span class="badge ${badgeCls}">${row.status}</span></td>
+      <td class="mono">${row.size_gb ? row.size_gb + ' GB' : '-'}</td>
+      <td class="mono">${row.play_count || 0}</td>
+      <td class="mono" style="cursor:pointer;" onclick="copyText('${detail.replace(/'/g, "\\'")}')" title="点击复制完整路径: ${detail}">
+        <div style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);">${detail}</div>
+      </td>
+      <td class="mono text-muted">${fmtTs(row.updated_at)}</td>
+      <td style="text-align:center;">
+        <button class="btn btn-outline btn-sm" onclick="preheatRow('${safeCat}','${safeTitle}',${row.season},${row.episode})">重转</button>
+        <button class="btn btn-danger btn-sm" onclick="resetTransfer(${row.id})">重置</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+
+    // 2. 移动端卡片视图项 (自适应折行、不被长字变形、可展开)
+    const card = document.createElement('div');
+    card.className = 'vod-card';
+    card.innerHTML = `
+      <div class="vod-card-head">
+        <div class="vod-card-title-group">
+          <span class="vod-card-id">#${row.id}</span>
+          <span class="vod-card-title">${row.title}</span>
+          <span class="vod-card-cat">${row.cat || '未分类'}</span>
+        </div>
+        <span class="badge ${badgeCls}">${row.status}</span>
+      </div>
+
+      <div class="vod-card-meta">
+        <span>🎬 ${seText}</span>
+        <span>💾 ${row.size_gb ? row.size_gb + ' GB' : '待测'}</span>
+        <span>▶ ${row.play_count || 0} 次播放</span>
+        <span>🕒 ${fmtTs(row.updated_at)}</span>
+      </div>
+
+      <div class="vod-detail-box" id="detail_box_${row.id}">
+        <div class="vod-detail-clamped" onclick="toggleDetailExpand(${row.id})">
+          <span style="color:var(--muted);font-weight:600;">[路径/诊断]</span> ${detail}
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">
+          <span class="vod-detail-toggle" onclick="toggleDetailExpand(${row.id})">展开/收起</span>
+          <span class="vod-detail-toggle" onclick="copyText('${detail.replace(/'/g, "\\'")}')">📋 复制</span>
+        </div>
+      </div>
+
+      <div class="vod-card-actions">
+        <button class="btn btn-outline btn-sm" onclick="preheatRow('${safeCat}','${safeTitle}',${row.season},${row.episode})">⚡ 重新转存</button>
+        <button class="btn btn-danger btn-sm" onclick="resetTransfer(${row.id})">🗑 重置为待处理</button>
+      </div>
+    `;
+    cardsWrap.appendChild(card);
+  });
+}
+
+function toggleDetailExpand(id) {
+  const box = document.getElementById(`detail_box_${id}`);
+  if (box) box.classList.toggle('expanded');
+}
+
+// 概览数据加载
 async function loadOverview() {
   try {
     const r = await fetch('/api/admin/overview');
@@ -274,7 +926,7 @@ async function loadOverview() {
     const rb = document.getElementById('readyBadge');
     if (cap.ready) {
       rb.className = 'badge badge-ok';
-      rb.textContent = 'ONLINE · 读写就绪';
+      rb.textContent = 'ONLINE · 就绪';
     } else {
       rb.className = 'badge badge-err';
       rb.textContent = 'DEGRADED · 需关注';
@@ -282,39 +934,80 @@ async function loadOverview() {
 
     document.getElementById('capStatus').textContent = cap.cookie_alive ? 'Cookie 有效' : 'Cookie 异常';
     document.getElementById('capDetail').textContent = `${cap.cookie_hint || ''} | OpenList: ${cap.openlist_reason || ''}`;
-    document.getElementById('liveCount').textContent = `${st.done || 0} 部就绪 / ${st.plays || 0} 次播放`;
-    document.getElementById('strmCount').textContent = `已登记 STRM: ${sm.registered || 0} | 已淘汰清理: ${st.cleaned || 0}`;
-    document.getElementById('audit4kCount').textContent = `4K: ${aud.valid_4k || 0} / HD: ${aud.valid_hd || 0}`;
-    document.getElementById('auditDetail').textContent = `无源标记: ${aud.no_source || 0} | 失败待重试: ${st.failed || 0}`;
+    document.getElementById('capDetail').title = document.getElementById('capDetail').textContent;
 
-    const tbody = document.getElementById('transferTbody');
-    tbody.innerHTML = '';
-    (data.recent_transfers || []).forEach(row => {
-      const tr = document.createElement('tr');
-      let badgeCls = 'badge-warn';
-      if (row.status === 'done') badgeCls = 'badge-ok';
-      else if (row.status === 'failed') badgeCls = 'badge-err';
-      const se = row.season > 0 || row.episode > 0 ? `S${String(row.season).padStart(2,'0')}E${String(row.episode).padStart(2,'0')}` : '电影';
-      const detail = row.remote_path || row.error || row.share_url || '-';
-      tr.innerHTML = `
-        <td class="mono">#${row.id}</td>
-        <td><strong>${row.title}</strong><br><span style="color:var(--muted);font-size:0.75rem">${row.cat}</span></td>
-        <td class="mono">${se}</td>
-        <td><span class="badge ${badgeCls}">${row.status}</span></td>
-        <td class="mono">${row.size_gb ? row.size_gb + ' GB' : '-'}</td>
-        <td class="mono">${row.play_count || 0}</td>
-        <td class="mono" style="max-width:360px;word-break:break-all;color:var(--muted)">${detail}</td>
-        <td class="mono" style="color:var(--muted)">${fmtTs(row.updated_at)}</td>
-        <td>
-          <button class="btn btn-outline btn-sm" onclick="preheatRow('${row.cat}','${row.title}',${row.season},${row.episode})">重转</button>
-          <button class="btn btn-danger btn-sm" onclick="resetTransfer(${row.id})">重置</button>
-        </td>
-      `;
-      tbody.appendChild(tr);
-    });
+    document.getElementById('liveCount').textContent = `${st.done || 0} 就绪 / ${st.plays || 0} 播放`;
+    document.getElementById('strmCount').textContent = `STRM登记: ${sm.registered || 0} | 淘汰: ${st.cleaned || 0}`;
+
+    document.getElementById('audit4kCount').textContent = `4K: ${aud.valid_4k || 0} / HD: ${aud.valid_hd || 0}`;
+    document.getElementById('auditDetail').textContent = `无源: ${aud.no_source || 0} | 失败: ${st.failed || 0}`;
+
+    lastTransfersData = data.recent_transfers || [];
+    renderTransfers();
   } catch (e) {
     showToast('加载概览失败: ' + e);
   }
+}
+
+// 渲染白盒搜索候选
+function renderSearchCandidates() {
+  const candidates = lastCandidatesData || [];
+  const tblWrap = document.getElementById('searchTableWrapper');
+  const crdWrap = document.getElementById('searchCardsWrapper');
+  const tbody = document.getElementById('searchTbody');
+
+  tbody.innerHTML = '';
+  crdWrap.innerHTML = '';
+
+  if (candidates.length === 0) {
+    tblWrap.classList.add('hidden');
+    crdWrap.classList.add('hidden');
+    return;
+  }
+
+  if (searchViewMode === 'card') {
+    tblWrap.classList.add('hidden');
+    crdWrap.classList.remove('hidden');
+  } else {
+    crdWrap.classList.add('hidden');
+    tblWrap.classList.remove('hidden');
+  }
+
+  candidates.forEach(c => {
+    const cls = c.qualified ? 'badge-ok' : 'badge-err';
+
+    // 1. 表格项
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="mono"><strong>${c.score}</strong></td>
+      <td><span class="badge ${cls}">${c.qualified ? '准入' : '淘汰'}</span></td>
+      <td>${c.is_4k_hint ? '<span class="badge badge-ok">4K/HDR</span>' : '-'}</td>
+      <td class="mono">${c.source || c.engine}</td>
+      <td title="${c.name}"><div style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${c.name}</div></td>
+      <td class="mono"><a href="${c.share_url}" target="_blank" style="color:var(--accent)">打开链接</a></td>
+    `;
+    tbody.appendChild(tr);
+
+    // 2. 移动端卡片项 (防字符溢出)
+    const card = document.createElement('div');
+    card.className = 'candidate-card';
+    card.innerHTML = `
+      <div class="candidate-head">
+        <div style="display:flex;align-items:center;gap:6px;">
+          <span class="mono" style="font-size:0.95rem;font-weight:700;color:var(--accent)">${c.score}分</span>
+          <span class="badge ${cls}">${c.qualified ? '准入' : '淘汰'}</span>
+          ${c.is_4k_hint ? '<span class="badge badge-ok">4K/HDR</span>' : ''}
+        </div>
+        <span class="badge badge-tag">${c.source || c.engine}</span>
+      </div>
+      <div class="candidate-name">${c.name}</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">
+        <a class="candidate-link" href="${c.share_url}" target="_blank">🔗 夸克分享链接</a>
+        <button class="btn btn-outline btn-sm" onclick="copyText('${c.share_url}')">复制</button>
+      </div>
+    `;
+    crdWrap.appendChild(card);
+  });
 }
 
 async function runSearchDebug() {
@@ -323,31 +1016,18 @@ async function runSearchDebug() {
   const s = parseInt(document.getElementById('qSeason').value || '0', 10);
   const e = parseInt(document.getElementById('qEpisode').value || '0', 10);
   if (!title) { showToast('请输入片名'); return; }
-  document.getElementById('searchMeta').textContent = '正在并发检索 6 大盘搜节点并计算五维隔离得分...';
+
+  document.getElementById('searchMeta').textContent = '⏳ 并发检索 6 大盘搜节点并计算五维打分...';
   try {
     const u = `/api/admin/search-debug?title=${encodeURIComponent(title)}&cat=${encodeURIComponent(cat)}&season=${s}&episode=${e}`;
     const r = await fetch(u);
     const d = await r.json();
-    const lockInfo = d.locked_share ? ` | 🔒 已锁存最优源: ${d.locked_share.url} (${d.locked_share.is_4k ? '4K' : 'HD'})` : ' | 未锁源';
+    const lockInfo = d.locked_share ? ` | 🔒 最优锁源: ${d.locked_share.url} (${d.locked_share.is_4k ? '4K' : 'HD'})` : ' | 未锁源';
     document.getElementById('searchMeta').textContent =
-      `检索耗时: ${d.elapsed_sec}s | 原始候选: ${d.total_candidates} 条 | 合格准入(>=30分): ${d.qualified_count} 条${lockInfo}`;
-    const tbl = document.getElementById('searchTable');
-    const tbody = document.getElementById('searchTbody');
-    tbody.innerHTML = '';
-    tbl.style.display = 'table';
-    (d.candidates || []).forEach(c => {
-      const tr = document.createElement('tr');
-      const cls = c.qualified ? 'badge-ok' : 'badge-err';
-      tr.innerHTML = `
-        <td class="mono"><strong>${c.score}</strong></td>
-        <td><span class="badge ${cls}">${c.qualified ? '准入' : '淘汰'}</span></td>
-        <td>${c.is_4k_hint ? '<span class="badge badge-ok">4K/HDR</span>' : '-'}</td>
-        <td>${c.source || c.engine}</td>
-        <td>${c.name}</td>
-        <td class="mono"><a href="${c.share_url}" target="_blank" style="color:var(--accent)">${c.share_url}</a></td>
-      `;
-      tbody.appendChild(tr);
-    });
+      `耗时: ${d.elapsed_sec}s | 候选: ${d.total_candidates} 条 | 准入(>=30): ${d.qualified_count} 条${lockInfo}`;
+    
+    lastCandidatesData = d.candidates || [];
+    renderSearchCandidates();
   } catch (err) {
     showToast('检索异常: ' + err);
   }
@@ -364,54 +1044,79 @@ async function runPreheatFromInput() {
 
 async function preheatRow(cat, title, s, e) {
   showToast(`已提交预热任务: ${title} S${s}E${e}`);
-  const r = await fetch(`/preheat?cat=${encodeURIComponent(cat)}&t=${encodeURIComponent(title)}&s=${s}&e=${e}`);
-  const d = await r.json();
-  showToast(d.msg || d.status);
-  setTimeout(loadOverview, 1500);
+  try {
+    const r = await fetch(`/preheat?cat=${encodeURIComponent(cat)}&t=${encodeURIComponent(title)}&s=${s}&e=${e}`);
+    const d = await r.json();
+    showToast(d.msg || d.status || '预热已响应');
+    setTimeout(loadOverview, 1500);
+  } catch (err) {
+    showToast('提交预热失败: ' + err);
+  }
 }
 
 async function resetTransfer(id) {
-  const r = await fetch(`/api/admin/transfer/${id}`, { method: 'DELETE' });
-  const d = await r.json();
-  if (d.ok) {
-    showToast(`记录 #${id} 已重置为 pending`);
-    loadOverview();
+  try {
+    const r = await fetch(`/api/admin/transfer/${id}`, { method: 'DELETE' });
+    const d = await r.json();
+    if (d.ok) {
+      showToast(`记录 #${id} 已重置为待处理`);
+      loadOverview();
+    }
+  } catch (err) {
+    showToast('重置失败: ' + err);
   }
 }
 
 async function triggerSelfheal() {
   showToast('正在执行全库 live strm 自愈巡检...');
-  const r = await fetch('/api/admin/selfheal', { method: 'POST' });
-  const d = await r.json();
-  showToast(`自愈巡检完成，耗时 ${d.elapsed_sec}s`);
-  loadOverview();
+  try {
+    const r = await fetch('/api/admin/selfheal', { method: 'POST' });
+    const d = await r.json();
+    showToast(`自愈巡检完成，耗时 ${d.elapsed_sec}s`);
+    loadOverview();
+  } catch (err) {
+    showToast('自愈请求异常: ' + err);
+  }
 }
 
 async function checkQuota() {
-  document.getElementById('quotaVal').textContent = '递归统计中...';
-  const r = await fetch('/api/admin/quota');
-  const d = await r.json();
-  if (d.total_gb !== undefined) {
-    document.getElementById('quotaVal').textContent = `${d.total_gb} GB / ${d.quota_limit_gb} GB`;
-    document.getElementById('quotaSub').textContent = `共 ${d.folder_count} 个影片目录`;
-  } else {
-    document.getElementById('quotaVal').textContent = '统计失败';
+  document.getElementById('quotaVal').textContent = '测算中...';
+  try {
+    const r = await fetch('/api/admin/quota');
+    const d = await r.json();
+    if (d.total_gb !== undefined) {
+      document.getElementById('quotaVal').textContent = `${d.total_gb} GB`;
+      document.getElementById('quotaSub').textContent = `共 ${d.folder_count} 目录 / 上限 ${d.quota_limit_gb}G`;
+    } else {
+      document.getElementById('quotaVal').textContent = '测算失败';
+    }
+  } catch (err) {
+    document.getElementById('quotaVal').textContent = '请求失败';
   }
 }
 
 async function updateCookie() {
   const cookie = document.getElementById('newCookie').value;
-  const r = await fetch('/api/admin/cookie', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ cookie })
-  });
-  const d = await r.json();
-  showToast(`Cookie 更新结果: ${d.cookie_status} (${d.cookie_hint})`);
-  document.getElementById('newCookie').value = '';
-  loadOverview();
+  try {
+    const r = await fetch('/api/admin/cookie', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cookie })
+    });
+    const d = await r.json();
+    showToast(`Cookie 更新结果: ${d.cookie_status} (${d.cookie_hint})`);
+    document.getElementById('newCookie').value = '';
+    loadOverview();
+  } catch (err) {
+    showToast('更新 Cookie 异常: ' + err);
+  }
 }
 
+// 初始化视图模式
+setTransferViewMode(transferViewMode);
+setSearchViewMode(searchViewMode);
+
+// 初始化数据加载
 loadOverview();
 </script>
 </body>
