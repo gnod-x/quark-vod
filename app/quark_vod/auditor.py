@@ -232,7 +232,15 @@ class VodAuditor:
                         is_4k = True
 
             # 电影防短剧/剧集冒充校验：若包含多个提取出集数的单集视频，坚决不作为单部电影锁存
-            if len(video_fits) > 1:
+            #
+            # 2026-11-08（与 transfer 验票同口径的「强证据优先」）：
+            #   旧实现只要命中弱集数信号就跳过该源，导致含 50GB 正片的电影源
+            #   因 "4K_HDR_60"/"d3 1" 等规格残片被判为剧集大包而永远无法锁源。
+            #   现先看强证据：存在「非集数标记且 >= 350MB」的单片即认定为本片电影。
+            _unmarked = [f for f in video_fits
+                         if f[1] >= 350 * 1024 * 1024
+                         and self.tr.extract_episode_num(f[0], season=1) is None]
+            if len(video_fits) > 1 and not _unmarked:
                 ep_hits = 0
                 for fn, _ in video_fits:
                     if self.tr.extract_episode_num(fn, season=1) is not None:

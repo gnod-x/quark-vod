@@ -266,14 +266,60 @@ def trigger_preheat_task(cat, title, season=0, episode=0):
             from . import search as search_mod
             prefer = config.COOKIE_READY and config.QUARK_FIRST
             res, url = search_mod.resolve_for_play(cat, title, season, episode, prefer_panshare=prefer)
+            tr = get_transfer()
+            if not (tr and tr.is_ready()):
+                return
+
+            # 2026-11-08（预热单源失败即放弃根治）：
+            #   旧实现只尝试 resolve_for_play 选出的唯一一个源，一旦该源
+            #   41031 封禁 / 41012 取消 / 空心，直接 [预热异常] 收工。而实测
+            #   同一影片往往还有 3~6 个可访问候选源（罗小黑战记 7 个候选里
+            #   有 5 个可用），白白失败。现与 /pending 链路对齐：按相关度
+            #   遍历全部合格候选源，首个转存成功即停。
+            candidates = []
             if res and res.engine == "panshare" and res.share_url:
-                tr = get_transfer()
-                if tr and tr.is_ready():
-                    tid, rpath = tr.transfer(cat, title, season, episode, res.share_url, res.pan_type or "quark")
-                    if rpath:
-                        d_url = _direct_url(rpath)
-                        strm_manager.activate(cat, title, season, episode, d_url)
-                        print(f"[{config.SERVICE_NAME}] [预热成功] {title} S{season}E{episode} -> {d_url}", flush=True)
+                candidates.append(res)
+            try:
+                for pr in search_mod.search(title, prefer_panshare=prefer):
+                    if pr.engine != "panshare" or not pr.share_url:
+                        continue
+                    if pr.share_url in [c.share_url for c in candidates]:
+                        continue
+                    if search_mod.score_search_result(
+                            pr, title, season=season, episode=episode) >= 30.0:
+                        candidates.append(pr)
+            except Exception:
+                pass
+
+            locked_url, _, l_title = db.get_locked_4k_share(cat, title, season, episode)
+            if locked_url and locked_url not in [c.share_url for c in candidates]:
+                candidates.insert(0, search_mod.SearchResult(
+                    engine="panshare", source="precheck_locked",
+                    name=l_title or title, year="", poster="", episodes=[],
+                    share_url=locked_url, pan_type="quark"))
+
+            last_err = None
+            for cand in candidates:
+                try:
+                    tid, rpath = tr.transfer(cat, title, season, episode,
+                                             cand.share_url, cand.pan_type or "quark")
+                except Exception as e:
+                    last_err = e
+                    print(f"[{config.SERVICE_NAME}] [预热换源] {title} S{season}E{episode} "
+                          f"源 {cand.share_url[:36]} 失败（{str(e)[:60]}），尝试下一候选", flush=True)
+                    continue
+                if rpath:
+                    d_url = _direct_url(rpath)
+                    strm_manager.activate(cat, title, season, episode, d_url)
+                    print(f"[{config.SERVICE_NAME}] [预热成功] {title} S{season}E{episode} -> {d_url}", flush=True)
+                    return
+            if not candidates:
+                print(f"[{config.SERVICE_NAME}] [预热异常] {title} S{season}E{episode}: 全网暂无合格片源", flush=True)
+            elif last_err:
+                raise last_err
+            else:
+                print(f"[{config.SERVICE_NAME}] [预热异常] {title} S{season}E{episode}: "
+                      f"{len(candidates)} 个候选源均未取得可用视频", flush=True)
         except Exception as e:
             print(f"[{config.SERVICE_NAME}] [预热异常] {title} S{season}E{episode}: {e}", flush=True)
 

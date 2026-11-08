@@ -466,8 +466,27 @@ class QuarkTransfer:
         stem, _ = os.path.splitext(name)
 
         # 1. 清洗常见画质、编码、分辨率等数字噪音标签
+        #
+        # 2026-11-08（电影源误判为剧集包根治）：
+        #   旧规则按「单词」剥离标签，HDR10 → 残留 "10"、HDR10P → 残留 "10P"，
+        #   再被规则 D 的独立数字模式识别成第 10 集；DDP5.1 剥成 "DDP ." 后
+        #   残留的 "5 1" 被识别成第 5 集；分卷 "d3 1"/"d3 2" 被识别成 E1/E2。
+        #   实测后果：含 50GB 完整正片的单部电影源被判为「多集剧集特征」整包拒绝
+        #   （宗师叶问2 / 惊蛰无声 / 给阿嬷的情书 / 罗小黑战记 / 后室 /
+        #     死侍与金刚狼 / 痴迷 共 7 部）。
+        #   现在按「整词优先」清洗，HDR10P/HDR10/DD5.1/DDP5 1 等规格词整体抹除。
         clean = re.sub(
-            r"(2160[pP]|1080[pP]|720[pP]|4[kK]|[hH]\.?26[45]|[xX]26[45]|19\d\d|20\d\d|5\.1|7\.1|60[fF][pP][sS]|8bit|10bit|HDR|SDR|WEB-DL|BluRay|BD|HD|NF|DDP|AAC|FLAC|AVC|HEVC|CHT|CHS)",
+            r"(2160[pP]|1080[pP]|720[pP]|576[pP]|480[pP]|4[kK]|[hH]\.?26[45]|[xX]26[45]|hev[cs]|avc|"
+            r"19\d\d|20\d\d|"
+            r"[dD][dD][pP]?\s?\d(?:\.\d|\s\d)?|"
+            r"(?:aac|ac3|eac3|truehd|dts(?:-?hd)?|flac|atmos)\s?\d(?:\.\d|\s\d)?|"
+            r"[57]\.1|"
+            r"\d{2,3}\s?[fF][pP][sS]|"
+            r"8bit|10bit|12bit|"
+            r"hdr1[04][pP]?|dv|hdr|dolby\s?vision|sdr|"
+            r"web-dl|webrip|bluray|blu-ray|remux|bdrip|hdrip|"
+            r"bd|hd|nf|amzn|\bit\b|ma|chte|cht|chs|"
+            r"\bd\d+(?=\s+\d))",
             " ", stem, flags=re.IGNORECASE
         )
 
@@ -485,6 +504,20 @@ class QuarkTransfer:
             if season == 0 or s_found == season:
                 return ep_found
             return None
+
+        # 规则 B2: 规格词残留兜底（在原始名上再剥一遍复合规格）
+        #   "H.264" 剥掉 h264 后残留 "H. 264"；"4K_HDR_60" 剥离后残留 "_60"；
+        #   单独成词的 "1080"（不带 p）也可能只是片名占位。这类残片会被
+        #   规则 D 误读成集数，因此在进入宽松匹配前整体抹除。
+        #   注意：仅作用于本规则链，不影响上面 S01E01 / 第xx集 等强证据匹配。
+        clean = re.sub(
+            r"(?<![A-Za-z0-9])[hH](?:\.\s*)?26[45](?![0-9])|"
+            r"(?<![A-Za-z0-9])(?:2160|1080|720|576|480)(?![pP0-9])|"
+            r"(?<![A-Za-z0-9])\d{2,3}[fF][pP][sS]|"
+            r"(?<![A-Za-z0-9])[hH][dD][rR]1[04][pP]?",
+            " ", clean, flags=re.IGNORECASE
+        )
+        clean = re.sub(r"[_\-\.\s]+", " ", clean).strip()
 
         # 规则 C: 第xx集 / 第xx话 / 第xx回 / EPxx
         patterns_explicit = [
@@ -523,6 +556,15 @@ class QuarkTransfer:
             # 严格防范短剧/剧集冒充电影：
             # 如果转存的目录包含多个不同集数的剧集特征（如 70 集短剧或 10 集电视剧），
             # 坚决拒绝从中随机抽一集充当电影！
+            #
+            # 2026-11-08：与 transfer 验票同口径的「强证据优先」。
+            #   优先保底：只要存在 >= 500MB 且无集数标记的正片，即认定为本片电影，
+            #   取其中体积最大者（杜绝 52GB 4K 正片被同包 d3 1/d3 2 分卷信号拖累）。
+            big_unmarked = [v for v in vids
+                            if (v.get("size") or 0) >= 500 * 1024 * 1024
+                            and cls.extract_episode_num(v["path"], season=1) is None]
+            if big_unmarked:
+                return max(big_unmarked, key=lambda x: x["size"])
             if len(vids) > 1:
                 ep_counts = 0
                 for v in vids:
@@ -702,7 +744,21 @@ class QuarkTransfer:
                     max_mb = (max(v.get('size', 0) for v in valid_vids) / 1024 / 1024) if valid_vids else 0
                     raise TransferFailed(f"分享包内无电影正片大文件(最大仅 {max_mb:.1f}MB)，疑似短剧或广告碎片，拒绝转存")
                 # B. 若包含多个带集数标记的文件，判定为剧集大包，拒绝冒充单片电影
-                if len(valid_vids) >= 3 and any(self.extract_episode_num(v.get("file_name", ""), 1) for v in valid_vids):
+                #
+                # 2026-11-08（7 部电影被误杀根治）：改为「强证据优先」。
+                #   旧实现只要 3 个以上文件命中任一弱集数信号即整包拒绝，而
+                #   extract_episode_num 在宽松模式(season=1)下会把规格残片读成集数：
+                #     "4K_HDR_60" → 60、"d3 1"(分卷碟号) → 1、"…H 264-…" → 264。
+                #   结果：含 50GB 完整正片的单部电影源被判为剧集包（宗师叶问2 /
+                #   惊蛰无声 / 给阿嬷的情书 / 罗小黑战记 / 后室 / 死侍与金刚狼 / 痴迷）。
+                #   现在先看强证据：存在「非集数标记且 >= 350MB」的单片即放行；
+                #   只有全部视频都带集数标记时，才按剧集包拒绝（真短剧源如此）。
+                _unmarked = [v for v in large_vids
+                             if self.extract_episode_num(v.get("file_name", ""), 1) is None]
+                if _unmarked:
+                    pass  # 强证据：包内存在明确单片正片，允许作为电影转存
+                elif len(valid_vids) >= 3 and any(
+                        self.extract_episode_num(v.get("file_name", ""), 1) for v in valid_vids):
                     raise TransferFailed("该分享包包含多集剧集特征，拒绝作为电影转存")
             else:
                 # 剧集验票门槛：必须包含目标集数！
