@@ -167,13 +167,57 @@ def get_source_audit(cat, title, season=0, episode=0):
 
 
 def get_locked_4k_share(cat, title, season=0, episode=0):
-    """提取经预检验证存活且为 4K 的锁定夸克分享源。"""
+    """提取经预检验证存活且为 4K 的锁定夸克分享源。
+
+    2026-11-08：追加 check_status 过滤。旧实现只看 has_quark_source 与
+    best_share_url，审计已判 dead / 空心分享并作废后若仍有残留字段，
+    仍会把它当成最高优先级片源调取，导致播放/预热永远死在这条源上。
+    """
     row = get_source_audit(cat, title, season, episode)
     if row and row["has_quark_source"] and row["best_share_url"]:
+        if str(row["check_status"] or "").lower() in ("dead", "not_found", "invalid", "expired"):
+            return None, False, ""
         # 再次确保不在黑名单中
         if not is_dead_source(row["best_share_url"]):
             return row["best_share_url"], bool(row["is_4k"]), row["best_share_title"]
     return None, False, ""
+
+
+def bump_audit_checked_at(cat, title, season, share_url, ts=None):
+    """把同一分享源在该季下所有剧集的 checked_at 刷新到最新。
+
+    2026-11-08（末路兼职锁源失效事故）：同一整季大包会被锁到该季所有剧集行，
+    原内联 SQL 只更新单行且易随表结构演进失配。统一收敛到本函数，
+    一次性推进整季锁源时间戳，避免「部分集数已过期判定」导致的反复重审。
+    """
+    if not share_url:
+        return
+    try:
+        con = _conn()
+        con.execute(
+            "UPDATE source_audits SET checked_at = ? "
+            "WHERE cat=? AND title=? AND season=? AND best_share_url=?",
+            (ts if ts is not None else now(), cat, title, season, share_url)
+        )
+        con.commit()
+    except Exception:
+        pass
+
+
+def purge_audit_locked_share(cat, title, season, share_url):
+    """作废某季下所有锁定了指定分享源的审计行（剧集回退为待补源）。"""
+    if not share_url:
+        return
+    try:
+        con = _conn()
+        con.execute(
+            "UPDATE source_audits SET has_quark_source=0, is_4k=0, best_share_url='', best_share_title='', "
+            "check_status='dead', checked_at=? WHERE cat=? AND title=? AND season=? AND best_share_url=?",
+            (now(), cat, title, season, share_url)
+        )
+        con.commit()
+    except Exception:
+        pass
 
 
 def mark_dead_source(source_url, source_type="panshare", reason="", ban_days=7):

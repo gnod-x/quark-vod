@@ -41,7 +41,7 @@
 
 | 文件名 | 代码行数 | 核心职责与白盒修改指南 |
 | :--- | :--- | :--- |
-| **`app/main.py`** | ~310 行 | **FastAPI 主入口**：定义 `/pending`、`/clean`、`/preheat`、`/health`、`/capability` 以及 `/admin` 控制台与 `/api/admin/*` 接口 |
+| **`app/main.py`** | ~310 行 | **FastAPI 主入口**：定义 `/pending`、`/clean`、`/preheat`、`/health`、`/capability` 以及 `/admin` 控制台与 `/api/admin/*` 接口；`/preheat` 经 `_resolve_strm_row()` 做剧集形态纠偏（见红线 7） |
 | **`app/static/admin.html`** | ~290 行 | **白盒可视化管理台**：浏览器访问 `http://192.168.101.240:8099/admin` 即可调试搜索打分、查看转存队列、热更新 Cookie、触发自愈 |
 | **`config.py`** | ~255 行 | **全局配置中心**：管理路径、OpenList 挂载点转换 (`play_path`)、Cookie 多级读取 (`quark_cookie.txt` > `.env` > `data.db?immutable=1`) |
 | **`search.py`** | ~730 行 | **搜索引擎与五维打分**：`sanitize_title` 标题清洗、`score_search_result` 五维隔离（类型/年份±1/季数/特别篇/短剧熔断） |
@@ -82,3 +82,8 @@ make test       # 运行自动化验收测试套件
 4. **元数据保护与限流红线**：`trigger_jellyfin_refresh_item` 必须保持 `ReplaceAllMetadata=false`，防止覆盖 Jellyfin2 中已同步的 AI 精修简介；整季连带激活（`background_batch=True`）自动走 1.5s 间隔串行队列，严禁并发风暴抢占首播带宽。
 5. **双向同步契约**：`make restart` 自动触发 `make sync` 将 `app/quark_vod/*.py` 同步至 `/home/dong/projects/hometheater/scripts/quark_vod/`，并由 `make test` 第 8 项強制校验零漂移。
 6. **伪装后缀验票与预检放行红线（2026-11-04 根治）**：第三方分享包为规避网盘和谐审查，常将正片改为 `.mp3/.pdf/.txt/.apk/.mkv1/.mp41` 或无后缀。`transfer.py` 转存前验票与 `auditor.py` 4K 预检锁源必须统一通过 `is_candidate_video(name, size)` 判定（伪装后缀且体积 `> 200MB` 视为候选视频放行），严禁仅凭 `VIDEO_EXTS` 白名单前置拦截导致转存后的 `sniff_and_fix_file` 魔数扶正逻辑形同虚设。
+7. **剧集形态纠偏与空心分享熔断红线（2026-11-08 根治，末路兼职 S0E0 事故）**：三个连锁缺陷曾导致《末路兼职》整季永久卡在 `/preheat` 失败；三者必须同时保持，任一回退即复现。
+   - **形态纠偏**：控制台「预热点播」常只填片名不填季集（`s=0&e=0`）。`server.py::_resolve_strm_row()` 必须先反查 `strm_map`：若 `season > 0` 条目存在则判为剧集，季集为 0 时自动取最小集号。**严禁**把 `S0E0` 直接传给 `transfer.py`，否则剧集会被电影验票门槛（`if not season or not episode` 分支的「多集剧集特征」判定）误杀。
+   - **空心分享熔断**：分享链接未过期、标题仍在，但根目录已被作者清空（`data._total == 0`）时必须判死并**继续遍历下一个候选源**。`resolve_share()` 返回空列表不是异常，旧实现仅凭「没抛错」即判 alive，导致空心源长期霸占 `source_audits` 锁定位。
+   - **锁定位作废闭环**：锁源失效时 `auditor.py` 必须调用 `db.purge_audit_locked_share()` 作废整季锁定位；`db.get_locked_4k_share()` 必须过滤 `dead/not_found` 状态。严禁出现「分享已拉黑但锁定位仍指向它」——播放链路始终优先调取 locked 源，残留即被永远反选。
+   - **验证口径**：修复后必须以**原失败参数**（`cat=&t=<剧名>&s=0&e=0`）重放一次预热，日志应出现 `[预热校正] … 纠正为 SxxExx` 与 `[预热成功]`，且 `transfers` 表对应集数 `status=done`、`.strm` 指向 OpenList 直链。

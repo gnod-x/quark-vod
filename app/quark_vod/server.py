@@ -199,21 +199,58 @@ def _remote_still_exists(remote_path):
 
 
 
+def _resolve_strm_row(cat, title, season=0, episode=0):
+    """按 (cat, title) 反查 strm_map，确认该片在 Jellyfin2 中的真实形态。
+
+    2026-11-08（末路兼职 S0E0 事故根治）：
+      控制台「预热点播」常只填片名与分类、季集留空（s=0&e=0），旧实现把
+      season/episode 原样传给 transfer，trigger_preheat_task 命中
+      `if not season or not episode` 分支按【电影】验票，而目标其实是
+      热门韩剧整季合集 → 被「该分享包包含多集剧集特征，拒绝作为电影转存」
+      误杀，剧集永远无法预热。
+
+    返回 (cat, season, episode, is_library_series)：
+      - cat：入参为空时按标题反查补全
+      - season/episode：入参为 0 且 strm 中确认是剧集时，取最小集号
+      - is_library_series：strm_map 中 season > 0 的条目存在即视为剧集
+    """
+    row = None
+    try:
+        if cat:
+            row = db._conn().execute(
+                "SELECT cat, title, season, episode FROM strm_map "
+                "WHERE cat=? AND title=? AND season > 0 ORDER BY season, episode LIMIT 1",
+                (cat, title)
+            ).fetchone()
+        if not row:
+            row = db._conn().execute(
+                "SELECT cat, title, season, episode FROM strm_map "
+                "WHERE title LIKE ? AND season > 0 ORDER BY season, episode LIMIT 1",
+                (f"%{_clean_title_key(title)}%",)
+            ).fetchone()
+    except Exception:
+        row = None
+
+    if not row:
+        return cat, season, episode, False
+
+    cat = cat or row["cat"]
+    is_series = True
+    if not season or not episode:
+        season, episode = int(row["season"] or 0), int(row["episode"] or 0)
+    return cat, season, episode, is_series
+
+
 def trigger_preheat_task(cat, title, season=0, episode=0):
     """触发单部影片或单集的后台异步转存预热。"""
     if not title:
         return False, "missing title"
     db.pin_item(cat, title, reason="preheated")
-    if not cat:
-        try:
-            row_map = db._conn().execute(
-                "SELECT cat, title FROM strm_map WHERE title LIKE ? LIMIT 1",
-                (f"%{_clean_title_key(title)}%",)
-            ).fetchone()
-            if row_map:
-                cat = row_map["cat"]
-        except Exception:
-            pass
+    req_season, req_episode = season, episode
+    cat, season, episode, is_series = _resolve_strm_row(cat, title, season, episode)
+    if is_series and (req_season != season or req_episode != episode):
+        print(f"[{config.SERVICE_NAME}] [预热校正] {title} 请求 S{req_season}E{req_episode} "
+              f"→ 按库内剧集形态纠正为 S{season}E{episode}（避免被电影验票门槛误杀）", flush=True)
 
     row = db.find_done_transfer(cat, title, season, episode)
     if row and row["remote_path"] and _remote_still_exists(row["remote_path"]):

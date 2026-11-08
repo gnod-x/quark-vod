@@ -91,6 +91,15 @@ class VodAuditor:
             except Exception:
                 continue
 
+            # 2026-11-08「空心分享」熔断：
+            # 分享本身未过期、标题仍在，但根目录文件已被作者清空（_total=0）。
+            # 旧实现仅凭 resolve_share 不抛错就判 alive，导致这类空心源
+            # 长期霸占 source_audits 锁定位（末路兼职 5732d7e33c35 实测），
+            # 播放/预热永远优先选中它、反复验票失败，而后面明明有活源。
+            if not items:
+                db.mark_dead_source(share_url, "panshare", "分享目录为空（空心分享）")
+                continue
+
             share_title = cand.name or ""
             is_4k_pack = is_4k_candidate(share_title)
 
@@ -193,6 +202,11 @@ class VodAuditor:
             except Exception:
                 continue
 
+            # 2026-11-08「空心分享」熔断（同 audit_tv_season 的处理口径）：
+            if not items:
+                db.mark_dead_source(share_url, "panshare", "分享目录为空（空心分享）")
+                continue
+
             is_4k = is_4k_candidate(cand.name or "")
             matched_video = False
 
@@ -237,6 +251,8 @@ class VodAuditor:
                                      check_status=status_str)
                 return True, is_4k, share_url, status_str
 
+        # 注：下方 save_source_audit 已整体覆盖为 has_quark_source=0/check_status=dead，
+        # get_locked_4k_share 不会再返回该行，无需额外 purge。
         db.save_source_audit(cat, title, 0, 0,
                              has_quark_source=0, is_4k=0,
                              best_share_url="", best_share_title="",
@@ -279,9 +295,11 @@ class VodAuditor:
             is_alive = False
             # 轻量只读探测存活性
             try:
-                stoken, pwd_id, items = self.tr.resolve_share(share_url)
-                if items:
-                    is_alive = True
+                stoken, pwd_id, listed = self.tr.resolve_share(share_url)
+                # 2026-11-08：根目录为空即判死（空心分享），不能只看「没抛错」
+                is_alive = bool(listed)
+                if not is_alive:
+                    db.mark_dead_source(share_url, "panshare", "分享目录为空（空心分享）")
             except TransferFailed as ex:
                 err_str = str(ex)
                 if any(k in err_str for k in ["已取消了分享", "已失效", "已过期", "链接内没有文件", "41011", "41012"]):
@@ -292,17 +310,16 @@ class VodAuditor:
             if is_alive:
                 stats["healthy"] += 1
                 # 刷新存活条目的检查时间戳
-                now_ts = db.now()
-                con.execute("""
-                    UPDATE source_audits SET checked_at = ?
-                    WHERE cat = ? AND title = ? AND season = ? AND best_share_url = ?
-                """, (now_ts, cat, title, season, share_url))
-                con.commit()
+                db.bump_audit_checked_at(cat, title, season, share_url)
                 tag = f"S{season:02d}" if season else "电影"
                 print(f" - [健康存活] 【{cat}】《{title}》({tag}) -> {share_url[:40]}...")
             else:
                 # 发现死链！立即触发多源矩阵自动打捞全新活源替换！
-                db.mark_dead_source(share_url, "panshare", "分享链接已失效或取消")
+                # 2026-11-08：先显式作废该季全部锁定位，防止自愈换源失败后
+                # 播放链路仍优先调取这条已死的 locked 源。
+                db.purge_audit_locked_share(cat, title, season, share_url)
+                if not db.is_dead_source(share_url):
+                    db.mark_dead_source(share_url, "panshare", "分享链接已失效或取消")
                 tag = f"S{season:02d}" if season else "电影"
                 print(f" - [死链检测] 【{cat}】《{title}》({tag}) 链接已失效！立即启动多源矩阵自动换源补新...")
                 if season > 0:
