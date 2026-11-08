@@ -34,11 +34,11 @@ PROTECTED_CATEGORIES = set()  # 港台经典不设免死保护，所有专区均
 
 
 def get_protected_titles():
-    """获取所有受保护（不可被网盘配额清理删除）的影片标题集合。仅收藏（Favorites）项目享有永久豁免。"""
+    """获取所有受保护（不可被网盘配额清理删除）的影片标题集合。包含收藏、在看以及用户置顶/预热项目。"""
     from contextlib import closing
     protected = set()
 
-    # 查询 jellyfin.db 中已收藏的条目（包含电影与剧集，免锁只读）
+    # 1. 查询 jellyfin.db 中已收藏或在看条目（包含电影与剧集，免锁只读）
     if os.path.exists(JF_DB):
         try:
             with closing(sqlite3.connect(f"file:{JF_DB}?mode=ro&immutable=1", uri=True)) as con:
@@ -46,7 +46,7 @@ def get_protected_titles():
                 cur.execute("""
                     SELECT b.Name, b.SeriesName FROM BaseItems b
                     JOIN UserData u ON b.Id = u.ItemId
-                    WHERE u.IsFavorite = 1
+                    WHERE u.IsFavorite = 1 OR u.Played = 1 OR u.PlayCount > 0 OR u.PlaybackPositionTicks > 0
                 """)
                 for row in cur.fetchall():
                     if row[0]:
@@ -55,6 +55,13 @@ def get_protected_titles():
                         protected.add(row[1].strip())
         except Exception as e:
             print(f"[cleanup] 读取 Jellyfin UserData 失败: {e}", flush=True)
+
+    # 2. 查询用户手动置顶/预热保护的项目
+    try:
+        pinned = db.get_all_pinned_titles()
+        protected.update(pinned)
+    except Exception as e:
+        print(f"[cleanup] 读取 user_pinned 失败: {e}", flush=True)
 
     return protected
 

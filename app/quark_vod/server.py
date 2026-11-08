@@ -203,6 +203,7 @@ def trigger_preheat_task(cat, title, season=0, episode=0):
     """触发单部影片或单集的后台异步转存预热。"""
     if not title:
         return False, "missing title"
+    db.pin_item(cat, title, reason="preheated")
     if not cat:
         try:
             row_map = db._conn().execute(
@@ -387,6 +388,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if not cat or not raw_title:
             return self._json(400, {"error": "missing cat/t"})
+
+        db.pin_item(cat, raw_title, reason="played")
 
         from .search import sanitize_title
         title = sanitize_title(raw_title)

@@ -118,6 +118,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_source_audits_item
     ON source_audits(cat, title, season, episode);
 CREATE INDEX IF NOT EXISTS idx_source_audits_status
     ON source_audits(check_status, is_4k);
+
+-- 用户手动预热/点播/收藏置顶保护表（免受年份淘汰与 LRU 清理）
+CREATE TABLE IF NOT EXISTS user_pinned (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cat TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT 'preheated', -- preheated, manual_add, played, favorited
+    pinned_at INTEGER NOT NULL,
+    UNIQUE(cat, title)
+);
+CREATE INDEX IF NOT EXISTS idx_user_pinned ON user_pinned(cat, title);
 """
 
 
@@ -387,6 +398,57 @@ def stats():
     out["cleanup_pending"] = con.execute(
         "SELECT COUNT(*) c FROM cleanup_queue WHERE cleaned=0").fetchone()["c"]
     return out
+
+
+# ── user_pinned ───────────────────────────────────────
+def pin_item(cat, title, reason="preheated"):
+    """将影视条目登记为用户置顶/预热保护（绝不淘汰）。"""
+    if not title:
+        return
+    clean_title = title.rsplit(" (", 1)[0].strip() if " (" in title else title.strip()
+    try:
+        con = _conn()
+        con.execute("""
+            INSERT OR REPLACE INTO user_pinned (cat, title, reason, pinned_at)
+            VALUES (?, ?, ?, ?)
+        """, (cat or "", clean_title, reason, now()))
+        con.commit()
+    except Exception:
+        pass
+
+
+def is_pinned(title, cat=""):
+    """检查条目是否处于用户置顶/预热保护状态。"""
+    if not title:
+        return False
+    clean_title = title.rsplit(" (", 1)[0].strip() if " (" in title else title.strip()
+    try:
+        if cat:
+            row = _conn().execute(
+                "SELECT id FROM user_pinned WHERE (cat=? OR cat='') AND (title=? OR title=?) LIMIT 1",
+                (cat, title, clean_title)
+            ).fetchone()
+        else:
+            row = _conn().execute(
+                "SELECT id FROM user_pinned WHERE title=? OR title=? LIMIT 1",
+                (title, clean_title)
+            ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def get_all_pinned_titles():
+    """获取所有用户手动预热或置顶保护的影视标题集合。"""
+    pinned = set()
+    try:
+        rows = _conn().execute("SELECT cat, title FROM user_pinned").fetchall()
+        for r in rows:
+            if r["title"]:
+                pinned.add(r["title"].strip())
+    except Exception:
+        pass
+    return pinned
 
 
 init_db()

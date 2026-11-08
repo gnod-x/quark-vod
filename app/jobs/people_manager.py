@@ -27,9 +27,11 @@ import urllib.request
 import urllib.error
 
 BASE_DIR = os.environ.get("HOMETHEATER_BASE_DIR", "/home/dong/projects/hometheater")
-JF_DB = os.path.join(BASE_DIR, "jellyfin/config/data/jellyfin.db")
-JF_CONFIG = os.path.join(BASE_DIR, "jellyfin/config")
-JELLYFIN_API_BASE = os.environ.get("JELLYFIN_API_BASE", "http://127.0.0.1:8096")
+JELLYFIN_API_BASE = os.environ.get("JELLYFIN_API_BASE", "http://127.0.0.1:8097")
+_is_jf2 = "8097" in JELLYFIN_API_BASE
+_jf_sub = "jellyfin2" if _is_jf2 else "jellyfin"
+JF_DB = os.path.join(BASE_DIR, f"{_jf_sub}/config/data/jellyfin.db")
+JF_CONFIG = os.path.join(BASE_DIR, f"{_jf_sub}/config")
 JELLYFIN_KEY = os.environ.get("JELLYFIN_KEY", "")
 
 # ---- 治理规则（单一事实来源，改动只需改这里）----

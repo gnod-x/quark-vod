@@ -15,7 +15,9 @@
   5. 联动刷新：自动触发 Jellyfin 媒体库扫描并清理孤立演职员缓存。
 """
 
+import datetime
 import os
+import re
 import sys
 import time
 import shutil
@@ -42,18 +44,46 @@ MAX_PER_CATEGORY = 200
 PROTECTED_CATEGORIES = set()  # 港台经典不设免死保护，所有专区均受配额与淘汰治理
 TV_CATEGORIES = {"国产剧集", "欧美剧集", "热门韩剧", "国产动漫", "日本动漫", "日本剧集", "泰国剧集"}
 
+CURRENT_YEAR = datetime.datetime.now().year
+_YEAR_RE = re.compile(r"\((\d{4})\)$")
+
 
 def log(msg):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] [DailyPrune] {msg}", flush=True)
 
 
+def get_item_year(full_path):
+    """解析影视资源的上映/首播年份（先查目录名，再查 nfo 标签）。"""
+    base_name = os.path.basename(full_path)
+    m = _YEAR_RE.search(base_name)
+    if m:
+        return int(m.group(1))
+
+    for nfo_name in ("tvshow.nfo", "movie.nfo"):
+        nfo_p = os.path.join(full_path, nfo_name)
+        if os.path.isfile(nfo_p):
+            try:
+                tree = ET.parse(nfo_p)
+                root = tree.getroot()
+                y = root.findtext("year")
+                if y and y.isdigit():
+                    return int(y)
+                for date_tag in ("premiered", "aired", "releasedate"):
+                    p = root.findtext(date_tag)
+                    if p and len(p) >= 4 and p[:4].isdigit():
+                        return int(p[:4])
+            except Exception:
+                pass
+    return None
+
+
 def get_protected_titles():
-    """获取所有受保护（不可删除）的影片标题集合。除用户收藏（IsFavorite=1）外，其他均不设永久保护。"""
+    """获取所有受保护（不可删除）的影片标题集合。包含用户收藏、在看/已看、一键预热以及置顶项目。"""
     from contextlib import closing
     protected = set()
 
-    # 仅查询 jellyfin.db 中已收藏的项目（支持电影名称与剧集名称，免锁只读）
+    # 1. 查询 jellyfin.db 中已收藏、在看或已看项目（免锁只读）
     if os.path.exists(JF_DB):
         try:
             with closing(sqlite3.connect(f"file:{JF_DB}?mode=ro&immutable=1", uri=True)) as con:
@@ -61,7 +91,7 @@ def get_protected_titles():
                 cur.execute("""
                     SELECT b.Name, b.SeriesName FROM BaseItems b
                     JOIN UserData u ON b.Id = u.ItemId
-                    WHERE u.IsFavorite = 1
+                    WHERE u.IsFavorite = 1 OR u.Played = 1 OR u.PlayCount > 0 OR u.PlaybackPositionTicks > 0
                 """)
                 for row in cur.fetchall():
                     if row[0]:
@@ -70,6 +100,32 @@ def get_protected_titles():
                         protected.add(row[1].strip())
         except Exception as e:
             log(f"读取 Jellyfin UserData 失败: {e}")
+
+    # 2. 查询 quark_plays.db 中用户手动置顶/一键预热保护的项目 (user_pinned)
+    try:
+        if vod_db and hasattr(vod_db, "get_all_pinned_titles"):
+            pinned = vod_db.get_all_pinned_titles()
+            protected.update(pinned)
+    except Exception as e:
+        log(f"读取 user_pinned 失败: {e}")
+
+    # 3. 查询 quark_plays.db 中历史点播记录 (plays) 与有效转存 (transfers)
+    if os.path.exists(QUARK_DB):
+        try:
+            with closing(sqlite3.connect(f"file:{QUARK_DB}?mode=ro&immutable=1", uri=True)) as con:
+                cur = con.cursor()
+                for row in cur.execute("SELECT title FROM plays").fetchall():
+                    if row[0]:
+                        t = row[0].rsplit(" (", 1)[0].strip() if " (" in row[0] else row[0].strip()
+                        protected.add(t)
+                        protected.add(row[0].strip())
+                for row in cur.execute("SELECT title FROM transfers WHERE status IN ('done', 'saving', 'searching', 'pending')").fetchall():
+                    if row[0]:
+                        t = row[0].rsplit(" (", 1)[0].strip() if " (" in row[0] else row[0].strip()
+                        protected.add(t)
+                        protected.add(row[0].strip())
+        except Exception as e:
+            log(f"读取 quark_plays 历史记录失败: {e}")
 
     return protected
 
@@ -90,8 +146,11 @@ def is_item_active_or_done(full_path, cat, name):
     return False
 
 
-def prune_category(cat, protected_titles, limit=MAX_PER_CATEGORY):
-    """对单专区执行配额检查与淘汰（一部连续剧算 1 个资源）。"""
+def prune_category(cat, protected_titles, limit=MAX_PER_CATEGORY, current_year=CURRENT_YEAR):
+    """对单专区执行年度过滤与配额检查淘汰：
+    第一阶段：非当前年度（太老）且非用户一键预热/点播的占位资源彻底淘汰清理；
+    第二阶段：若当前年度存量仍超出单专区配额上限 (limit)，按 LRU 淘汰热度最低的 pending 占位。
+    """
     cat_dir = os.path.join(CINEMA2, cat)
     if not os.path.isdir(cat_dir):
         return 0
@@ -101,60 +160,78 @@ def prune_category(cat, protected_titles, limit=MAX_PER_CATEGORY):
         return 0
 
     entries = [d for d in os.listdir(cat_dir) if not d.startswith(".")]
-    total = len(entries)
-    if total <= limit:
-        log(f"专区【{cat}】当前 {total} 部，在上限 {limit} 内，无需清理")
-        return 0
+    pruned = 0
 
-    excess = total - limit
-    log(f"专区【{cat}】当前 {total} 部，超出上限 {excess} 部，准备执行淘汰")
-
-    candidates = []
+    # ── 第一阶段：非本年度历史老旧占位资源清理 ──────────────────────────
+    remaining_entries = []
     for d in entries:
         full_p = os.path.join(cat_dir, d)
         if not os.path.isdir(full_p):
             continue
 
         clean_name = d.rsplit(" (", 1)[0].strip() if " (" in d else d
-        if d in protected_titles or clean_name in protected_titles:
-            continue
+        is_user_protected = (
+            d in protected_titles or
+            clean_name in protected_titles or
+            is_item_active_or_done(full_p, cat, clean_name)
+        )
 
-        # 保护已转存/已点播为 live 的影片，仅允许淘汰从未点播过的纯 pending 占位
-        if is_item_active_or_done(full_p, cat, clean_name):
-            continue
+        item_year = get_item_year(full_p)
+        # 如果年份早于当前年度，且未受用户预热/在看保护，彻底淘汰清理
+        if item_year is not None and item_year < current_year and not is_user_protected:
+            try:
+                shutil.rmtree(full_p)
+                log(f"已清理非本年度历史老旧资源: 【{cat}】{d} (年份: {item_year})")
+                if os.path.exists(QUARK_DB):
+                    try:
+                        with sqlite3.connect(QUARK_DB) as c:
+                            c.execute("DELETE FROM strm_map WHERE strm_path LIKE ?", (f"{full_p}%",))
+                    except Exception:
+                        pass
+                pruned += 1
+            except Exception as e:
+                log(f"删除老旧资源失败 {full_p}: {e}")
+        else:
+            remaining_entries.append((d, full_p, clean_name, is_user_protected))
 
-        mtime = os.path.getmtime(full_p)
-        candidates.append((mtime, d, full_p))
+    # ── 第二阶段：配额超限治理 (LRU 智能淘汰) ───────────────────────
+    rem_total = len(remaining_entries)
+    if rem_total > limit:
+        excess = rem_total - limit
+        log(f"专区【{cat}】清理后尚存 {rem_total} 部，超出配额上限 {excess} 部，执行配额淘汰")
+        candidates = []
+        for d, full_p, clean_name, is_user_protected in remaining_entries:
+            if is_user_protected:
+                continue
+            mtime = os.path.getmtime(full_p)
+            candidates.append((mtime, d, full_p))
 
-    candidates.sort(key=lambda x: x[0])
+        candidates.sort(key=lambda x: x[0])
+        to_delete = candidates[:excess]
+        for _, name, path in to_delete:
+            try:
+                shutil.rmtree(path)
+                log(f"已按配额淘汰资源: 【{cat}】{name}")
+                if os.path.exists(QUARK_DB):
+                    try:
+                        with sqlite3.connect(QUARK_DB) as c:
+                            c.execute("DELETE FROM strm_map WHERE strm_path LIKE ?", (f"{path}%",))
+                    except Exception:
+                        pass
+                pruned += 1
+            except Exception as e:
+                log(f"配额删除失败 {path}: {e}")
 
-    pruned = 0
-    to_delete = candidates[:excess]
-    for _, name, path in to_delete:
-        try:
-            shutil.rmtree(path)
-            log(f"已淘汰清理老旧资源: 【{cat}】{name}")
-            if os.path.exists(QUARK_DB):
-                try:
-                    c = sqlite3.connect(QUARK_DB)
-                    c.execute("DELETE FROM strm_map WHERE cat=? AND title=?", (cat, name))
-                    c.commit()
-                    c.close()
-                except Exception:
-                    pass
-            pruned += 1
-        except Exception as e:
-            log(f"删除失败 {path}: {e}")
-
-    log(f"专区【{cat}】淘汰完成，共释放 {pruned} 部非热播老旧资源")
+    remaining_count = len([d for d in os.listdir(cat_dir) if not d.startswith(".")])
+    log(f"专区【{cat}】清理完成，共淘汰/释放 {pruned} 部资源，现保留 {remaining_count} 部 (本年度新片+预热保留)")
     return pruned
 
 
 def run_pruning():
-    """全库执行存储配额治理。"""
-    log(f"=== 开始执行存储上限 ({MAX_PER_CATEGORY}部/区) 与 LRU 智能淘汰检查 ===")
+    """全库执行存储配额与年份智能治理。"""
+    log(f"=== 开始执行当前年度 ({CURRENT_YEAR}) 资源保留、历史老旧清理与上限 ({MAX_PER_CATEGORY}部/区) 智能治理 ===")
     protected = get_protected_titles()
-    log(f"当前共锁定 {len(protected)} 部收藏保护影视（绝不删除）")
+    log(f"当前共锁定 {len(protected)} 部用户预热/在看/收藏保护影视（绝不删除）")
 
     total_pruned = 0
     if os.path.isdir(CINEMA2):
@@ -162,7 +239,8 @@ def run_pruning():
             if os.path.isdir(os.path.join(CINEMA2, cat)) and not cat.startswith("."):
                 total_pruned += prune_category(cat, protected, limit=MAX_PER_CATEGORY)
 
-    log(f"=== 淘汰清理结束，全库共移除 {total_pruned} 部旧资源 ===")
+    log(f"=== 治理清理结束，全库共移除 {total_pruned} 部非当前年度/超额旧资源 ===")
+    return total_pruned
     return total_pruned
 
 
@@ -386,17 +464,17 @@ def _wait_library_refresh(vod_cfg, max_wait=1800, interval=15):
 
 
 def clean_orphan_people():
-    """清理孤立的演职人员头像图片，释放 SSD 空间。"""
-    people_script = os.path.join(BASE, "scripts", "people_manager.py")
-    if os.path.exists(people_script):
-        log("执行演职员目录瘦身治理...")
+    """清理孤立的剧照、海报、演职人员头像图片与僵尸元数据，释放 SSD 空间。"""
+    purge_script = os.path.join(BASE, "scripts", "purge_orphan_metadata.py")
+    if os.path.exists(purge_script):
+        log("执行孤儿剧照、演职员头像与僵尸元数据全量深度清理...")
         try:
             env = os.environ.copy()
             env["JELLYFIN_API_BASE"] = "http://127.0.0.1:8097"
             env["HOMETHEATER_BASE_DIR"] = BASE
-            subprocess.run([sys.executable, people_script], env=env, timeout=120)
-        except Exception:
-            pass
+            subprocess.run([sys.executable, purge_script], env=env, timeout=600)
+        except Exception as e:
+            log(f"深度元数据清理异常: {e}")
 
 
 def run_vod_canary_test(sample_count=10):
@@ -482,6 +560,14 @@ def main():
         pass
 
     try:
+        if "--prune-only" in sys.argv:
+            log("收到 --prune-only 参数，仅执行当前年度资源治理与老旧资源清理...")
+            run_pruning()
+            refresh_jellyfin()
+            clean_orphan_people()
+            log("年度治理与老旧清理全部完成！")
+            return
+
         # 0. 全库影视分类精准度治理与重名消歧（如《凡人修仙传》真人剧 vs 动画版）
         try:
             import category_governor

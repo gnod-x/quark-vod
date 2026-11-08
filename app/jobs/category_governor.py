@@ -192,13 +192,94 @@ def clean_broken_empty_dirs(dry_run=False):
     return cleaned
 
 
+def deduplicate_by_tmdbid(dry_run=False):
+    """阶段 4: 同专区同 TMDB ID 自动去重治理（彻底根治译名变迁产生重复目录与播放异常）。"""
+    log("=== [阶段 4] 扫描并治理同专区 TMDB ID 影视目录重复 ===")
+    from collections import defaultdict
+    cat_tmdb = defaultdict(lambda: defaultdict(list))
+    cleaned = 0
+
+    for cat in os.listdir(CINEMA2):
+        cat_dir = os.path.join(CINEMA2, cat)
+        if not os.path.isdir(cat_dir):
+            continue
+        for show in os.listdir(cat_dir):
+            show_dir = os.path.join(cat_dir, show)
+            if not os.path.isdir(show_dir):
+                continue
+            for nfo_name in ("tvshow.nfo", "movie.nfo"):
+                nfo_path = os.path.join(show_dir, nfo_name)
+                if os.path.exists(nfo_path):
+                    try:
+                        tree = ET.parse(nfo_path)
+                        tmdbid = tree.findtext("tmdbid")
+                        if tmdbid:
+                            cat_tmdb[cat][tmdbid.strip()].append(show_dir)
+                    except Exception:
+                        pass
+                    break
+
+    os.makedirs(TRASH_ARCHIVE, exist_ok=True)
+    for cat, id_map in cat_tmdb.items():
+        for tmdbid, paths in id_map.items():
+            if len(paths) <= 1:
+                continue
+
+            def score(p):
+                name = os.path.basename(p)
+                live_cnt = 0
+                total_files = 0
+                for root, _, files in os.walk(p):
+                    total_files += len(files)
+                    for f in files:
+                        if f.endswith('.strm'):
+                            try:
+                                with open(os.path.join(root, f), 'r', errors='ignore') as sf:
+                                    if '/d/' in sf.read():
+                                        live_cnt += 1
+                            except Exception:
+                                pass
+                has_cn = 1 if any('\u4e00' <= c <= '\u9fff' for c in name) else 0
+                has_year = 1 if re.search(r'\(\d{4}\)', name) else 0
+                mtime = os.path.getmtime(p)
+                return (live_cnt, has_cn, has_year, total_files, mtime)
+
+            sorted_paths = sorted(paths, key=score, reverse=True)
+            keep = sorted_paths[0]
+            remove = sorted_paths[1:]
+
+            log(f"发现同剧/同片重复 (TMDB ID {tmdbid}): 保留 [{cat}/{os.path.basename(keep)}]")
+            for r in remove:
+                r_name = os.path.basename(r)
+                log(f"  --> 淘汰旧译名/冗余条目: [{cat}/{r_name}]")
+                if not dry_run:
+                    archive_target = os.path.join(TRASH_ARCHIVE, f"tmdb_dup_{cat}_{r_name}_{int(time.time())}")
+                    try:
+                        shutil.move(r, archive_target)
+                        log(f"      已安全移入归档区: {archive_target}")
+                    except Exception as ex:
+                        log(f"      移入归档区失败: {ex}")
+                    # 同步清理 quark_plays.db 中旧条目的 strm_map
+                    try:
+                        con = vod_db._conn()
+                        con.execute("DELETE FROM strm_map WHERE cat=? AND title=?", (cat, r_name))
+                        con.commit()
+                    except Exception:
+                        pass
+                cleaned += 1
+
+    log(f"同专区 TMDB ID 重复治理完成，共清理/归档 {cleaned} 个多余影视目录")
+    return cleaned
+
+
 def run_governance(dry_run=False):
     """一键执行全套影视分类纠偏与重名消歧治理。"""
     log(">>>>>>>> 开始执行全库影视分类精准度治理与重名消歧 <<<<<<<<")
     c1 = cleanup_known_misplaced(dry_run=dry_run)
     c2 = disambiguate_anime_vs_liveaction(dry_run=dry_run)
     c3 = clean_broken_empty_dirs(dry_run=dry_run)
-    total = c1 + c2 + c3
+    c4 = deduplicate_by_tmdbid(dry_run=dry_run)
+    total = c1 + c2 + c3 + c4
     log(f">>>>>>>> 治理全部完成！累计处理 {total} 处错位/重名/空目录 <<<<<<<<")
     return total
 

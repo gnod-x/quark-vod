@@ -20,6 +20,7 @@ TMDB 热门元数据生成器 for jellyfin2 (cinema2)
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -29,6 +30,8 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
+
+CUR_YEAR = datetime.datetime.now().year
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 项目根
 sys.path.insert(0, os.path.join(BASE, "scripts"))
@@ -47,71 +50,71 @@ IMG_BASE = "https://image.tmdb.org/t/p"
 
 # ── 13 个专区 → TMDB discover 参数 ──────────────────────────────
 # 与 jellyfin(8096/8097) 的媒体库名称、CollectionType 保持一致
+# 严格限制：只收录当前年度 (CUR_YEAR) 影视资源，太老资源不入库
 CATEGORIES = {
     "国产剧集": dict(
         media="tv", kind="series",
-        params="&with_origin_country=CN&sort_by=popularity.desc&first_air_date.gte=2022-01-01",
+        params=f"&with_origin_country=CN&sort_by=popularity.desc&first_air_date.gte={CUR_YEAR}-01-01",
         exclude_genres="16,99,10764",
     ),
     "国产动漫": dict(
         media="tv", kind="series",
-        params="&with_origin_country=CN&with_genres=16&sort_by=popularity.desc",
+        params=f"&with_origin_country=CN&with_genres=16&sort_by=popularity.desc&first_air_date.gte={CUR_YEAR}-01-01",
         exclude_genres="99,10764",
     ),
     "国产电影": dict(
         media="movie", kind="movie",
-        params="&with_origin_country=CN&sort_by=popularity.desc&release_date.gte=2022-01-01",
+        params=f"&with_origin_country=CN&sort_by=popularity.desc&primary_release_date.gte={CUR_YEAR}-01-01",
         exclude_genres="99,10764",
     ),
     "日本动漫": dict(
         media="tv", kind="series",
-        params="&with_origin_country=JP&with_genres=16&sort_by=popularity.desc",
+        params=f"&with_origin_country=JP&with_genres=16&sort_by=popularity.desc&first_air_date.gte={CUR_YEAR}-01-01",
         exclude_genres="99,10764",
     ),
     "日本剧集": dict(
         media="tv", kind="series",
-        params="&with_origin_country=JP&sort_by=popularity.desc&first_air_date.gte=2020-01-01",
+        params=f"&with_origin_country=JP&sort_by=popularity.desc&first_air_date.gte={CUR_YEAR}-01-01",
         exclude_genres="16,99,10764",  # 排除动画（归日本动漫专区），纯真人日剧
     ),
     "日本电影": dict(
         media="movie", kind="movie",
-        params="&with_origin_country=JP&sort_by=popularity.desc&release_date.gte=2015-01-01&vote_count.gte=10",
+        params=f"&with_origin_country=JP&sort_by=popularity.desc&primary_release_date.gte={CUR_YEAR}-01-01&vote_count.gte=5",
         exclude_genres="16,99,10764",  # 排除动画电影（归日本动漫专区），纯真人日影
     ),
     "欧美剧集": dict(
         media="tv", kind="series",
-        params="&with_origin_country=US|GB|FR|DE|ES|IT&sort_by=popularity.desc&first_air_date.gte=2022-01-01",
+        params=f"&with_origin_country=US|GB|FR|DE|ES|IT&sort_by=popularity.desc&first_air_date.gte={CUR_YEAR}-01-01",
         exclude_genres="16,99,10764",
     ),
     "欧美大片": dict(
         media="movie", kind="movie",
-        params="&with_origin_country=US|GB&sort_by=popularity.desc&release_date.gte=2022-01-01",
+        params=f"&with_origin_country=US|GB&sort_by=popularity.desc&primary_release_date.gte={CUR_YEAR}-01-01",
         exclude_genres="16,99,10764",
     ),
     "港台经典": dict(
         media="movie", kind="movie",
-        params="&with_origin_country=HK|TW&sort_by=popularity.desc&vote_count.gte=50",
+        params=f"&with_origin_country=HK|TW&sort_by=popularity.desc&primary_release_date.gte={CUR_YEAR}-01-01",
         exclude_genres="99,10764",
-        # 港台经典限制级/三级片名作解禁（尊重成年人观影自由）
     ),
     "热门韩剧": dict(
         media="tv", kind="series",
-        params="&with_origin_country=KR&sort_by=popularity.desc&first_air_date.gte=2022-01-01",
+        params=f"&with_origin_country=KR&sort_by=popularity.desc&first_air_date.gte={CUR_YEAR}-01-01",
         exclude_genres="16,99,10764",
     ),
     "韩国电影": dict(
         media="movie", kind="movie",
-        params="&with_origin_country=KR&sort_by=popularity.desc&release_date.gte=2015-01-01&vote_count.gte=30",
+        params=f"&with_origin_country=KR&sort_by=popularity.desc&primary_release_date.gte={CUR_YEAR}-01-01&vote_count.gte=5",
         exclude_genres="99,10764",
     ),
     "泰国电影": dict(
         media="movie", kind="movie",
-        params="&with_origin_country=TH&sort_by=popularity.desc&release_date.gte=2015-01-01&vote_count.gte=10",
+        params=f"&with_origin_country=TH&sort_by=popularity.desc&primary_release_date.gte={CUR_YEAR}-01-01&vote_count.gte=3",
         exclude_genres="99,10764",
     ),
     "泰国剧集": dict(
         media="tv", kind="series",
-        params="&with_origin_country=TH&sort_by=popularity.desc&first_air_date.gte=2020-01-01",
+        params=f"&with_origin_country=TH&sort_by=popularity.desc&first_air_date.gte={CUR_YEAR}-01-01",
         exclude_genres="16,99,10764",
     ),
 }
@@ -405,6 +408,24 @@ def main():
         cat_dir = os.path.join(CINEMA2, cat)
         os.makedirs(cat_dir, exist_ok=True)
 
+        # 建立专区已有影视的 tmdbid 索引，从源头杜绝因 TMDB 官方译名变更产生多目录重复入库 (如《午夜规则》)
+        existing_tmdb_ids = set()
+        for existing_folder in os.listdir(cat_dir):
+            ef_path = os.path.join(cat_dir, existing_folder)
+            if not os.path.isdir(ef_path):
+                continue
+            for nfo_name in ("movie.nfo", "tvshow.nfo"):
+                ef_nfo = os.path.join(ef_path, nfo_name)
+                if os.path.isfile(ef_nfo):
+                    try:
+                        tree = ET.parse(ef_nfo)
+                        tid = tree.findtext("tmdbid")
+                        if tid:
+                            existing_tmdb_ids.add(str(tid).strip())
+                    except Exception:
+                        pass
+                    break
+
         target_new = args.limit if args.limit else 60
         new_cnt = skip_cnt = ep_cnt = 0
         poster_cnt = fanart_cnt = 0
@@ -433,8 +454,16 @@ def main():
                 if new_cnt >= target_new:
                     break
 
+                item_id_str = str(item.get("id") or "").strip()
+                if item_id_str and item_id_str in existing_tmdb_ids and not args.full:
+                    skip_cnt += 1
+                    continue
+
                 title = sanitize(fmt_title(item))
                 year = (fmt_date(item) or "0")[:4]
+                if year.isdigit() and int(year) < CUR_YEAR and not args.full:
+                    skip_cnt += 1
+                    continue
                 if kind == "movie":
                     folder = f"{title} ({year})" if year != "0" else title
                 else:
@@ -462,6 +491,8 @@ def main():
                 else:
                     gen_tv_nfo(dir_path, item, detail)
                 new_cnt += 1
+                if item_id_str:
+                    existing_tmdb_ids.add(item_id_str)
 
                 # 下载本地海报 + 背景图
                 if download_poster(dir_path, item, kind):

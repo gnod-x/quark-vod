@@ -141,6 +141,13 @@ def add_to_library(item):
     dir_path = os.path.join(CINEMA2, cat, folder_name)
     os.makedirs(dir_path, exist_ok=True)
 
+    # 用户通过一键搜索收录，永久置顶保护（绝不参与年份淘汰与配额清理）
+    try:
+        vod_db.pin_item(cat, folder_name, reason="manual_add")
+        vod_db.pin_item(cat, title, reason="manual_add")
+    except Exception:
+        pass
+
     # 1. 抓取 TMDB 详情以生成完整的 NFO
     key = tmdb_populate.read_tmdb_key()
     detail = {}
