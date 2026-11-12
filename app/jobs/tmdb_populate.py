@@ -329,6 +329,26 @@ def download_image(url, dst_path):
         return False
 
 
+def is_episode_aired(ep_data, s_num, e, detail=None, today_str=None):
+    """判断剧集单集是否已正式播出/更新（防止连载中剧集提前生成未来未播出的虚假占位）。"""
+    if today_str is None:
+        today_str = datetime.date.today().isoformat()
+    air_date = ep_data.get("air_date") if ep_data else None
+    if air_date:
+        return air_date <= today_str
+    if detail:
+        last_ep = detail.get("last_episode_to_air")
+        if last_ep:
+            last_s = last_ep.get("season_number", 0)
+            last_e = last_ep.get("episode_number", 0)
+            if s_num < last_s:
+                return True
+            if s_num == last_s and e <= last_e:
+                return True
+            return False
+    return False
+
+
 def gen_episode_nfo(nfo_path, ep_title, s, e, ep_data):
     """生成单集标准 episodedetails nfo。"""
     fields = [
@@ -509,22 +529,29 @@ def main():
                                 vod_db.save_strm_map(cat, folder, 0, 0, strm_path)
                             except Exception:
                                 pass
+                # 剧集：按 TMDB 实际季集生成（跳过特别篇 season 0）
                 else:
-                    # 剧集：按 TMDB 实际季集生成（跳过特别篇 season 0）
+                    status = detail.get("status")
+                    is_updating = (status != "Ended" and status != "Canceled")
+                    today_str = datetime.date.today().isoformat()
+
                     seasons = [s for s in detail.get("seasons", []) if s.get("season_number", 0) >= 1]
                     total_eps = sum(s.get("episode_count") or 0 for s in seasons)
                     if total_eps > MAX_EPISODES_PER_SHOW:
                         log(f"    [跳过] {title} 共 {total_eps} 集，超过上限 {MAX_EPISODES_PER_SHOW}")
                         continue
+
+                    # 连载更新中的剧集：若连第一集都未开播（无 last_episode_to_air），跳过创建，严禁创建空目录
+                    if is_updating:
+                        last_ep = detail.get("last_episode_to_air")
+                        if not last_ep:
+                            log(f"    [跳过-尚未开播] 连载剧集尚未开播/暂无已播出集数: 《{title}》")
+                            continue
+
                     for season in seasons:
                         s_num = season.get("season_number")
-                        s_dir = os.path.join(dir_path, f"Season {s_num:02d}")
-                        os.makedirs(s_dir, exist_ok=True)
-                        s_nfo = os.path.join(s_dir, "season.nfo")
-                        if not os.path.isfile(s_nfo) or args.full:
-                            gen_season_nfo(s_dir, item, detail, season)
 
-                        # 拉取分季详情：获取单集名称、官方分集剧照 (still_path) 与单集剧情
+                        # 拉取分季详情：获取单集名称、官方分集剧照 (still_path) 与单集剧情、播出日期
                         ep_info_map = {}
                         try:
                             s_url = f"https://api.themoviedb.org/3/tv/{item['id']}/season/{s_num}?api_key={key}&language=zh-CN"
@@ -537,8 +564,24 @@ def main():
                             pass
 
                         ep_total = season.get("episode_count") or 0
+                        # 连载更新中的剧集只生成已播出的有效集数；完结剧集全部生成
+                        valid_eps = []
                         for e in range(1, ep_total + 1):
                             ep_data = ep_info_map.get(e, {})
+                            if is_updating and not is_episode_aired(ep_data, s_num, e, detail, today_str):
+                                continue
+                            valid_eps.append((e, ep_data))
+
+                        if not valid_eps:
+                            continue
+
+                        s_dir = os.path.join(dir_path, f"Season {s_num:02d}")
+                        os.makedirs(s_dir, exist_ok=True)
+                        s_nfo = os.path.join(s_dir, "season.nfo")
+                        if not os.path.isfile(s_nfo) or args.full:
+                            gen_season_nfo(s_dir, item, detail, season)
+
+                        for e, ep_data in valid_eps:
                             base_ep = f"{folder} - S{s_num:02d}E{e:02d}"
                             strm_path = os.path.join(s_dir, f"{base_ep}.strm")
                             thumb_path = os.path.join(s_dir, f"{base_ep}-thumb.jpg")

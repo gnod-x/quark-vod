@@ -93,3 +93,7 @@ make test       # 运行自动化验收测试套件
    - **三处必须同口径**：`transfer.py` 电影验票 B 门槛、`transfer.py::match_episode_video` 选片（≥500MB 非集数正片优先，杜绝 52GB 正片被分卷信号拖累）、`auditor.py::audit_single_item` 锁源校验。任一处回退都会让对应环节重新误杀。
    - **预热换源红线**：`trigger_preheat_task` 严禁只尝试 `resolve_for_play` 选出的单一源。实测同一影片常有 3~7 个可访问候选，首源 41031/41012 即放弃会造成「明明有源却预热失败」（罗小黑战记 7 个候选中 5 个可用）。必须遍历全部合格候选（locked 源置顶），首个转存成功即停。
    - **清洗规则维护**：`extract_episode_num` 第一步须按**整词优先**剥离规格词（`hdr1[04][pP]?` / `[dD][dD][pP]?\s?\d(?:\.\d|\s\d)?` / `\bd\d+(?=\s+\d)` 等），第 B2 步在宽松匹配前再对 `H.264`、裸 `1080`、`NNfps` 做一次残留兜底。新增发布组命名规范时必须回归测试：**剧集样本 `01.mp4` / `第64集.mp4` / `S01E04.mp4` / `[04].mp4` 提取结果不得改变**。
+9. **连载剧集未来未播出集数严禁生成 pending 占位（2026-11-12 根治）**：
+   - **痛点根因**：TMDB 剧集分季详情会列出整季规划总集数（如 12、24 或 40 集）。旧逻辑为所有规划集数无差别生成 `.strm` 占位，导致电视端 Jellyfin2 充斥尚未播出的未来假集数（用户点击必报 503），未开播新剧甚至创建幽灵空目录引发海报墙裂图。
+   - **判定口径**：连载更新中（`status != 'Ended'` 且 `status != 'Canceled'`）剧集必须通过 `is_episode_aired(ep_data, s_num, e, detail)` 校验 `air_date <= today` 或 `last_episode_to_air`；整季第一集都未开播者严禁创建目录，仅允许已播出集数生成 `.strm`。
+   - **存量治理**：`daily_update_and_prune.py` 每日 05:00 自动调用 `prune_unaired_pending_strms()` 清理未来未播出占位，真实转存 live 直链（含 5244 或 /d/）无论播出日期均受保护严禁删除。

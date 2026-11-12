@@ -191,21 +191,32 @@ def add_to_library(item):
         created_strms.append((cat, folder_name, 0, 0, strm_path))
     else:
         # 剧集：取第一季或默认 24 集
+        status = detail.get("status")
+        is_updating = (status != "Ended" and status != "Canceled")
         seasons = detail.get("seasons") or []
         s1 = next((s for s in seasons if s.get("season_number") == 1), None)
         ep_count = s1.get("episode_count", 24) if s1 else 24
         ep_count = min(max(ep_count, 1), 60)
 
-        s_dir = os.path.join(dir_path, "Season 01")
-        os.makedirs(s_dir, exist_ok=True)
-        if s1:
-            tmdb_populate.gen_season_nfo(s_dir, item_for_nfo, detail, s1)
+        # 连载更新中的剧集：只生成已播出的集数，严禁生成未更新的未来占位
+        if is_updating:
+            last_ep = detail.get("last_episode_to_air")
+            if last_ep and last_ep.get("season_number") == 1:
+                ep_count = min(ep_count, last_ep.get("episode_number") or ep_count)
+            elif not last_ep:
+                ep_count = 0
 
-        for ep in range(1, ep_count + 1):
-            ep_file = f"{title} - S01E{ep:02d}.strm"
-            ep_path = os.path.join(s_dir, ep_file)
-            tmdb_populate.write_pending_strm(ep_path, cat, title, 1, ep)
-            created_strms.append((cat, title, 1, ep, ep_path))
+        if ep_count > 0:
+            s_dir = os.path.join(dir_path, "Season 01")
+            os.makedirs(s_dir, exist_ok=True)
+            if s1:
+                tmdb_populate.gen_season_nfo(s_dir, item_for_nfo, detail, s1)
+
+            for ep in range(1, ep_count + 1):
+                ep_file = f"{title} - S01E{ep:02d}.strm"
+                ep_path = os.path.join(s_dir, ep_file)
+                tmdb_populate.write_pending_strm(ep_path, cat, title, 1, ep)
+                created_strms.append((cat, title, 1, ep, ep_path))
 
     # 4. 登记到 SQLite strm_map
     try:

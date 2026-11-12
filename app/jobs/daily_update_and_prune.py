@@ -230,18 +230,155 @@ def prune_category(cat, protected_titles, limit=MAX_PER_CATEGORY, current_year=C
 def run_pruning():
     """全库执行存储配额与年份智能治理。"""
     log(f"=== 开始执行当前年度 ({CURRENT_YEAR}) 资源保留、历史老旧清理与上限 ({MAX_PER_CATEGORY}部/区) 智能治理 ===")
+    # 1. 清理连载更新中剧集内的未播出未来 pending 占位
+    unaired_pruned = prune_unaired_pending_strms()
+
     protected = get_protected_titles()
     log(f"当前共锁定 {len(protected)} 部用户预热/在看/收藏保护影视（绝不删除）")
 
-    total_pruned = 0
+    total_pruned = unaired_pruned
     if os.path.isdir(CINEMA2):
         for cat in os.listdir(CINEMA2):
             if os.path.isdir(os.path.join(CINEMA2, cat)) and not cat.startswith("."):
                 total_pruned += prune_category(cat, protected, limit=MAX_PER_CATEGORY)
 
-    log(f"=== 治理清理结束，全库共移除 {total_pruned} 部非当前年度/超额旧资源 ===")
+    log(f"=== 治理清理结束，全库共移除 {total_pruned} 部非当前年度/超额旧资源/未更新占位 ===")
     return total_pruned
-    return total_pruned
+
+
+def prune_unaired_pending_strms(dry_run=False):
+    """清理正在连载/更新中（status != 'Ended'）剧集内未来尚未播出的 pending 占位符。
+
+    保护铁律：
+    1. status == 'Ended' 的已完结剧集所有集数均为有效正片，绝不误删；
+    2. 已转存为 live 直链（含 5244 或 /d/）的真实正片视频流无论播出日期均受铁律保护，严禁删除；
+    3. 仅清理 status != 'Ended' 且 aired > 今天（或无播出日期）的纯 pending 占位；
+    4. 同步移除关联的分集 nfo、剧照及 strm_map 数据库映射；
+    5. 若清理后季目录或剧集目录完全为空，自动回收空目录（受保护剧集除外）。
+    """
+    log("=== 开始检查并清理连载剧集中未播出的未来占位 (消灭未更新占位) ===")
+    today_str = datetime.date.today().isoformat()
+    total_pruned_strms = 0
+    protected = get_protected_titles()
+
+    if not os.path.isdir(CINEMA2):
+        return 0
+
+    to_delete_strm_paths = []
+
+    for cat in os.listdir(CINEMA2):
+        if cat not in TV_CATEGORIES:
+            continue
+        cat_dir = os.path.join(CINEMA2, cat)
+        if not os.path.isdir(cat_dir):
+            continue
+
+        for show_dir_name in os.listdir(cat_dir):
+            if show_dir_name.startswith("."):
+                continue
+            show_path = os.path.join(cat_dir, show_dir_name)
+            if not os.path.isdir(show_path):
+                continue
+
+            nfo_path = os.path.join(show_path, "tvshow.nfo")
+            if not os.path.isfile(nfo_path):
+                continue
+
+            try:
+                tree = ET.parse(nfo_path)
+                status = tree.getroot().findtext("status")
+            except Exception:
+                continue
+
+            # 已完结剧集所有集数均已播出，绝不清理
+            if status == "Ended":
+                continue
+
+            show_title = show_dir_name.rsplit(" (", 1)[0].strip() if " (" in show_dir_name else show_dir_name
+
+            # 遍历该连载剧各季
+            season_dirs = [d for d in os.listdir(show_path) if d.startswith("Season ") and os.path.isdir(os.path.join(show_path, d))]
+            for s_dir_name in season_dirs:
+                s_dir = os.path.join(show_path, s_dir_name)
+                for f_name in os.listdir(s_dir):
+                    if not f_name.endswith(".strm"):
+                        continue
+                    strm_path = os.path.join(s_dir, f_name)
+
+                    # 1. 检查是否为已转存直链
+                    head = ""
+                    try:
+                        with open(strm_path, "r", encoding="utf-8", errors="ignore") as f:
+                            head = f.read(128)
+                    except Exception:
+                        pass
+                    if "5244" in head or "/d/" in head:
+                        continue  # 真实已转存直链，严禁删除
+
+                    # 2. 检查对应 nfo 的 aired 属性
+                    base_name = f_name[:-5]
+                    ep_nfo_path = os.path.join(s_dir, f"{base_name}.nfo")
+                    ep_thumb_path = os.path.join(s_dir, f"{base_name}-thumb.jpg")
+
+                    is_unaired = False
+                    if os.path.isfile(ep_nfo_path):
+                        try:
+                            etree = ET.parse(ep_nfo_path)
+                            aired = etree.getroot().findtext("aired")
+                            if not aired or not aired.strip() or aired.strip() > today_str:
+                                is_unaired = True
+                        except Exception:
+                            is_unaired = True
+                    else:
+                        is_unaired = True
+
+                    if is_unaired:
+                        if not dry_run:
+                            try:
+                                os.remove(strm_path)
+                                if os.path.isfile(ep_nfo_path):
+                                    os.remove(ep_nfo_path)
+                                if os.path.isfile(ep_thumb_path):
+                                    os.remove(ep_thumb_path)
+                                to_delete_strm_paths.append(strm_path)
+                            except Exception as err:
+                                log(f"删除未更新占位异常 {strm_path}: {err}")
+                        total_pruned_strms += 1
+
+                # 季目录若已无任何视频文件，回收该季目录
+                if not dry_run and os.path.isdir(s_dir):
+                    remaining_in_season = [x for x in os.listdir(s_dir) if not x.startswith(".")]
+                    if not remaining_in_season or (len(remaining_in_season) == 1 and remaining_in_season[0] == "season.nfo"):
+                        try:
+                            shutil.rmtree(s_dir)
+                        except Exception:
+                            pass
+
+            # 剧集若已无任何有效季与视频集数，且非用户收藏/在看保护项，回收未开播剧集目录
+            if not dry_run and os.path.isdir(show_path):
+                remaining_strms = [
+                    f for r, d, files in os.walk(show_path) for f in files if f.endswith(".strm")
+                ]
+                if not remaining_strms and show_title not in protected:
+                    try:
+                        shutil.rmtree(show_path)
+                        log(f"回收无已播集数的未开播剧集目录: 《{show_title}》")
+                    except Exception as err:
+                        log(f"回收空目录异常 {show_path}: {err}")
+
+    # 同步清理 strm_map 记录
+    if to_delete_strm_paths and not dry_run:
+        try:
+            con = vod_db._conn()
+            for p in to_delete_strm_paths:
+                con.execute("DELETE FROM strm_map WHERE strm_path = ?", (p,))
+            con.commit()
+            log(f"已同步从 strm_map 移除 {len(to_delete_strm_paths)} 条未播出占位映射")
+        except Exception as err:
+            log(f"清理 strm_map 异常: {err}")
+
+    log(f"=== 未更新占位清理完成，共移除 {total_pruned_strms} 个未播出的未来 pending 占位符 ===")
+    return total_pruned_strms
 
 
 def sync_airing_episodes():
@@ -307,43 +444,55 @@ def sync_airing_episodes():
             if total_show_eps > 300:
                 continue
 
+            today_str = datetime.date.today().isoformat()
+
             for s in seasons:
                 s_num = s.get("season_number")
                 tmdb_ep_total = s.get("episode_count") or 0
                 if tmdb_ep_total <= 0:
                     continue
 
+                # 同步获取该季分集详情：随新集上线同步提取剧照 (still_path) 与分集剧情、播出日期
+                ep_info_map = {}
+                try:
+                    s_url = f"https://api.themoviedb.org/3/tv/{tmdbid}/season/{s_num}?api_key={key}&language=zh-CN"
+                    s_detail = tmdb_populate.http_json(s_url)
+                    for ep_obj in s_detail.get("episodes", []):
+                        e_no = ep_obj.get("episode_number")
+                        if e_no:
+                            ep_info_map[e_no] = ep_obj
+                except Exception:
+                    pass
+
+                # 仅筛选已正式播出的有效集数（严禁为连载剧未来未播出集数创建虚假占位）
+                aired_ep_list = [
+                    e for e in range(1, tmdb_ep_total + 1)
+                    if tmdb_populate.is_episode_aired(ep_info_map.get(e), s_num, e, detail, today_str)
+                ]
+                if not aired_ep_list:
+                    continue
+
                 s_dir = os.path.join(show_path, f"Season {s_num:02d}")
                 os.makedirs(s_dir, exist_ok=True)
 
-                existing_strms = [f for f in os.listdir(s_dir) if f.endswith(".strm")]
-                local_ep_cnt = len(existing_strms)
+                # 检查哪些已播集数本地尚未创建
+                missing_eps = []
+                for ep in aired_ep_list:
+                    base_ep = f"{title} - S{s_num:02d}E{ep:02d}"
+                    ep_file = f"{base_ep}.strm"
+                    ep_path = os.path.join(s_dir, ep_file)
+                    if not os.path.isfile(ep_path):
+                        missing_eps.append((ep, ep_path, base_ep))
 
-                if tmdb_ep_total > local_ep_cnt:
-                    diff = tmdb_ep_total - local_ep_cnt
-                    log(f"发现新集上线！《{title}》第 {s_num} 季: 本地 {local_ep_cnt} 集 -> 官方更新至 {tmdb_ep_total} 集 (新增 {diff} 集)")
-
-                    # 同步获取该季分集详情：随新集上线同步提取剧照 (still_path) 与分集剧情
-                    ep_info_map = {}
-                    try:
-                        s_url = f"https://api.themoviedb.org/3/tv/{tmdbid}/season/{s_num}?api_key={key}&language=zh-CN"
-                        s_detail = tmdb_populate.http_json(s_url)
-                        for ep_obj in s_detail.get("episodes", []):
-                            e_no = ep_obj.get("episode_number")
-                            if e_no:
-                                ep_info_map[e_no] = ep_obj
-                    except Exception:
-                        pass
+                if missing_eps:
+                    log(f"发现新集上线！《{title}》第 {s_num} 季: 新增播出 {len(missing_eps)} 集 (最新播出至第 {max(aired_ep_list)} 集)")
 
                     created = []
-                    for ep in range(local_ep_cnt + 1, tmdb_ep_total + 1):
+                    for ep, ep_path, base_ep in missing_eps:
                         ep_data = ep_info_map.get(ep, {})
-                        base_ep = f"{title} - S{s_num:02d}E{ep:02d}"
-                        ep_file = f"{base_ep}.strm"
                         thumb_file = f"{base_ep}-thumb.jpg"
                         ep_nfo_file = f"{base_ep}.nfo"
 
-                        ep_path = os.path.join(s_dir, ep_file)
                         thumb_path = os.path.join(s_dir, thumb_file)
                         ep_nfo_path = os.path.join(s_dir, ep_nfo_file)
 
