@@ -30,15 +30,28 @@ UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.3
 
 
 
-# ── 经过实测连通性验证的活跃 4K 网盘搜索节点矩阵 ──────────────
+# ── 实网搜索节点矩阵（本模块是搜索节点的唯一事实来源）──────────
+#
+# 2026-11-13 修正：快映旧地址 43.248.128.118:12512 已失效。
+# 实测（以 /index.php/vod/search.html?wd=凡人修仙传 为准，非仅看首页）：
+#   38.76.197.172:12521  200 0.4s 详情页=10  ← 采用
+#   xsayang.fun          首页 200，但搜索接口超时  ← 弃用（首页可用≠搜索可用）
+# 教训：验证节点必须打真实搜索接口，只测首页会选中「首页能开、搜索白等到超时」的地址，
+# 反而拖慢整轮并发（每个失效节点都要耗满 timeout 才返回）。
 ACTIVE_PAN_NODES = [
-    {"key": "kuaiying_new", "name": "快映•新节点", "base": "http://43.248.128.118:12512", "timeout": 4.0},
+    {"key": "kuaiying",     "name": "快映•4K",     "base": "http://38.76.197.172:12521",  "timeout": 4.0},
     {"key": "huban_ip",     "name": "虎斑•高速",   "base": "http://38.76.197.172:16969", "timeout": 3.5},
     {"key": "labi",         "name": "蜡笔•4K",     "base": "https://www.fmcf.fun",        "timeout": 4.5},
-    {"key": "labi_mirror",  "name": "蜡笔•备用",   "base": "https://www.mmpanpan.site",   "timeout": 4.5},
+    # 2026-11-13 移除「蜡笔•备用 mmpanpan.site」：三次实测 3.1/3.0/5.8s，
+    #   内容与蜡笔•4K 完全同源（详情页数一致），去重后零增益却拖慢整轮并发。
     {"key": "duoduo",       "name": "多多•4K",     "base": "https://tv.yydsys.cc",        "timeout": 4.5},
     {"key": "duoduo_xyz",   "name": "多多•备用",   "base": "https://tv.214521.xyz",       "timeout": 4.5},
-    {"key": "huban_domain", "name": "虎斑•备用",   "base": "http://xhban.xyz",            "timeout": 4.0},
+    # 2026-11-13 移除「虎斑•备用 xhban.xyz」：三次实测全部 TimeoutError（稳定失效），
+    #   每个失效节点都要耗满 timeout 才返回，是单轮耗时的主要浪费来源。
+    #   虎斑主 IP 38.76.197.172:16969 健康（0.3~0.4s / 详情页 10），保留。
+    # 2026-11-13 新增：实测搜索接口 4.2s / 详情页 9 个，补足召回。
+    # 同源的 woog.430520.xyz 首页可用但搜索接口报错，故不采用。
+    {"key": "baling",       "name": "八零•4K",     "base": "https://woog.nxog.eu.org",    "timeout": 5.0},
 ]
 # ── 搜索结果缓存 ────────────────────────────────────────
 # 内存缓存 + 磁盘持久化，避免服务重启后冷启动全线 8~12s。

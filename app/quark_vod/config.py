@@ -268,7 +268,12 @@ AI_PARSE_MAX_FAILS = int(os.environ.get("AI_PARSE_MAX_FAILS", "3"))
 AI_PARSE_COOLDOWN = int(os.environ.get("AI_PARSE_COOLDOWN", "300"))
 
 # ── 搜索源（网盘搜索站）───────────────────────────────
-# 复用在 tv.json 里已验证可用的 4K 网盘站
+#
+# ⚠️ DEPRECATED（2026-11-13）：本列表**无任何代码引用**，仅为历史遗留。
+#   实际生效的搜索节点是 `panshare_matrix.ACTIVE_PAN_NODES`，那才是唯一事实来源。
+#   两者曾经漂移（此处的「木偶」4 个地址实测全部失效，且从未被使用；
+#   「快映」旧的 xsayang.fun 搜索接口超时）。**新增/调整节点请只改
+#   panshare_matrix.py**，不要再往这里加。
 PAN_SEARCH_SITES = [
     {"key": "快映", "name": "快映 • 4K", "api": "csp_PanWebShare",
      "site": ["http://xsayang.fun", "http://38.76.197.172:12521"]},
