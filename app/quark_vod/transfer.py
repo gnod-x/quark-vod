@@ -20,6 +20,7 @@
 """
 
 import json
+import os
 import re
 import threading
 import time
@@ -30,6 +31,7 @@ import urllib.request
 from . import config
 from . import db
 from . import strm_manager
+from . import name_parser
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -547,6 +549,31 @@ class QuarkTransfer:
         return None
 
     @classmethod
+    def prefetch_episodes(cls, names, season=1):
+        """AI 文件名解析预热（2026-11-13 试点）。
+
+        对一组文件名做「一次批量」AI 复核并回填缓存，返回 {name: episode}。
+        之后同一组文件在各处调用 extract_episode_num 时会直接命中缓存，
+        不再逐条触发模型请求——这正是本设计避免 N×RT 的关键。
+
+        AI 不可用/关闭/熔断时自动退回纯规则结果，语义与 extract_episode_num 一致。
+        """
+        try:
+            return name_parser.parse_names_batch(names, season)
+        except Exception as e:
+            print(f"[{config.SERVICE_NAME}] [NameParser] 预热异常，回落规则: {e}", flush=True)
+            return {}
+
+    @classmethod
+    def _lookup_ep(cls, path_or_name, season, prefetched=None):
+        """供批量上下文使用：优先取预热结果，否则回退原规则。"""
+        if prefetched:
+            base = os.path.basename(path_or_name)
+            if base in prefetched:
+                return prefetched[base]
+        return cls.extract_episode_num(path_or_name, season)
+
+    @classmethod
     def match_episode_video(cls, vids, season=0, episode=0):
         """从视频列表中精确挑选目标剧集/电影（杜绝张冠李戴）。"""
         if not vids:
@@ -560,15 +587,18 @@ class QuarkTransfer:
             # 2026-11-08：与 transfer 验票同口径的「强证据优先」。
             #   优先保底：只要存在 >= 500MB 且无集数标记的正片，即认定为本片电影，
             #   取其中体积最大者（杜绝 52GB 4K 正片被同包 d3 1/d3 2 分卷信号拖累）。
+            # 2026-11-13：整组一次性 AI 复核（只复核规则 weak/none 分区），
+            # 避免下面三处循环逐文件触发模型请求。
+            ep1 = cls.prefetch_episodes([v["path"] for v in vids], season=1)
             big_unmarked = [v for v in vids
                             if (v.get("size") or 0) >= 500 * 1024 * 1024
-                            and cls.extract_episode_num(v["path"], season=1) is None]
+                            and cls._lookup_ep(v["path"], 1, ep1) is None]
             if big_unmarked:
                 return max(big_unmarked, key=lambda x: x["size"])
             if len(vids) > 1:
                 ep_counts = 0
                 for v in vids:
-                    ep_val = cls.extract_episode_num(v["path"], season=1)
+                    ep_val = cls._lookup_ep(v["path"], 1, ep1)
                     if ep_val is not None and ep_val > 0:
                         ep_counts += 1
                 if ep_counts >= 2 or (len(vids) >= 3 and ep_counts >= 1):
@@ -577,9 +607,10 @@ class QuarkTransfer:
             return max(vids, key=lambda x: x["size"])
 
         # 剧集：必须精确匹配集数，同集多版本优先选体积最大的（如 4K HDR > 4K SDR）
+        ep_s = cls.prefetch_episodes([v["path"] for v in vids], season=season)
         matched = []
         for v in vids:
-            ep = cls.extract_episode_num(v["path"], season=season)
+            ep = cls._lookup_ep(v["path"], season, ep_s)
             if ep == episode:
                 matched.append(v)
 
@@ -598,8 +629,9 @@ class QuarkTransfer:
     def match_all_episodes(cls, vids, season=1):
         """扫描多集视频列表，提取出同季每一集最佳画质视频映射 {episode: video_dict}。"""
         ep_map = {}
+        ep_all = cls.prefetch_episodes([v["path"] for v in vids], season=season)
         for v in vids:
-            ep = cls.extract_episode_num(v["path"], season=season)
+            ep = cls._lookup_ep(v["path"], season, ep_all)
             if ep and ep > 0:
                 # 剔除小于 80MB 的超小片头/短剧视频，保障整季批量激活全部为高清正片
                 if v.get("size", 0) < 80 * 1024 * 1024:
@@ -753,16 +785,21 @@ class QuarkTransfer:
                 #   惊蛰无声 / 给阿嬷的情书 / 罗小黑战记 / 后室 / 死侍与金刚狼 / 痴迷）。
                 #   现在先看强证据：存在「非集数标记且 >= 350MB」的单片即放行；
                 #   只有全部视频都带集数标记时，才按剧集包拒绝（真短剧源如此）。
+                # 2026-11-13：整包一次性 AI 复核，后续 3 处判定复用同一份结果
+                _ep_movie = self.prefetch_episodes(
+                    [v.get("file_name", "") for v in valid_vids], season=1)
                 _unmarked = [v for v in large_vids
-                             if self.extract_episode_num(v.get("file_name", ""), 1) is None]
+                             if self._lookup_ep(v.get("file_name", ""), 1, _ep_movie) is None]
                 if _unmarked:
                     pass  # 强证据：包内存在明确单片正片，允许作为电影转存
                 elif len(valid_vids) >= 3 and any(
-                        self.extract_episode_num(v.get("file_name", ""), 1) for v in valid_vids):
+                        self._lookup_ep(v.get("file_name", ""), 1, _ep_movie) for v in valid_vids):
                     raise TransferFailed("该分享包包含多集剧集特征，拒绝作为电影转存")
             else:
                 # 剧集验票门槛：必须包含目标集数！
-                has_target_ep = any(self.extract_episode_num(v.get("file_name", ""), season=season) == episode for v in valid_vids)
+                _ep_tv = self.prefetch_episodes(
+                    [v.get("file_name", "") for v in valid_vids], season=season)
+                has_target_ep = any(self._lookup_ep(v.get("file_name", ""), season, _ep_tv) == episode for v in valid_vids)
                 if not has_target_ep:
                     raise TransferFailed(f"分享包内未找到 S{season:02d}E{episode:02d} 对应文件，拒绝转存")
 

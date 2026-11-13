@@ -19,6 +19,9 @@ services:
       # 挂载代码目录支持免重构镜像秒级热更新，同时保持容器内路径与宿主机 strm_map 100% 对齐
       - ./app:/app
       - /home/dong/projects/hometheater:/home/dong/projects/hometheater
+      # 2026-11-13 AI 文件名解析兜底：只读挂载 cliproxyapi token 单文件，
+      # 刻意不挂整个 hometheater/.env（包含夸克 Cookie 等敏感项），收敛密钥暴露面。
+      - /home/dong/.config/cliproxy/token:/home/dong/.config/cliproxy/token:ro
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/health', timeout=5)"]
       interval: 30s

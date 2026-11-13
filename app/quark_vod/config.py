@@ -247,6 +247,26 @@ SELFHEAL_INITIAL_DELAY = 120
 # 自愈总开关
 SELFHEAL_ENABLED = True
 
+# ── AI 文件名语义解析兜底（2026-11-13 试点）─────────────
+# Why：extract_episode_num 的规则 D 宽松匹配是红线 7/8 两次事故的共同根因——
+#      发布组命名无限而正则只能覆盖踩过的坑（HDR10→10、d3 1→E1、H.264→264）。
+# 设计：规则 A/C（SxxEyy、第N集）为强证据永不进 AI；规则 B（季号冲突）永不进 AI；
+#      只有「规则 D 弱匹配」与「全部未命中」才按分享包批量送模型复核。
+#      模型只能把可疑数字改成 None，或为漏判补集数，严禁推翻强证据。
+AI_PARSE_ENABLED = os.environ.get("AI_PARSE_ENABLED", "1") == "1"
+AI_PARSE_SHADOW = os.environ.get("AI_PARSE_SHADOW", "0") == "1"
+# 实测 cn/deepseek-v4.1-flash 批量 12 个文件名 2.56s；单条 1.85~2.5s
+AI_PARSE_BASE_URL = os.environ.get("AI_PARSE_BASE_URL", "http://127.0.0.1:8317/v1")
+AI_PARSE_MODEL = os.environ.get("AI_PARSE_MODEL", "cn/deepseek-v4.1-flash")
+AI_PARSE_TIMEOUT = float(os.environ.get("AI_PARSE_TIMEOUT", "8.0"))
+# 单次批量请求的文件名上限（超出分片，防止上下文过长导致 JSON 破损）
+AI_PARSE_BATCH_SIZE = int(os.environ.get("AI_PARSE_BATCH_SIZE", "24"))
+# 置信度门槛：低于此值一律判 None（宁可回落规则结果，也不采信模糊判断）
+AI_PARSE_MIN_CONFIDENCE = float(os.environ.get("AI_PARSE_MIN_CONFIDENCE", "0.7"))
+# 进程内熔断：连续失败达到阈值后进入冷却，期间直接回落规则结果
+AI_PARSE_MAX_FAILS = int(os.environ.get("AI_PARSE_MAX_FAILS", "3"))
+AI_PARSE_COOLDOWN = int(os.environ.get("AI_PARSE_COOLDOWN", "300"))
+
 # ── 搜索源（网盘搜索站）───────────────────────────────
 # 复用在 tv.json 里已验证可用的 4K 网盘站
 PAN_SEARCH_SITES = [

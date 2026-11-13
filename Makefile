@@ -34,3 +34,5 @@ test:
 	@python3 -c "import urllib.request, json, sys; d=json.loads(urllib.request.urlopen('http://127.0.0.1:8099/capability').read()); print('[PASS] 6. Capability ready:', d) if d.get('ready') else sys.exit(1)"
 	@python3 -m py_compile app/main.py app/quark_vod/*.py app/jobs/*.py && echo "[PASS] 7. All Python modules compile cleanly"
 	@diff -q /home/dong/projects/quark-vod/app/quark_vod/strm_manager.py /home/dong/projects/hometheater/scripts/quark_vod/strm_manager.py >/dev/null && echo "[PASS] 8. quark_vod dual-directory in sync" || (echo "[FAIL] 8. quark_vod drift detected!" && exit 1)
+	@python3 -I tests/test_name_parser.py >/tmp/name_parser_test.log 2>&1 && echo "[PASS] 9. name_parser offline regression (red-line 7/8 golden samples)" || (echo "[FAIL] 9. name_parser regression!" && tail -20 /tmp/name_parser_test.log && exit 1)
+	@for f in $$(ls app/quark_vod/*.py); do diff -q $$f /home/dong/projects/hometheater/scripts/quark_vod/$$(basename $$f) >/dev/null || (echo "[FAIL] 10. drift: $$f" && exit 1); done; echo "[PASS] 10. all quark_vod modules zero drift"

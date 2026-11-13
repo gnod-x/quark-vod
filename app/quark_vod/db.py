@@ -129,6 +129,19 @@ CREATE TABLE IF NOT EXISTS user_pinned (
     UNIQUE(cat, title)
 );
 CREATE INDEX IF NOT EXISTS idx_user_pinned ON user_pinned(cat, title);
+
+-- AI 文件名语义解析结果缓存（2026-11-13 试点）
+-- key = sha1(filename + "|" + season)；episode 为 NULL 表示「确认为非集数」（电影正片等）
+CREATE TABLE IF NOT EXISTS name_parse_cache (
+    cache_key TEXT PRIMARY KEY,
+    file_name TEXT NOT NULL,
+    season INTEGER NOT NULL DEFAULT 0,
+    episode INTEGER,                   -- NULL = 非集数；整数 = 集数
+    confidence REAL DEFAULT 0,
+    origin TEXT NOT NULL DEFAULT 'ai', -- ai / shadow（影子模式观测，不参与生效）
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_name_parse_cache_origin ON name_parse_cache(origin);
 """
 
 
@@ -377,6 +390,36 @@ def find_done_transfer(cat, title, season, episode):
         return None
     matched.sort(key=lambda x: x[0])
     return matched[0][1]
+
+
+# ── name_parse_cache（AI 文件名解析缓存）────────────────
+def get_name_parse_cache(keys, origin="ai"):
+    """批量读取解析缓存。返回 {cache_key: episode_or_None}；未命中不出现在结果中。"""
+    if not keys:
+        return {}
+    con = _conn()
+    out = {}
+    keys = list(keys)
+    for i in range(0, len(keys), 500):
+        chunk = keys[i:i + 500]
+        q = ("SELECT cache_key, episode FROM name_parse_cache WHERE origin=? AND cache_key IN (%s)"
+             % ",".join("?" * len(chunk)))
+        for row in con.execute(q, [origin] + chunk):
+            out[row["cache_key"]] = row["episode"]
+    return out
+
+
+def put_name_parse_cache(rows, origin="ai"):
+    """批量写入解析缓存。rows = [(cache_key, file_name, season, episode, confidence)]"""
+    if not rows:
+        return
+    con = _conn()
+    now = int(time.time())
+    con.executemany(
+        "INSERT OR REPLACE INTO name_parse_cache "
+        "(cache_key,file_name,season,episode,confidence,origin,created_at) VALUES (?,?,?,?,?,?,?)",
+        [(k, n, s, ep, c, origin, now) for (k, n, s, ep, c) in rows])
+    con.commit()
 
 
 # ── strm_map ──────────────────────────────────────────

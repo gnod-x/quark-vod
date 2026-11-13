@@ -53,7 +53,8 @@
 | **`selfheal.py`** | ~360 行 | **后台自愈守护线程**：每天单次批量拉取 `/点播` 目录树比对 live strm，文件被删自动回退为 pending |
 | **`cleanup.py`** | ~460 行 | **网盘容量配额治理**：递归统计 `/点播` 真实占用（2TB 上限 / 1TB 水位），按 `(cat, title)` 整组淘汰过期资源 |
 | **`auditor.py`** | ~415 行 | **前置 4K 预检锁源器**：只读解析分享包树结构，提前锁定真 4K 资源存入 `source_audits` 表 |
-| **`db.py`** | ~390 行 | **SQLite 状态库封装**：管理 `quark_plays.db` 的 `transfers`、`plays`、`strm_map`、`dead_sources`、`source_audits` 五张核心表 |
+| **`db.py`** | ~400 行 | **SQLite 状态库封装**：管理 `quark_plays.db` 的 `transfers`、`plays`、`strm_map`、`dead_sources`、`source_audits`、`name_parse_cache` 六张表 |
+| **`name_parser.py`** | ~440 行 | **AI 文件名语义解析兜底**：规则四分区（strong/conflict/weak/none），仅 weak/none 送模型批量复核；带缓存、硬校验、熔断与影子模式（见红线 10） |
 
 ---
 
@@ -97,3 +98,13 @@ make test       # 运行自动化验收测试套件
    - **痛点根因**：TMDB 剧集分季详情会列出整季规划总集数（如 12、24 或 40 集）。旧逻辑为所有规划集数无差别生成 `.strm` 占位，导致电视端 Jellyfin2 充斥尚未播出的未来假集数（用户点击必报 503），未开播新剧甚至创建幽灵空目录引发海报墙裂图。
    - **判定口径**：连载更新中（`status != 'Ended'` 且 `status != 'Canceled'`）剧集必须通过 `is_episode_aired(ep_data, s_num, e, detail)` 校验 `air_date <= today` 或 `last_episode_to_air`；整季第一集都未开播者严禁创建目录，仅允许已播出集数生成 `.strm`。
    - **存量治理**：`daily_update_and_prune.py` 每日 05:00 自动调用 `prune_unaired_pending_strms()` 清理未来未播出占位，真实转存 live 直链（含 5244 或 /d/）无论播出日期均受保护严禁删除。
+10. **AI 文件名语义解析分区红线（2026-11-13 试点，`name_parser.py`）**：
+   - **Why**：红线 7/8 的共同根因是 `extract_episode_num` 的规则 D 把规格残片读成集数（`HDR10`→10、`4K_HDR_60`→60、`DDP5 1`→5、`d3 1`→E1）。发布组命名无界、正则有限，语义判断改由模型承担。
+   - **分区铁律**：`classify_by_rules()` 四分区——`strong`（规则 A/B季号相符/C 命中）与 `conflict`（季号冲突）**永不送 AI、结果不可被推翻**；只有 `weak`（规则 D 命中）与 `none`（全未命中）才送模型复核。严禁放宽此边界，否则电影验票依赖的 `is None` 语义全线失守。
+   - **批量铁律**：严禁逐文件调用模型。`match_episode_video` / `match_all_episodes` / 电影验票 / `auditor` 必须先 `prefetch_episodes()` 整组一次调用，再用 `_lookup_ep()` 查结果（实测 12 项 2.26s，逐文件会放大成 N×RT）。
+   - **归位铁律**：模型输出必须按 `file_name` 精确归位，下标仅作校验——实测模型偶发「从 1 编号/漏首项」，纯按 `i` 采信会把 A 的集数错挂到 B（比集数识别错误更危险的错位污染）。任一条目缺失则整批作废、回落规则。
+   - **硬校验**：值域 `1~2500`、置信度 `< AI_PARSE_MIN_CONFIDENCE(0.7)` 一律判 `None`；连续失败 3 次熔断 300s。任何异常都必须退化为改造前的纯规则行为。
+   - **年份误剥降级（2026-11-13 补充）**：`_NOISE_RE` 无边界保护的 `19\d\d|20\d\d` 会把「集数恰为年份形态」的名字清洗坏（`S01E2010` → `S01E10` → None）。`classify_by_rules()` 用**未清洗的原始 stem** 经 `_S_YEARLIKE_RE` 预判，downgrade 为 `weak` 交 AI 复核；**严禁**因此去改 `extract_episode_num` 的清洗正则（那是电影年份剥离的关键，改错即触碰红线 8）。
+   - **密钥红线**：容器以 `HOME=/root` 运行，`expanduser("~")` 不可靠；token 固定按 `/home/dong/.config/cliproxy/token` 读取，docker-compose 仅**只读挂载该单文件**，严禁挂载整个 `hometheater/.env`。
+   - **灰度开关**：`AI_PARSE_ENABLED` / `AI_PARSE_SHADOW`（影子模式只写 `origin=shadow` 缓存与 `[影子分歧]` 日志，绝不改变行为）。
+   - **验证口径**：`make test` 第 9 项跑 `tests/test_name_parser.py`（红线 7/8 黄金样本 + 归位/值域/熔断回归），第 10 项校验全部模块双目录零漂移。

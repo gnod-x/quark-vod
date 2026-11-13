@@ -117,11 +117,16 @@ class VodAuditor:
                         pass
 
             pack_episodes = {}
+            # 2026-11-13：整包一次性 AI 复核（锁源属后台任务，延迟不敏感）
+            _pack_names = [it.get("file_name", "") for it in inspect_items
+                           if not it.get("dir")
+                           and is_candidate_video(it.get("file_name", ""), it.get("size", 0) or 0)]
+            _ep_pack = self.tr.prefetch_episodes(_pack_names, season=season)
             for fit in inspect_items:
                 fname = fit.get("file_name", "")
                 fsize = fit.get("size", 0) or 0
                 if not fit.get("dir") and is_candidate_video(fname, fsize):
-                    ep_no = self.tr.extract_episode_num(fname, season=season)
+                    ep_no = self.tr._lookup_ep(fname, season, _ep_pack)
                     if ep_no and ep_no > 0:
                         is_single_4k = is_4k_pack or is_4k_candidate(fname, fsize, is_series=True)
                         if ep_no not in pack_episodes or is_single_4k:
@@ -237,13 +242,15 @@ class VodAuditor:
             #   旧实现只要命中弱集数信号就跳过该源，导致含 50GB 正片的电影源
             #   因 "4K_HDR_60"/"d3 1" 等规格残片被判为剧集大包而永远无法锁源。
             #   现先看强证据：存在「非集数标记且 >= 350MB」的单片即认定为本片电影。
+            # 2026-11-13：整包一次性 AI 复核，两处判定复用同一份结果
+            _ep_movie = self.tr.prefetch_episodes([f[0] for f in video_fits], season=1)
             _unmarked = [f for f in video_fits
                          if f[1] >= 350 * 1024 * 1024
-                         and self.tr.extract_episode_num(f[0], season=1) is None]
+                         and self.tr._lookup_ep(f[0], 1, _ep_movie) is None]
             if len(video_fits) > 1 and not _unmarked:
                 ep_hits = 0
                 for fn, _ in video_fits:
-                    if self.tr.extract_episode_num(fn, season=1) is not None:
+                    if self.tr._lookup_ep(fn, 1, _ep_movie) is not None:
                         ep_hits += 1
                 if ep_hits >= 2 or (len(video_fits) >= 3 and ep_hits >= 1):
                     continue  # 跳过该多集短剧包，继续寻找正片候选
