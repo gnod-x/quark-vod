@@ -2,10 +2,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-夸克网盘点播资源定时清理与 2TB 智能配额治理引擎
+夸克网盘点播资源定时清理与账号容量自适应配额治理引擎
 ========================================================================
 核心机制：
-  1. 2TB 存储配额监控：每日扫描 /夸克/点播 真实占用，若超 2TB 自动 LRU 淘汰至 1TB。
+  1. 账号容量自适应配额：每日查询账号真实容量，整盘使用率超 85% 时按 LRU 淘汰至 70%。
+     点播低于 200GB 时永不淘汰（避免因 /视频、/游戏 等其它目录占满而误删点播资源）。
   2. LRU 智能淘汰排序：
      - 白名单保护：正在追的剧集（未看完）、已收藏（Favorites）及港台经典专区绝不删除。
      - 淘汰优先级：从未播放（0次播放）> 最早播放（played_at 最旧）。
@@ -27,10 +28,48 @@ from .openlist_client import OpenListClient, OpenListError
 
 JF_DB = os.path.join(config.BASE_DIR, "jellyfin2/config/data/jellyfin.db")
 
-# 2TB 触发上限与 1TB 目标水位
+# ── 配额水位（2026-11-13 改为按账号容量动态推导）──────────────
+#
+# 旧实现硬编码 2TB / 1TB，与账号真实容量脱钩。实测：
+#   账号总容量 6TB、已用 3541GB（57.6%），而 /夸克/点播 仅占 4.7GB。
+#   由于点播永远到不了 2TB，配额淘汰形同虚设；即便触发，从 2TB 清到 1TB
+#   对 6TB 账号也是过度清理（用户可能正需要这些资源）。
+#
+# 现改为「按整盘使用率」治理，而非按点播绝对体积：
+#   整盘使用率 >= VOD_QUOTA_TRIGGER_PCT(85%)  → 淘汰点播至 VOD_QUOTA_TARGET_PCT(70%)
+#   同时保留绝对下限保护：点播低于 VOD_MIN_EVICT_BYTES 时不做任何淘汰，
+#   避免因其它目录（视频/游戏等）占满空间而误删用户正在看的点播资源。
+VOD_QUOTA_TRIGGER_PCT = 0.85
+VOD_QUOTA_TARGET_PCT = 0.70
+VOD_MIN_EVICT_BYTES = 200 * 1024 * 1024 * 1024      # 点播不足 200GB 时永不淘汰
+# 触发淘汰时，点播最多淘汰到自身体积的 30%（保留 70% 现有资源，防止一次清空）
+VOD_KEEP_FLOOR_PCT = 0.70
+
+# 兼容旧引用：作为「账号容量未知」时的兜底阈值
 MAX_VOD_BYTES = 2 * 1024 * 1024 * 1024 * 1024       # 2TB (2,199,023,255,552 字节)
 TARGET_VOD_BYTES = 1 * 1024 * 1024 * 1024 * 1024    # 1TB (1,099,511,627,776 字节)
 PROTECTED_CATEGORIES = set()  # 港台经典不设免死保护，所有专区均受配额与淘汰治理
+
+
+def resolve_quotas(max_bytes=None, target_bytes=None):
+    """根据账号真实容量推导配额水位。返回 (触发上限, 目标水位, 账号总量, 已用)。
+
+    账号容量查询失败时退化为旧常量，保证行为不劣化。
+    """
+    from .transfer import QuarkTransfer
+    try:
+        d = QuarkTransfer(None)._request(
+            "https://drive.quark.cn/1/clouddrive/member?pr=ucpro&fr=pc", method="GET").get("data", {})
+        total = int(d.get("total_capacity") or 0)
+        used = int(d.get("use_capacity") or 0)
+    except Exception as e:
+        print(f"[quota] 账号容量查询失败，退化为固定阈值: {e}", flush=True)
+        return (max_bytes or MAX_VOD_BYTES), (target_bytes or TARGET_VOD_BYTES), 0, 0
+    if total <= 0:
+        return (max_bytes or MAX_VOD_BYTES), (target_bytes or TARGET_VOD_BYTES), 0, 0
+    return (max_bytes or int(total * VOD_QUOTA_TRIGGER_PCT),
+            target_bytes or int(total * VOD_QUOTA_TARGET_PCT),
+            total, used)
 
 
 def get_protected_titles():
@@ -132,31 +171,67 @@ def get_vod_disk_usage(ol, max_depth=4, max_entries=400):
     return total_bytes, items
 
 
-def enforce_vod_quota(ol=None, max_bytes=MAX_VOD_BYTES, target_bytes=TARGET_VOD_BYTES,
+def enforce_vod_quota(ol=None, max_bytes=None, target_bytes=None,
                       dry_run=False, verbose=True):
     """
-    检查夸克网盘点播目录容量是否超 2TB；若超标，按 LRU 智能淘汰至 1TB 目标水位。
+    按【账号整盘使用率】治理点播存储；若超水位，按 LRU 智能淘汰至目标水位。
     返回 (淘汰数量, 释放字节数, 剩余总字节数)。
     """
     if ol is None:
         ol = OpenListClient()
 
+    # 淘汰上限不得超过点播自身的实际体积（否则会算出无意义的释放量）
     total_bytes, items = get_vod_disk_usage(ol)
+    max_bytes, target_bytes, acct_total, acct_used = resolve_quotas(max_bytes, target_bytes)
     gb = 1024 ** 3
     tb = 1024 ** 4
 
     if verbose:
-        print(f"[quota] 当前点播网盘实际占用: {total_bytes / gb:.2f} GB / {max_bytes / tb:.2f} TB",
-              flush=True)
+        if acct_total:
+            print(f"[quota] 账号容量 {acct_used / gb:.1f} GB / {acct_total / gb:.1f} GB "
+                  f"({acct_used / acct_total * 100:.1f}%)；点播目录占用 {total_bytes / gb:.2f} GB",
+                  flush=True)
+        else:
+            print(f"[quota] 点播目录占用 {total_bytes / gb:.2f} GB / 上限 {max_bytes / tb:.2f} TB",
+                  flush=True)
 
-    if total_bytes <= max_bytes:
+    # 触发条件：整盘使用率超阈值（账号可得时）或点播超过上限（兜底）
+    trigger = acct_used >= max_bytes if acct_total else total_bytes > max_bytes
+
+    if not trigger:
         if verbose:
-            print("[quota] 容量在配额限制内，无需执行配额淘汰。", flush=True)
+            print("[quota] 使用率在配额水位内，无需执行淘汰。", flush=True)
         return 0, 0, total_bytes
 
-    excess_gb = (total_bytes - target_bytes) / gb
-    print(f"[quota] ⚠️ 点播目录已超过 2TB 上限！准备淘汰释放至少 {excess_gb:.2f} GB 空间至 1TB 目标水位...",
-          flush=True)
+    # 安全护栏：点播本身很小时不做任何淘汰。
+    # 空间被 /视频、/游戏 等非本系统目录占用时，删点播既救不了空间、又会误伤资源。
+    if total_bytes <= VOD_MIN_EVICT_BYTES:
+        if verbose:
+            print(f"[quota] ⚠️ 使用率超水位，但点播仅占 {total_bytes / gb:.2f} GB "
+                  f"(低于 {VOD_MIN_EVICT_BYTES / gb:.0f}GB 淘汰底线)，不执行淘汰。"
+                  f"请检查 /视频、/游戏 等非点播目录的占用。", flush=True)
+        return 0, 0, total_bytes
+
+    # 淘汰量按「点播自身能释放多少」推导，不能直接拿整盘目标水位相减。
+    #
+    # 2026-11-13 实测缺陷：target_bytes 源自整盘容量（6TB×70%），而点播可能只有
+    # 几百 GB，两者相减会得到负数（实测输出「释放至少 -3500.80 GB」）。
+    # 正确口径：
+    #   ① 整盘需要腾出的量 = 整盘used - 目标水位；
+    #   ② 点播最多能腾出 = 点播体积 - 保留线(VOD_KEEP_FLOOR_PCT 的点播体积)；
+    #   ③ 实际淘汰量 = min(①, ②)，且不超过全部可淘汰候选之和。
+    if acct_total:
+        need_total = max(0, acct_used - target_bytes)
+        # 点播保留线：只淘汰多余的部分，至少保留 30% 的现有资源兜底
+        keep_floor = int(total_bytes * VOD_KEEP_FLOOR_PCT)
+        max_evict = max(0, total_bytes - keep_floor)
+        evict_goal = min(need_total, max_evict)
+    else:
+        evict_goal = max(0, total_bytes - target_bytes)
+
+    excess_gb = evict_goal / gb
+    print(f"[quota] ⚠️ 使用率超过水位！准备淘汰点播释放最多 {excess_gb:.2f} GB "
+          f"(整盘需腾出 {max(0, acct_used - target_bytes) / gb:.2f} GB)...", flush=True)
 
     protected_titles = get_protected_titles()
 
@@ -227,14 +302,26 @@ def enforce_vod_quota(ol=None, max_bytes=MAX_VOD_BYTES, target_bytes=TARGET_VOD_
     evicted_cnt = 0
     freed_bytes = 0
 
+    per_item_cap = max(evict_goal * 2, VOD_MIN_EVICT_BYTES)
+
     for cand in candidates:
-        if total_bytes <= target_bytes:
+        # 按「本次淘汰目标」判断，而不是拿点播体积去比整盘目标水位（见上方推导）
+        if freed_bytes >= evict_goal:
             break
 
         item = cand["item"]
         remote = item["remote_path"]
         sz = item["size"]
         title = cand["title"]
+
+        # 淘汰是「整部影片」粒度，无法精确切到 evict_goal。为避免一部超大影片
+        # 独自超出目标数倍（实测：目标 900GB 时若唯一候选是 3000GB 会一次全删），
+        # 限制单部释放量不超过目标的 2 倍；超出则跳过，优先淘汰体积合适的影片。
+        if sz > per_item_cap:
+            if verbose:
+                print(f"  [跳过超大影片] {title} ({sz / gb:.1f}GB > 单部上限 {per_item_cap / gb:.1f}GB)",
+                      flush=True)
+            continue
 
         if dry_run:
             print(f"  [配额预演] 将淘汰移入回收站: {remote} ({title}, 释放 {sz / gb:.2f} GB)", flush=True)
@@ -517,7 +604,7 @@ def main():
         # 1. 自动巡检并清理误匹配的短剧大包（防止占用网盘配额）
         clean_mismatched_short_dramas(dry_run=dry, verbose=True)
 
-        # 2. 执行 2TB 容量配额检测与 LRU 智能淘汰
+        # 2. 执行账号容量配额检测与 LRU 智能淘汰
         enforce_vod_quota(ol=ol, dry_run=dry, verbose=True)
 
         # 3. 清理 Jellyfin2 metadata/library 下的孤儿图片缓存

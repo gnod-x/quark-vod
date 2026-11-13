@@ -27,15 +27,43 @@ from . import search as search_mod
 from .transfer import QuarkTransfer, TransferFailed, QUARK_SHARE_DETAIL, is_candidate_video
 from .openlist_client import OpenListClient
 
-# 4K / 超高清正片识别正则
-FOUR_K_REGEX = re.compile(r'(?i)(?:2160[pP]|4[kK]|UHD|HDR(?:10|\+)?|DoVi|DV|REMUX|原盘|蓝光原盘)')
+# ── 4K 判定（2026-11-13 根治）──────────────────────────────
+#
+# 旧实现：
+#   FOUR_K_REGEX = 2160p | 4K | UHD | HDR10 | DoVi | DV | REMUX | 原盘 | 蓝光原盘
+# 缺陷：把「编码/母版特征」当成了「分辨率」。
+#   实测 1080p.HDR → True、720p.DV → True、1080p.REMUX → True，
+#   而库里 18486 条 valid_4k 锁源中 17321 条（94%）标题根本不含 4K/2160。
+#   由于 is_4k 决定锁源是否被优先调取，等于整条「4K 优先」策略失效。
+#
+# 现在拆成两个概念：
+#   ① 分辨率是否真为 4K  —— 只有 2160p / 4K / UHD 才算
+#   ② 是否明确标注低分辨率 —— 1080p / 720p / 576p / 480p 出现即否证 4K
+# HDR / DV / REMUX / 原盘 一律不再参与分辨率判定（它们可与 1080p 共存）。
+#
+# 保留体积判据，但仅作「未标注分辨率时」的辅助推断：显式标了 1080p 的文件
+# 无论多大都不算 4K，避免把高码率 1080p REMUX（体积可超 4.5GB）误判为 4K。
+_4K_RES_RE = re.compile(
+    r'(?i)(?:2160\s*[pP]?|(?<![0-9A-Za-z])4\s*[kK](?![0-9A-Za-z])|(?<![0-9A-Za-z])UHD(?![0-9A-Za-z])|'
+    r'3840\s*[xX×]\s*2160)')
+
+_LOW_RES_RE = re.compile(r'(?i)(?:1080\s*[pP]|720\s*[pP]|576\s*[pP]|480\s*[pP]|(?<![0-9])1280\s*[xX×]\s*720)')
+
+# 兼容旧引用名（外部如有 import FOUR_K_REGEX 仍可用，但语义已收敛为「明确 4K 标记」）
+FOUR_K_REGEX = _4K_RES_RE
+
 
 def is_4k_candidate(filename, size_bytes=0, is_series=False):
-    """根据文件名与体积综合裁定是否达到夸克 4K 原画标准。"""
+    """裁定资源是否达到 4K 原画标准。
+
+    判定顺序（重要）：先看显式低分辨率否证，再看 4K 标记，最后才用体积推断。
+    """
     fn = filename or ""
-    if FOUR_K_REGEX.search(fn):
+    if _LOW_RES_RE.search(fn):
+        return False          # 明确标注 1080p/720p 等 → 无论体积多大都不是 4K
+    if _4K_RES_RE.search(fn):
         return True
-    # 辅助体积判据（针对部分压制未在文件名中打 4K 标记的高码率文件）
+    # 未标注任何分辨率时，按体积辅助推断
     # 电影 > 4.5 GB，单集剧集 > 1.2 GB
     if is_series and size_bytes >= 1.2 * 1024 * 1024 * 1024:
         return True

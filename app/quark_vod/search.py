@@ -624,6 +624,19 @@ def match_best(results, title, year=None, season=0, episode=0):
         return None
     scored = [(score_search_result(r, title, year=year, season=season, episode=episode), i, r)
               for i, r in enumerate(results)]
+
+    # 2026-11-13：边界分数的一次性 AI 语义复核（见 title_judge.py）。
+    # 只对 15~90 分的候选做整批一次请求；100 分（清洗后标题完全相等）不进模型。
+    # 注意 85 分档（白名单命中）也在此区间——那正是规则最需要语义判断的地方。
+    # 任何异常均返回空覆盖表，行为与改造前完全一致。
+    try:
+        from . import title_judge
+        overrides = title_judge.judge(results, title, season=season, episode=episode)
+    except Exception:
+        overrides = {}
+    if overrides:
+        scored = [(overrides.get(id(r), sc), i, r) for sc, i, r in scored]
+
     passed = [t for t in scored if t[0] >= 30.0]
     if not passed:
         return None

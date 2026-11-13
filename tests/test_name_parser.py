@@ -145,6 +145,46 @@ def main():
     check("模型不可用时结果等于纯规则", got, want)
     name_parser.urllib.request.urlopen = orig
 
+    print("\n=== 4b. 4K 判定（2026-11-13 根治 HDR≠4K）===")
+    from quark_vod.auditor import is_4k_candidate
+    G = 1024 ** 3
+    for fn, size, series, want in [
+        ("某剧.S01E05.1080p.HDR.mkv",     0,     True,  False),  # 旧实现误判 True
+        ("某剧.S01E05.720p.DV.mkv",       0,     True,  False),  # 旧实现误判 True
+        ("某剧.S01E05.1080p.REMUX.mkv",   5 * G, True,  False),  # 体积大但显式 1080p
+        ("某剧.S01E05.2160p.mkv",         0,     True,  True),
+        ("某剧.S01E05.4K.mkv",            0,     True,  True),
+        ("某剧.S01E05.UHD.HDR.mkv",       0,     True,  True),
+        ("某剧.S01E05.mkv",               2 * G, True,  True),   # 未标注，体积推断
+        ("某剧.S01E05.mkv",               0,     True,  False),
+        ("Movie.2020.mkv",                5 * G, False, True),
+    ]:
+        check(f"4K {fn} {size // G}GB", is_4k_candidate(fn, size, is_series=series), want)
+
+    print("\n=== 4c. title_judge 边界与调整策略 ===")
+    from quark_vod import title_judge as tj
+    from quark_vod.search import SearchResult, score_search_result
+
+    def _mk(n):
+        return SearchResult(engine="panshare", source="t", name=n, year="",
+                            poster="", episodes=[], share_url="http://x/" + n)
+
+    check("高分为不升分（85 同作保持 85）", tj._apply(85.0, 0.0), 85.0)
+    check("低分为可升分（20 同作 → 60）", tj._apply(20.0, tj.MAX_UP), 60.0)
+    check("不同作品可降分", tj._apply(85.0, -tj.MAX_DOWN), 45.0)
+    check("分数不下穿 0", tj._apply(20.0, -tj.MAX_DOWN), 0.0)
+    check("分数不上穿 100", tj._apply(90.0, tj.MAX_UP), 100.0)
+    check("空结果零副作用", tj.judge([], "测试"), {})
+    # 100 分强匹配绝不进模型（边界上限 90）——用打桩验证 AI 未被调用
+    _called = []
+    _orig_ask = tj._ask
+    tj._ask = lambda *a, **k: _called.append(1) or (_ for _ in ()).throw(RuntimeError("不应调用"))
+    try:
+        ov = tj.judge([_mk("恶人 1080p")], "恶人", season=0, episode=0)
+        check("100 分候选不进 AI", (_called, ov), ([], {}))
+    finally:
+        tj._ask = _orig_ask
+
     print("\n=== 5. 未命中（none）文件不得因 AI 缺席而丢失结果 ===")
     check("返回项完整", set(got.keys()), set(batch))
 

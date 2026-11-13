@@ -33,6 +33,8 @@ from . import config
 from . import db
 from . import strm_manager
 from . import cleaner
+# 2026-11-13：统一 4K 判定口径，杜绝「HDR/DV/REMUX = 4K」误判
+from .auditor import is_4k_candidate
 from .openlist_client import OpenListClient, OpenListError
 
 # ── 全局单例 ──────────────────────────────────────────
@@ -674,7 +676,7 @@ class Handler(BaseHTTPRequestHandler):
                                         ep_penalty = 1
                                 except ValueError:
                                     pass
-                            is_4k = 1 if re.search(r"4K|臻彩|2160|UHD|HDR", cn, re.I) else 0
+                            is_4k = 1 if is_4k_candidate(cn) else 0
                             try:
                                 sc = search_mod.score_search_result(
                                     c, title, season=season, episode=episode)
@@ -684,7 +686,7 @@ class Handler(BaseHTTPRequestHandler):
                         share_candidates.sort(key=_cand_priority)
                     else:
                         share_candidates.sort(
-                            key=lambda c: -1 if re.search(r"4K|臻彩|2160|UHD|HDR", c.name or "", re.I) else 0)
+                            key=lambda c: -1 if is_4k_candidate(c.name or "") else 0)
 
                     # ── 转存前置验活（2026-10-20 全库实测新增）──
                     # 实测 203 部国产有源作品中，168 部失败里 85 部（51%）是分享源已死
