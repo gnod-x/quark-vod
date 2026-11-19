@@ -11,26 +11,15 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from . import config, db
+from . import search_plugins
 
 UA = {"User-Agent": "Mozilla/5.0"}
-ACTIVE_PAN_NODES = [
-    {"key": "kuaiying",     "name": "快映•4K",     "base": "http://38.76.197.172:12521",  "timeout": 4.0},
-    {"key": "huban_ip",     "name": "虎斑•高速",   "base": "http://38.76.197.172:16969", "timeout": 3.5},
-    {"key": "labi",         "name": "蜡笔•4K",     "base": "https://www.fmcf.fun",        "timeout": 4.5},
-    # 2026-11-13 移除「蜡笔•备用 mmpanpan.site」：三次实测 3.1/3.0/5.8s，
-    #   内容与蜡笔•4K 完全同源（详情页数一致），去重后零增益却拖慢整轮并发。
-    {"key": "duoduo",       "name": "多多•4K",     "base": "https://tv.yydsys.cc",        "timeout": 4.5},
-    {"key": "duoduo_xyz",   "name": "多多•备用",   "base": "https://tv.214521.xyz",       "timeout": 4.5},
-    # 2026-11-13 移除「虎斑•备用 xhban.xyz」：三次实测全部 TimeoutError（稳定失效），
-    #   每个失效节点都要耗满 timeout 才返回，是单轮耗时的主要浪费来源。
-    #   虎斑主 IP 38.76.197.172:16969 健康（0.3~0.4s / 详情页 10），保留。
-    # 2026-11-16: woog.nxog.eu.org 搜索连续 HTTP 失败，复测 520，暂移出。
-    # 恢复后先通过搜索和详情解析验活再加入；不自动改用未经验证的镜像。
-]
+# Deprecated test/embedding override; deployment sources live in VOD_SEARCH_CONFIG.
+ACTIVE_PAN_NODES = []
 
 SEARCH_CACHE_TTL = 1800
 SEARCH_CACHE_DIR = os.path.join(config.DATA_DIR, "search_cache")
-_CACHE_MAGIC = 3
+_CACHE_MAGIC = 4
 _mem_cache = {}
 _cache_lock = threading.RLock()
 _search_slots = threading.BoundedSemaphore(2)
@@ -94,9 +83,23 @@ def next_page(text, current, base):
     return None
 
 
-def _cache_key(keyword, pages=3, limit=24):
-    raw=f'{keyword.strip()}|{pages}|{limit}'
-    return 'ps3_'+hashlib.sha256(raw.encode()).hexdigest()[:32]
+def source_snapshot():
+    registry = search_plugins.get_registry()
+    snapshot = registry.snapshot()
+    error = registry.status(refresh=False)['error']
+    # Old embedding/test code may explicitly set this list. An explicit JSON
+    # configuration always wins, including an intentionally empty one.
+    if not os.environ.get('VOD_SEARCH_CONFIG') and ACTIVE_PAN_NODES:
+        snapshot = search_plugins.snapshot_from_nodes(ACTIVE_PAN_NODES)
+        error = None
+    return snapshot, error
+
+
+def _cache_key(keyword, pages=3, limit=24, fingerprint=None):
+    if fingerprint is None:
+        fingerprint = source_snapshot()[0].fingerprint
+    raw=f'{keyword.strip()}|{pages}|{limit}|{fingerprint}'
+    return 'ps4_'+hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
 def _cache_path(key):return os.path.join(SEARCH_CACHE_DIR,key+'.json')
@@ -168,7 +171,7 @@ def _fetch_node(node,keyword,limit,max_pages):
         for page in range(max_pages):
             if not url or url in visited:break
             visited.add(url)
-            text=_fetch_html(url,min(7,max(.1,deadline-time.monotonic())))
+            text=_fetch_html(url,min(node.get('timeout', 7),max(.1,deadline-time.monotonic())))
             report['pages']+=1
             paths=list(dict.fromkeys(paths+detail_paths(text)))
             following=next_page(text,url,base)
@@ -179,7 +182,7 @@ def _fetch_node(node,keyword,limit,max_pages):
     except Exception as exc:report['errors']+=1;report['error_type']=type(exc).__name__
     def detail(path):
         if time.monotonic()>=deadline:raise TimeoutError('node deadline')
-        text=_fetch_html(base+path,min(7,max(.1,deadline-time.monotonic())))
+        text=_fetch_html(base+path,min(node.get('timeout', 7),max(.1,deadline-time.monotonic())))
         rows=parse_download_rows(text)
         if not rows:
             tm=re.search(r'<title[^>]*>(.*?)</title>',text,re.S|re.I)
@@ -193,6 +196,81 @@ def _fetch_node(node,keyword,limit,max_pages):
             except Exception as exc:report['errors']+=1;report['error_type']=type(exc).__name__
     report.update(seconds=round(time.monotonic()-start,3),candidates=len(items))
     return items,report
+
+
+
+def _fetch_json_node(node, keyword, limit, max_pages):
+    start = time.monotonic()
+    report = {'node': node['key'], 'pages': 0, 'details': 0, 'errors': 0,
+              'truncated': False}
+    items = []
+    try:
+        url = node['base'].rstrip('/') + node.get('path', '/search') + '?' + urllib.parse.urlencode({
+            node.get('query_param', 'q'): keyword})
+        body = json.loads(_fetch_html(url, node.get('timeout', 4.0)))
+        if not isinstance(body, dict) or not isinstance(body.get('items'), list):
+            raise ValueError('invalid provider response')
+        report['pages'] = 1
+        report['truncated'] = len(body['items']) > limit
+        report['partial'] = bool(body.get('partial', False))
+        for row in body['items'][:limit]:
+            if (not isinstance(row, dict) or not isinstance(row.get('name'), str)
+                or not row['name'].strip() or len(row['name']) > 1000
+                or not isinstance(row.get('share_url'), str)
+                or len(row['share_url']) > 4096
+                or not canonical_share(row['share_url'])):
+                report['errors'] += 1
+                continue
+            items.append({'source': node['key'], 'name': row['name'].strip(),
+                          'share_url': row['share_url']})
+    except Exception as exc:
+        report['errors'] += 1
+        report['error_type'] = type(exc).__name__
+    report.update(seconds=round(time.monotonic()-start, 3), candidates=len(items))
+    return items, report
+
+
+def _fetch_provider(node, keyword, limit, max_pages):
+    provider = node.get('provider', 'html')
+    handler = (_fetch_node if provider == 'html' else
+               _fetch_json_node if provider == 'json' else search_plugins.get_provider(provider))
+    started = time.monotonic()
+    try:
+        if handler is None:
+            raise ValueError('provider unavailable')
+        items, report = handler(node, keyword, limit, max_pages)
+        if not isinstance(items, list) or not isinstance(report, dict):
+            raise ValueError('invalid provider result')
+        if len(items) > 1200:
+            raise ValueError('provider result too large')
+        normalized = []
+        invalid = 0
+        for row in items:
+            if (not isinstance(row, dict) or not isinstance(row.get('name'), str)
+                or not isinstance(row.get('share_url'), str)
+                or len(row['name']) > 1000 or len(row['share_url']) > 4096):
+                invalid += 1
+                continue
+            normalized.append({'name': row['name'], 'share_url': row['share_url'],
+                               'source': node['key']})
+        # Retain diagnostic counters only. Plugins must not leak upstream URLs
+        # or arbitrary error text into the public report.
+        safe = {'node': node['key'], 'provider': provider,
+                'errors': max(0, min(int(report.get('errors', 0)), 10000)) + invalid,
+                'pages': max(0, min(int(report.get('pages', 0)), 10000)),
+                'details': max(0, min(int(report.get('details', 0)), 10000)),
+                'truncated': bool(report.get('truncated')),
+                'partial': bool(report.get('partial')),
+                'seconds': round(time.monotonic()-started, 3),
+                'candidates': len(normalized)}
+        if safe['errors']:
+            safe['error_type'] = 'ProviderError'
+        return normalized, safe
+    except Exception:
+        return [], {'node': node['key'], 'provider': provider, 'pages': 0,
+                    'details': 0, 'errors': 1, 'truncated': False,
+                    'error_type': 'ProviderError', 'candidates': 0,
+                    'seconds': round(time.monotonic()-started, 3)}
 
 
 def merge_items(items):
@@ -219,15 +297,27 @@ def merge_items(items):
 
 class PanshareMatrix:
     @classmethod
-    def search_report(cls,keyword,limit_per_node=24,max_workers=5,use_cache=True,max_pages=3):
+    def search_report(cls,keyword,limit_per_node=24,max_workers=5,use_cache=True,max_pages=3,
+                      *, snapshot=None, configuration_error=None):
         keyword=' '.join((keyword or '').split())[:120]
-        empty={'items':[],'nodes':[],'partial':False,'cached':False}
+        if snapshot is None:
+            snapshot, configuration_error = source_snapshot()
+        nodes = [node.as_dict() for node in snapshot.enabled_nodes]
+        empty={'items':[],'nodes':[],'partial':not bool(nodes) or bool(configuration_error),
+               'cached':False,'configured':bool(nodes),
+               'configuration_error':configuration_error,
+               'config_fingerprint':snapshot.fingerprint}
         if not keyword:return empty
         max_pages=max(1,min(int(max_pages),3));limit_per_node=max(1,min(int(limit_per_node),30))
-        key=_cache_key(keyword,max_pages,limit_per_node)
+        key=_cache_key(keyword,max_pages,limit_per_node,snapshot.fingerprint)
         if use_cache:
             hit=_cache_get(key)
-            if hit is not None:return cls._filter_dead({**hit,'cached':True})
+            if hit is not None:
+                return cls._filter_dead({**hit,'cached':True,
+                    'configuration_error':configuration_error,
+                    'partial':bool(hit.get('partial')) or bool(configuration_error)})
+        if not nodes:
+            return empty
         if not _search_slots.acquire(timeout=2):return {**empty,'partial':True,'busy':True}
         try:
             items=[];reports=[]
@@ -237,12 +327,13 @@ class PanshareMatrix:
                     if keyword.casefold() in row.get('clean_name','').casefold():
                         items.append({'source':'daily_hot','name':row.get('title') or row['clean_name'],'share_url':row.get('quark_url','')})
             except (OSError,ValueError,KeyError,TypeError):pass
-            with ThreadPoolExecutor(max_workers=max(1,min(max_workers,len(ACTIVE_PAN_NODES)))) as pool:
-                futures=[pool.submit(_fetch_node,n,keyword,limit_per_node,max_pages) for n in ACTIVE_PAN_NODES]
+            workers = max(1,min(int(max_workers),5,len(nodes)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures=[pool.submit(_fetch_provider,n,keyword,limit_per_node,max_pages) for n in nodes]
                 for future in as_completed(futures):
                     found,report=future.result();items.extend(found);reports.append(report)
-            result={'items':merge_items(items),'nodes':sorted(reports,key=lambda n:n['node']),
-                    'partial':any(r['errors'] for r in reports),'cached':False}
+            result={**empty,'items':merge_items(items),'nodes':sorted(reports,key=lambda n:n['node']),
+                    'partial':bool(configuration_error) or any(r['errors'] or r.get('partial') for r in reports)}
             if use_cache:_cache_put(key,result)
             return cls._filter_dead(result)
         finally:_search_slots.release()

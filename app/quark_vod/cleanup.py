@@ -29,7 +29,7 @@ from . import db
 from . import strm_manager
 from .openlist_client import OpenListClient, OpenListError
 
-JF_DB = os.path.join(config.BASE_DIR, "jellyfin2/config/data/jellyfin.db")
+JF_DB = config.JELLYFIN2_DB
 
 # ── 配额水位（2026-11-13 改为按账号容量动态推导）──────────────
 #

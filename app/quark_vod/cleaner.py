@@ -86,7 +86,7 @@ class CleanStream:
             self.close()
 
 
-def open_clean_stream(url, skip, range_header="", request_headers=None):
+def open_clean_stream(url, skip, range_header="", request_headers=None, *, opener=None):
     """Open and validate a prefixed stream; body reads are bounded and lazy."""
     if not isinstance(skip, int) or skip < 0:
         raise CleanStreamError(400, "invalid skip")
@@ -107,7 +107,7 @@ def open_clean_stream(url, skip, range_header="", request_headers=None):
         translated = f"bytes={start + skip}-{end + skip if end is not None else ''}"
     headers["Range"] = translated
     try:
-        response = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20)
+        response = (opener or urllib.request.urlopen)(urllib.request.Request(url, headers=headers), timeout=20)
     except urllib.error.HTTPError as exc:
         try:
             if exc.code == 416:

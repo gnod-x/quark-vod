@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 TMP = tempfile.TemporaryDirectory(prefix='vod-playback-')
 os.environ.update(VOD_BASE_DIR=TMP.name, VOD_DATA_DIR=TMP.name+'/data',
-                  VOD_CINEMA2_DIR=TMP.name+'/cinema2', AI_PARSE_ENABLED='0')
+                  VOD_CINEMA2_DIR=TMP.name+'/cinema2', AI_PARSE_ENABLED='0', VOD_JELLYFIN_ENABLED='1', VOD_MAINTENANCE_ENABLED='1')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'app'))
 from quark_vod import config, db, server, strm_manager, cleaner, search, coordination
 from quark_vod.identity import Work

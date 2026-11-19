@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Quark-VOD Engine (FastAPI + Whitebox Admin Console)
-===================================================
-提供 100% 兼容原有 cinema-quark (8099) 的流媒体点播拦截接口，
-同时新增 /admin 白盒可视化管理台与 /docs (Swagger UI) 调试接口。
+Quark-VOD API, playback proxy and authenticated administration.
 """
 
+import hmac
 import json
 import os
 import re
@@ -19,13 +17,15 @@ from typing import Optional
 
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from quark_vod import cleaner, cleanup, config, db, search as search_mod, selfheal, server as legacy_srv, strm_manager
 from quark_vod.transfer import QuarkTransfer
 from quark_vod import coordination
 from quark_vod import media_cache
+from quark_vod import search_plugins
+from quark_vod import download_http
 
 
 class MediaResponse(StreamingResponse):
@@ -93,36 +93,57 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"[{config.SERVICE_NAME}] strm 登记异常: {e}", flush=True)
 
-    threading.Thread(target=_bg_scan, daemon=True, name="strm-scan").start()
+    if config.VOD_STARTUP_SCAN:
+        threading.Thread(target=_bg_scan, daemon=True, name="strm-scan").start()
 
+    stop_event = threading.Event()
     if config.SELFHEAL_ENABLED:
-        threading.Thread(target=selfheal.heal_loop, daemon=True, name="selfheal").start()
+        threading.Thread(target=selfheal.heal_loop, kwargs={"stop_event": stop_event},
+                         daemon=True, name="selfheal").start()
         print(
             f"[{config.SERVICE_NAME}] 自愈线程已启动（间隔 {config.SELFHEAL_INTERVAL}s，"
             f"首次延迟 {config.SELFHEAL_INITIAL_DELAY}s）",
             flush=True,
         )
 
-    ol = legacy_srv.get_openlist()
-    if ol:
-        try:
-            ok, reason = ol.check_write_capable()
-            print(f"[{config.SERVICE_NAME}] OpenList 写能力: {'就绪' if ok else '未就绪'} ({reason})", flush=True)
-        except Exception as e:
-            print(f"[{config.SERVICE_NAME}] OpenList 写能力检查异常: {e}", flush=True)
-    else:
-        print(f"[{config.SERVICE_NAME}] OpenList 暂未就绪: {legacy_srv._ol_err}", flush=True)
+    # Starting an unconfigured instance never logs into a drive or writes a probe.
+    if config.VOD_STARTUP_WRITE_PROBE:
+        _probe_capability()
 
     print(f"[{config.SERVICE_NAME}] Cookie: {config.redact_cookie(config.get_quark_cookie())}", flush=True)
-    yield
+    try:
+        yield
+    finally:
+        stop_event.set()
 
 
 app = FastAPI(
-    title="Quark-VOD Engine (Jellyfin2 伴生点播引擎)",
-    description="家庭影院双轨流媒体点播拦截、五维身份隔离搜索、夸克读写分离转存与三道防线自愈引擎",
-    version="2.0.0",
+    title="Quark VOD",
+    description="可独立部署的夸克点播服务，支持搜索源热加载和可选媒体库集成。",
+    version="3.0.0",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def admin_auth(request: Request, call_next):
+    path = request.url.path
+    protected = path.startswith("/api/admin/") or path in {"/stats", "/capability", "/preheat"}
+    if protected:
+        token = config.get_admin_token()
+        if not token:
+            return JSONResponse(status_code=503, content={"error": "admin_not_configured"},
+                                headers={"Cache-Control": "no-store"})
+        authorization = request.headers.get("authorization", "")
+        scheme, _, supplied = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(supplied.encode(), token.encode()):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"},
+                                headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"})
+    response = await call_next(request)
+    if path == "/admin" or path.startswith("/api/admin/"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 @app.exception_handler(coordination.Busy)
@@ -140,7 +161,7 @@ async def maintenance_busy(request, exc):
 def health(request: Request):
     if request.method == "HEAD":
         return Response(status_code=200, media_type="application/json")
-    return {"status": "ok", "service": config.SERVICE_NAME, "engine": "fastapi-v2"}
+    return {"status": "ok", "service": config.SERVICE_NAME, "engine": "fastapi-v3", "version": "3.0.0"}
 
 
 @app.get("/stats", tags=["Core VOD"])
@@ -156,6 +177,23 @@ def stats(request: Request):
 def capability(request: Request):
     if request.method == "HEAD":
         return Response(status_code=200, media_type="application/json")
+    registry = search_plugins.get_registry().status()
+    checked = getattr(app.state, "capability_probe", {})
+    return {
+        "cookie_ready": bool(config.get_quark_cookie()),
+        "cookie_hint": config.redact_cookie(config.get_quark_cookie()),
+        "cookie_alive": checked.get("cookie_alive"),
+        "cookie_status": checked.get("cookie_status", "尚未执行连接验证"),
+        "openlist_write": checked.get("openlist_write"),
+        "openlist_reason": checked.get("openlist_reason", "尚未执行连接验证"),
+        "panshare_ready": bool(registry.get("enabled_count")),
+        "ready": bool(checked.get("ready")),
+        "probe_time": checked.get("probe_time"),
+        "plugins": registry,
+    }
+
+
+def _probe_capability():
     ol = legacy_srv.get_openlist()
     write_ok, write_reason = (False, legacy_srv._ol_err or "未初始化")
     if ol:
@@ -166,7 +204,7 @@ def capability(request: Request):
     tr_probe = legacy_srv.get_transfer() or QuarkTransfer(None)
     cookie_alive, cookie_status = tr_probe.check_cookie_alive()
     cur_cookie = config.get_quark_cookie()
-    return {
+    result = {
         "cookie_ready": bool(cur_cookie),
         "cookie_alive": cookie_alive,
         "cookie_status": cookie_status,
@@ -175,7 +213,32 @@ def capability(request: Request):
         "openlist_reason": write_reason,
         "panshare_ready": True,
         "ready": bool(cookie_alive and write_ok),
+        "probe_time": int(time.time()),
     }
+    app.state.capability_probe = result
+    return result
+
+
+@app.post("/api/admin/capability/probe", tags=["Administration"])
+def admin_probe_capability():
+    """Explicit authenticated probe; may create and remove a unique drive probe."""
+    return _probe_capability()
+
+
+@app.get("/api/admin/plugins", tags=["Administration"])
+def admin_plugins():
+    registry = search_plugins.get_registry()
+    registry.snapshot()
+    return registry.status()
+
+
+@app.post("/api/admin/plugins/reload", tags=["Administration"])
+def admin_reload_plugins():
+    try:
+        return search_plugins.get_registry().reload()
+    except search_plugins.PluginConfigError:
+        return JSONResponse(status_code=422, content={"error": "invalid_plugin_configuration",
+                                                     "active": search_plugins.get_registry().status()})
 
 
 @app.api_route("/play", methods=["GET", "HEAD"], tags=["Core VOD"])
@@ -258,17 +321,25 @@ def preheat(
         return JSONResponse(status_code=503,content={'error':str(exc),'code':exc.code})
 
 
+def media_url_allowed(url: str) -> bool:
+    """Only configured OpenList download origins may enter the public proxy."""
+    return download_http.allowed_openlist_url(url)
+
+
 @app.api_route("/clean", methods=["GET", "HEAD"], tags=["Core VOD"])
 def clean_stream(
     request: Request,
     url: str = Query(..., description="原始 OpenList 直链 URL"),
-    skip: int = Query(8, description="需剥离的前导混淆字节数（默认 8 字节 PNG 头）"),
+    skip: int = Query(8, ge=0, le=4096, description="需剥离的前导混淆字节数（默认 8 字节 PNG 头）"),
 ):
     """流式剥离前导字节，统一处理完整请求、单区间和后缀 Range。"""
     if not url:
         return JSONResponse(status_code=400, content={"error": "missing url"})
+    if not media_url_allowed(url):
+        return JSONResponse(status_code=403, content={"error": "media_origin_not_allowed"})
     try:
-        stream = cleaner.open_clean_stream(url, skip, request.headers.get("range", ""), request.headers)
+        stream = cleaner.open_clean_stream(url, skip, request.headers.get("range", ""), request.headers,
+                                          opener=download_http.urlopen)
         if request.method == "HEAD":
             stream.close()
             return Response(status_code=stream.status, headers=stream.headers)
@@ -287,7 +358,7 @@ def clean_stream(
 
 
 class CookieUpdateReq(BaseModel):
-    cookie: str
+    cookie: str = Field(max_length=32768)
 
 
 @app.get("/", include_in_schema=False)
@@ -297,7 +368,7 @@ def root_redirect():
 
 @app.get("/admin", response_class=HTMLResponse, tags=["Whitebox Admin"])
 def admin_page():
-    html_path = os.path.join(os.path.dirname(__file__), "static", "admin.html")
+    html_path = os.path.join(os.path.dirname(search_plugins.__file__), "static", "admin.html")
     if os.path.exists(html_path):
         return FileResponse(html_path, media_type="text/html; charset=utf-8")
     return HTMLResponse("<h1>Admin UI not found</h1>", status_code=404)
@@ -369,7 +440,8 @@ def admin_search_debug(
     locked_url, is_4k, l_title = db.get_locked_4k_share(cat, title, season, episode)
 
     candidates = []
-    raw_results = search_mod.search(title, prefer_panshare=True, season=season, episode=episode)
+    report = search_mod.search_report(title, season=season, episode=episode)
+    raw_results = report['results']
     for r in raw_results:
         sc = search_mod.score_search_result(r, title, season=season, episode=episode)
         candidates.append(
@@ -389,6 +461,8 @@ def admin_search_debug(
     return {
         "query": {"raw_title": title, "clean_title": clean_t, "cat": cat, "season": season, "episode": episode},
         "elapsed_sec": elapsed,
+        "configured": report.get("configured", True),
+        "partial": report.get("partial", False),
         "locked_share": {"url": locked_url, "is_4k": bool(is_4k), "title": l_title} if locked_url else None,
         "total_candidates": len(candidates),
         "qualified_count": sum(1 for c in candidates if c["qualified"]),
@@ -399,7 +473,12 @@ def admin_search_debug(
 @app.post("/api/admin/cookie", tags=["Whitebox Admin"])
 def admin_update_cookie(req: CookieUpdateReq):
     """在线热更新 QUARK_COOKIE 并立即校验有效性。"""
-    config.set_quark_cookie(req.cookie)
+    try:
+        config.set_quark_cookie(req.cookie)
+    except ValueError:
+        return JSONResponse(status_code=422, content={"error": "invalid_cookie_header"})
+    except OSError:
+        return JSONResponse(status_code=503, content={"error": "cookie_persistence_failed"})
     # 重置转存器缓存以应用新 Cookie
     legacy_srv._transfer = None
     tr = QuarkTransfer(None)
@@ -415,6 +494,8 @@ def admin_update_cookie(req: CookieUpdateReq):
 @app.post("/api/admin/selfheal", tags=["Whitebox Admin"])
 def admin_trigger_selfheal():
     """手动触发一次全库 live strm 自愈巡检。"""
+    if not config.VOD_MAINTENANCE_ENABLED:
+        return JSONResponse(status_code=409, content={"error": "maintenance_disabled"})
     t0 = time.time()
     res = selfheal.scan_and_heal(verbose=True)
     return {"ok": True, "elapsed_sec": round(time.time() - t0, 2), "result": res}

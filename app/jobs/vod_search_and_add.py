@@ -303,7 +303,12 @@ def _refresh():
 
 def _queue_preheat(cat, folder, season, episode):
     params=urllib.parse.urlencode({'cat':cat,'t':folder,'s':season,'e':episode})
-    with urllib.request.urlopen(VOD_API+'/preheat?'+params,timeout=12) as response:
+    token = config.get_admin_token()
+    if not token:
+        raise ValueError('点播服务管理凭证尚未配置')
+    request = urllib.request.Request(VOD_API+'/preheat?'+params,
+        headers={'Authorization': 'Bearer '+token})
+    with urllib.request.urlopen(request,timeout=12) as response:
         if response.status not in (200,202):raise ValueError('点播服务暂时无法接收转存')
 
 

@@ -38,6 +38,8 @@ def main():
     tmp = temp.name
     os.environ["VOD_BASE_DIR"] = tmp
     os.environ["VOD_DATA_DIR"] = tmp
+    os.environ["AI_PARSE_BASE_URL"] = "http://127.0.0.1:9/v1"
+    os.environ["AI_PARSE_MODEL"] = "synthetic-model"
     os.environ["AI_PARSE_ENABLED"] = "0"     # 本测试一律不触网
 
     from quark_vod import config, db, name_parser

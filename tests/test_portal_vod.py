@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 TMP=tempfile.TemporaryDirectory(prefix='vod-portal-test-')
-os.environ.update(VOD_BASE_DIR=TMP.name,VOD_DATA_DIR=TMP.name+'/data',VOD_CINEMA2_DIR=TMP.name+'/cinema2',AI_PARSE_ENABLED='0')
+os.environ.update(VOD_BASE_DIR=TMP.name,VOD_DATA_DIR=TMP.name+'/data',VOD_CINEMA2_DIR=TMP.name+'/cinema2',AI_PARSE_ENABLED='0',VOD_ADMIN_TOKEN='synthetic-host-test-token')
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'app'))
 # Import the authoritative host job, with quark_vod already loaded from app.

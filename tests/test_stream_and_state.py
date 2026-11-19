@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 TMP = tempfile.TemporaryDirectory(prefix='vod-regression-')
 os.environ.update(VOD_BASE_DIR=TMP.name, VOD_DATA_DIR=TMP.name + '/data',
-                  VOD_CINEMA2_DIR=TMP.name + '/cinema2', AI_PARSE_ENABLED='0')
+                  VOD_CINEMA2_DIR=TMP.name + '/cinema2', AI_PARSE_ENABLED='0', VOD_JELLYFIN_ENABLED='1', VOD_MAINTENANCE_ENABLED='1', OPENLIST_PUBLIC='http://fixture.invalid')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
 from quark_vod import cleaner, cleanup, config, coordination, db, strm_manager
 from quark_vod.openlist_client import OpenListClient, OpenListError
@@ -66,8 +66,8 @@ class StreamTests(unittest.TestCase):
             response = main.Response(**kwargs)
             response.sync_body = body
             return response
-        with patch.object(main, 'StreamingResponse', side_effect=capture_stream), patch.object(cleaner.urllib.request, 'urlopen', return_value=upstream) as opened:
-            result = main.clean_stream(request(rng, method), 'http://fixture.invalid/video', 8)
+        with patch.object(main, 'StreamingResponse', side_effect=capture_stream), patch.object(main.download_http, 'urlopen', return_value=upstream) as opened:
+            result = main.clean_stream(request(rng, method), 'http://fixture.invalid/d/video', 8)
             actual = response_bytes(result)
         return result, actual, opened.call_args.args[0], upstream
 
@@ -115,15 +115,15 @@ class StreamTests(unittest.TestCase):
 
     def test_unsatisfiable_range_no_heal(self):
         error = urllib.error.HTTPError('http://fixture.invalid', 416, 'range', {'Content-Range': 'bytes */18'}, io.BytesIO())
-        with patch.object(cleaner.urllib.request, 'urlopen', side_effect=error), patch.object(cleaner, '_trigger_selfheal_for') as heal:
-            r = main.clean_stream(request('bytes=100-'), 'http://fixture.invalid/video', 8)
+        with patch.object(main.download_http, 'urlopen', side_effect=error), patch.object(cleaner, '_trigger_selfheal_for') as heal:
+            r = main.clean_stream(request('bytes=100-'), 'http://fixture.invalid/d/video', 8)
         self.assertEqual(r.status_code, 416)
         self.assertEqual(r.headers['content-range'], 'bytes */10')
         heal.assert_not_called()
 
     def test_negative_skip_rejected(self):
-        with patch.object(cleaner.urllib.request, 'urlopen') as opened:
-            r = main.clean_stream(request(), 'http://fixture.invalid/video', -1)
+        with patch.object(main.download_http, 'urlopen') as opened:
+            r = main.clean_stream(request(), 'http://fixture.invalid/d/video', -1)
         self.assertEqual(r.status_code, 400)
         opened.assert_not_called()
 
@@ -202,7 +202,7 @@ class StateTests(unittest.TestCase):
     def test_4k_debug_does_not_use_hdr_alone(self):
         from quark_vod.search import SearchResult
         item=SearchResult(engine='panshare',source='fixture',name='样例 HDR 1080p',year='',poster='',episodes=[],share_url='https://fixture.invalid/s/id',pan_type='quark')
-        with patch.object(main.search_mod,'search',return_value=[item]), patch.object(main.search_mod,'score_search_result',return_value=90), patch.object(db,'get_locked_4k_share',return_value=(None,False,'')):
+        with patch.object(main.search_mod,'search_report',return_value={'results':[item], 'configured':True, 'partial':False}), patch.object(main.search_mod,'score_search_result',return_value=90), patch.object(db,'get_locked_4k_share',return_value=(None,False,'')):
             result=main.admin_search_debug('样例','电影',0,0)
         self.assertFalse(result['candidates'][0]['is_4k_hint'])
 
@@ -242,7 +242,7 @@ class StateTests(unittest.TestCase):
             writer.execute('DELETE FROM x_storages')
             writer.execute('INSERT INTO x_storages VALUES (?,?)', (config.QUARK_MOUNT, '{"cookie":"synthetic-current"}'))
             writer.commit()
-            with patch.object(config,'_cached_quark_cookie',''), patch.dict(os.environ, {'QUARK_COOKIE':''}):
+            with patch.object(config,'OPENLIST_DB_PATH',str(path)), patch.object(config,'_cached_quark_cookie',''), patch.dict(os.environ, {'QUARK_COOKIE':''}):
                 self.assertEqual(config.get_quark_cookie(), 'synthetic-current')
         writer.close()
 

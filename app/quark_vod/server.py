@@ -1,7 +1,8 @@
 """Playback coordination. HTTP routes live in main.py.
 
 Pending requests and explicit preheating join the same bounded job. A successful
-result means the saved file is readable and its exact library STRM was activated.
+result means the saved file is readable. With Jellyfin enabled, its exact library
+STRM must also be activated; standalone playback does not write a media library.
 A timeout never starts a second save while the original job is still running.
 """
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
@@ -134,10 +135,14 @@ def _finish(work, tid, remote):
     if not _wait_direct_url_ready(url, remote_path=remote):
         raise PlaybackUnavailable('文件已转存，播放通道暂未就绪，请稍后重试', 'saved_not_ready')
     url = cleaner.clean_url_if_obfuscated(url)
-    try:
-        strm_manager.activate(*work.args, url)
-    except Exception as exc:
-        raise PlaybackUnavailable('文件可读，但片库映射更新失败', 'activation_failed') from exc
+    # Standalone installs have no pre-generated Jellyfin STRM library. Returning
+    # the verified media URL needs no filesystem mutation. Keep the strict
+    # activation gate for integrated deployments (including mapping failures).
+    if config.VOD_JELLYFIN_ENABLED:
+        try:
+            strm_manager.activate(*work.args, url)
+        except Exception as exc:
+            raise PlaybackUnavailable('文件可读，但片库映射更新失败', 'activation_failed') from exc
     # This is a successful resolution/access, not proof of actual watch progress.
     # No automatic permanent pin; real watch/favourite protection comes from Jellyfin.
     db.record_access(tid)
@@ -236,6 +241,8 @@ def _resolve_once(work):
             if report['partial']:
                 message += '；本轮搜索未完成'
             raise PlaybackUnavailable(message, 'transfer_failed')
+        if report.get('configured') is False:
+            raise PlaybackUnavailable('尚未配置搜索源，请在管理台配置并加载插件', 'search_not_configured')
         if report['partial']:
             raise PlaybackUnavailable('片源搜索未完成，请稍后重试', 'search_incomplete')
         raise PlaybackUnavailable('本轮未找到可尝试的匹配片源，可在门户重新查找', 'source_unavailable')

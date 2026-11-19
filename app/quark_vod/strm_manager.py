@@ -36,13 +36,18 @@ _refresh_worker_lock = threading.Lock()
 
 def _do_jellyfin_refresh_sync(strm_path: str):
     """同步执行单个条目的 Jellyfin2 流信息刷新（免锁只读查询 + ReplaceAllMetadata=false）。"""
+    if not config.VOD_JELLYFIN_ENABLED:
+        return
     try:
         from contextlib import closing
         import urllib.request
         import sqlite3
         if not strm_path or not os.path.isfile(strm_path):
             return
-        container_path = strm_path.replace(config.CINEMA2_DIR, "/cinema2")
+        relative = os.path.relpath(strm_path, config.CINEMA2_DIR)
+        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+            return
+        container_path = os.path.join(config.JELLYFIN_LIBRARY_ROOT, relative)
         with closing(sqlite3.connect(f"file:{config.JELLYFIN2_DB}?mode=ro", uri=True, timeout=2)) as con:
             cur = con.cursor()
             row = cur.execute("SELECT Id FROM BaseItems WHERE Path = ? LIMIT 1", (container_path,)).fetchone()
@@ -205,7 +210,7 @@ def parse_live_remote_path(content):
     """从 live strm 内容反推网盘【写入侧】路径。
 
     live 内容形如：
-      http://192.168.101.240:5244/d/%E5%A4%B8%E5%85%8B/%E7%82%B9%E6%92%AD/...
+      https://openlist.example.invalid/d/%E5%A4%B8%E5%85%8B/%E7%82%B9%E6%92%AD/...
     其中 %E5%A4%B8%E5%85%8B = /夸克（播放侧挂载，QuarkTV）。
     需要转回写入侧（/夸克网盘）才能用夸克官方 API 校验存在性。
 
@@ -213,7 +218,7 @@ def parse_live_remote_path(content):
 
     2026-10-25 修复（976 条 8099/clean 死链自愈盲区）：
     clean 路由的内容形如
-      http://192.168.101.240:8099/clean?url=<内层直链>&skip=8
+      https://vod.example.invalid/clean?url=<内层直链>&skip=8
     旧实现直接 urlparse 外层 URL，得到 path='/clean' 而非 '/d/...'，
     于是无条件返回 None，导致 selfheal 完全看不见所有 clean 流
     （实测 1012 条 live strm 中只识别到 36 条，976 条网盘已删的

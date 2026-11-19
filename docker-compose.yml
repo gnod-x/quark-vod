@@ -2,34 +2,41 @@ services:
   quark-vod:
     build:
       context: .
-      dockerfile: Dockerfile
-    image: quark-vod:latest
-    container_name: quark-vod
+    image: quark-vod:3.0.0
     restart: unless-stopped
-    network_mode: host
+    env_file:
+      - .env
+    environment:
+      VOD_HOST: 0.0.0.0
+      VOD_PORT: "8099"
+      VOD_BASE_DIR: /data
+      VOD_SEARCH_CONFIG: /config/search.json
+    ports:
+      - "${VOD_PUBLISH_ADDRESS:-127.0.0.1}:${VOD_PORT:-8099}:8099"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - quark_vod_data:/data
+      - ./examples:/config:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
     deploy:
       resources:
         limits:
           memory: 256M
-    environment:
-      - VOD_HOST=0.0.0.0
-      - VOD_PORT=8099
-      - VOD_BASE_DIR=/home/dong/projects/hometheater
-    volumes:
-      # 保持 STRM 绝对路径；只允许点播数据、日志和 cinema2 写入。
-      - ./app:/app:ro
-      - /home/dong/projects/hometheater/data:/home/dong/projects/hometheater/data
-      - /home/dong/projects/hometheater/logs:/home/dong/projects/hometheater/logs
-      - /home/dong/projects/hometheater/cinema2:/home/dong/projects/hometheater/cinema2
-      - /home/dong/projects/hometheater/.env:/home/dong/projects/hometheater/.env:ro
-      # 在线 WAL 数据库必须连同 -wal/-shm 所在目录一起可读。
-      - /home/dong/projects/hometheater/openlist/data:/home/dong/projects/hometheater/openlist/data:ro
-      - /home/dong/projects/hometheater/jellyfin2/config/data:/home/dong/projects/hometheater/jellyfin2/config/data:ro
-      - /home/dong/projects/hometheater/web:/home/dong/projects/hometheater/web:ro
-      # AI 凭证只挂载统一 token 文件。
-      - /home/dong/.config/cliproxy/token:/home/dong/.config/cliproxy/token:ro
+    stop_grace_period: 30s
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/health', timeout=5)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/health', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3
+
+volumes:
+  quark_vod_data:

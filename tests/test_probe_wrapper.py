@@ -6,7 +6,8 @@ import subprocess
 import tempfile
 import unittest
 
-SOURCE = Path('/home/dong/projects/hometheater/custom-ffmpeg')
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = (ROOT / 'custom-ffmpeg') if (ROOT / 'custom-ffmpeg').is_dir() else (ROOT.parent / 'hometheater/custom-ffmpeg')
 
 
 class WrapperTests(unittest.TestCase):

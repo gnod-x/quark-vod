@@ -1,55 +1,60 @@
-.PHONY: up down restart build logs status test sync sync-jobs test-offline test-ui check-sync verify-runtime
+PYTHON ?= python3
+HOMETHEATER_DIR ?= ../hometheater
 
-sync:
-	@cp -f /home/dong/projects/quark-vod/app/quark_vod/*.py /home/dong/projects/hometheater/scripts/quark_vod/
-	@echo "[OK] Synced quark_vod modules to hometheater/scripts/quark_vod"
+.PHONY: install test test-offline test-homelab test-ui package build up down restart logs status sync sync-jobs check-sync verify-runtime
 
-sync-jobs:
-	@set -e; for name in ai_night_worker category_governor daily_update_and_prune people_manager purge_orphan_metadata tmdb_populate vod_search_and_add; do cp /home/dong/projects/hometheater/scripts/$$name.py app/jobs/$$name.py; done
+install:
+	$(PYTHON) -m pip install -e '.[test]'
+
+test: test-offline
+
+test-offline:
+	@set -e; for file in tests/test_*.py; do \
+	  case "$$file" in tests/test_portal_vod.py|tests/test_probe_wrapper.py) continue ;; esac; \
+	  PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -I "$$file"; \
+	done
+
+test-homelab: test-offline
+	@set -e; test -d "$(HOMETHEATER_DIR)/scripts/tests"; \
+	for file in tests/test_portal_vod.py tests/test_probe_wrapper.py; do PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -I "$$file"; done; \
+	for file in "$(HOMETHEATER_DIR)"/scripts/tests/test_*.py; do PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -I "$$file"; done
+	$(PYTHON) -I tests/verify_tmdb_populate.py --offline-fixture
+	$(MAKE) check-sync
+
+test-ui:
+	node tests/test_portal_ui.js
+
+package:
+	$(PYTHON) -m build
+
+build:
+	docker compose build quark-vod
 
 up:
 	docker compose up -d
 
-build:
-	docker compose build quark-vod && docker compose up -d
-
-restart: sync
-	docker compose restart quark-vod
-
 down:
 	docker compose down
 
+restart:
+	docker compose restart quark-vod
+
 logs:
-	docker logs -f --tail 100 quark-vod
+	docker compose logs --tail 100 -f quark-vod
 
 status:
-	@docker ps --filter "name=quark-vod" --filter "name=jellyfin2" --filter "name=openlist"
-	@curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8099/health | python3 -m json.tool
+	docker compose ps
 
-test: test-offline check-sync
+sync:
+	@test -d "$(HOMETHEATER_DIR)/scripts/quark_vod"
+	cp -f app/quark_vod/*.py "$(HOMETHEATER_DIR)/scripts/quark_vod/"
 
-test-ui:
-	@node tests/test_portal_ui.js
-
-test-offline:
-	@python3 -I tests/test_name_parser.py
-	@python3 -I tests/test_search_quality.py
-	@python3 -I tests/test_portal_vod.py
-	@python3 -I tests/test_stream_and_state.py
-	@python3 -I tests/test_playback_coordinator.py
-	@python3 -I tests/test_probe_wrapper.py
-	@python3 -I tests/test_media_cache.py
-	@python3 -I tests/test_sync_check.py
-	@python3 -I ../hometheater/scripts/tests/test_daily_prune_and_populate.py
-	@python3 -I tests/verify_tmdb_populate.py --offline-fixture
-	@python3 -I ../hometheater/scripts/tests/test_ai_worker_concurrency.py
-	@python3 -I ../hometheater/scripts/tests/test_ai_worker_content.py
-	@python3 -I ../hometheater/scripts/tests/test_ai_worker_subtitles.py
-	@python3 -I ../hometheater/scripts/tests/test_ai_worker_write_safety.py
-	@python3 -I ../hometheater/scripts/tests/test_ai_extractor.py
+sync-jobs:
+	@set -e; for name in ai_night_worker category_governor daily_update_and_prune people_manager purge_orphan_metadata tmdb_populate vod_search_and_add; do cp "$(HOMETHEATER_DIR)/scripts/$$name.py" "app/jobs/$$name.py"; done
 
 check-sync:
-	@python3 -I tests/check_sync.py
+	$(PYTHON) -I tests/check_sync.py --destination "$(HOMETHEATER_DIR)/scripts/quark_vod"
 
 verify-runtime:
-	@python3 -I tests/verify_runtime.py --output /home/dong/.agent-context/verification/cinema-runtime-latest.json
+	@test -n "$(OUTPUT)" || (echo "Set OUTPUT=/path/to/report.json"; exit 2)
+	$(PYTHON) -I tests/verify_runtime.py --output "$(OUTPUT)"

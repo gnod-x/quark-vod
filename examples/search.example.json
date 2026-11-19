@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "id": "example-html",
+      "name": "HTML provider",
+      "provider": "html",
+      "base": "https://example.invalid",
+      "enabled": false,
+      "timeout": 4
+    },
+    {
+      "id": "example-json",
+      "name": "JSON provider",
+      "provider": "json",
+      "base": "https://example.invalid",
+      "path": "/search",
+      "query_param": "q",
+      "enabled": false,
+      "timeout": 4
+    }
+  ]
+}

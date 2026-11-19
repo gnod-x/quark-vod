@@ -18,14 +18,8 @@ from . import db
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 # ── CMS 源（2026-10-18 最新高可用源池）──────────────────
-CMS_SITES = [
-    {"key": "ikun", "name": "⚡ikun┃官方M3U8", "api": "https://ikunzyapi.com/api.php/provide/vod"},
-    {"key": "guangsu", "name": "⚡光速┃官方M3U8", "api": "https://api.guangsuapi.com/api.php/provide/vod"},
-    {"key": "bfzy", "name": "⚡暴风┃官方M3U8", "api": "https://bfzyapi.com/api.php/provide/vod"},
-    {"key": "lzi",  "name": "⚡量子┃官方M3U8", "api": "https://cj.lziapi.com/api.php/provide/vod"},
-    {"key": "xinlang", "name": "⚡新浪┃官方M3U8", "api": "http://api.xinlangapi.com/xinlangapi.php/provide/vod"},
-    {"key": "feifan", "name": "⚡非凡┃官方M3U8", "api": "http://cj.ffzyapi.com/api.php/provide/vod"},
-]
+# Legacy CMS helpers require an explicit sites argument; no bundled service list.
+CMS_SITES = []
 
 # 单源超时（秒）。CMS 源响应 3~4s，留余量
 SEARCH_TIMEOUT = 20
@@ -250,14 +244,19 @@ def query_variants(title, aliases=(), season=0):
 
 
 def search_report(title, *, aliases=(), season=0, episode=0, use_cache=True):
-    from .panshare_matrix import PanshareMatrix, merge_items
+    from .panshare_matrix import PanshareMatrix, merge_items, source_snapshot
+    snapshot, configuration_error = source_snapshot()
     queries = query_variants(title, aliases, season)
-    reports = [PanshareMatrix.search_report(q, use_cache=use_cache) for q in queries]
+    reports = [PanshareMatrix.search_report(q, use_cache=use_cache, snapshot=snapshot,
+                configuration_error=configuration_error) for q in queries]
     items = merge_items([row for report in reports for row in report['items']])
     results = [SearchResult(engine='panshare', source=r['source'], name=r['name'], year='', poster='', episodes=[],
                share_url=r['share_url'], pan_type='quark', names=r['names'], sources=r['sources']) for r in items]
     return {'results': results, 'queries': queries, 'nodes': [n for r in reports for n in r['nodes']],
-            'partial': any(r['partial'] for r in reports), 'cached': bool(reports) and all(r['cached'] for r in reports)}
+            'partial': any(r['partial'] for r in reports) or not bool(snapshot.enabled_nodes),
+            'cached': bool(reports) and all(r['cached'] for r in reports),
+            'configured': bool(snapshot.enabled_nodes), 'configuration_error': configuration_error,
+            'config_fingerprint': snapshot.fingerprint}
 
 
 def search(keyword, prefer_panshare=False, season=0, episode=0, *, aliases=()):

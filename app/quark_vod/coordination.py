@@ -93,6 +93,10 @@ def ensure_idle():
     Offline business fixtures must explicitly substitute this external guard;
     absence of a production database is never evidence that the library is idle.
     """
+    if not config.VOD_MAINTENANCE_ENABLED:
+        raise Busy('自动维护未启用')
+    if not config.VOD_JELLYFIN_ENABLED:
+        raise Busy('未配置媒体库保护集成，暂缓维护')
     if not os.path.isfile(config.JELLYFIN2_DB):
         raise Busy('Jellyfin 保护数据库缺失或不可访问，暂缓维护')
     key = config.get_jellyfin2_key()
