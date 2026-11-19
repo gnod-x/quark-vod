@@ -20,7 +20,7 @@ def main():
         sources=call('/api/vod/sources',{'id':item['id'],'media_type':item['media_type'],'season':1,'episode':1})
         report['search']={'count':len(sources['candidates']),'partial':sources['partial'],'queries':sources['queries'],'nodes':sources['nodes']}
         checks=[]
-        for candidate in sources['candidates'][:5]:
+        for candidate in [c for c in sources['candidates'] if not c.get('reuse_saved')][:5]:
             try:
                 result=call('/api/vod/inspect',{'token':candidate['token']})
                 check={'candidate':candidate['name'],**result['file']};checks.append(check)
