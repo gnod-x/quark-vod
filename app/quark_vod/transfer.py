@@ -621,10 +621,11 @@ class QuarkTransfer:
             return max(vids, key=video_rank)
 
         # 剧集：必须精确匹配集数，同集多版本优先选体积最大的（如 4K HDR > 4K SDR）
-        ep_s = cls.prefetch_episodes([v["path"] for v in vids], season=season)
+        ep_s = cls.prefetch_episodes([v["path"] for v in vids if '_confirmed_episode' not in v], season=season)
         matched = []
         for v in vids:
-            ep = cls._lookup_ep(v["path"], season, ep_s)
+            ep = (v['_confirmed_episode'] if '_confirmed_episode' in v
+                  else cls._lookup_ep(v["path"], season, ep_s))
             if ep == episode:
                 matched.append(v)
 
@@ -811,6 +812,7 @@ class QuarkTransfer:
             return not rest.strip(' ._-()[]（）【】')
         videos=[]
         for item in files:
+            confirmed_episode = None
             path=item.get('relative_path') or item['file_name']
             file_title = item['file_name']
             wanted_year=split_title(title)[1]
@@ -900,7 +902,15 @@ class QuarkTransfer:
                         suffix_is_metadata = not safe_suffix.strip(' ._-()[]')
                         if not (unknown_name and not explicit_variant and parent_identity and not conflicting_parent and suffix_is_metadata):
                             continue
-            videos.append({'path':path,'name':item['file_name'],'size':item.get('size') or 0,'share':item})
+                        if numeric_episode:
+                            # The exact parent and numeric leaf already prove
+                            # this episode. Do not let the weak-name AI stage
+                            # overwrite that deterministic context later.
+                            confirmed_episode = episode
+            video={'path':path,'name':item['file_name'],'size':item.get('size') or 0,'share':item}
+            if confirmed_episode is not None:
+                video['_confirmed_episode'] = confirmed_episode
+            videos.append(video)
         if not season:
             features=[v for v in videos if v['size']>=350*1024**2]
             matched=[]

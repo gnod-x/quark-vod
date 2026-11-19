@@ -144,6 +144,44 @@ class SearchTests(unittest.TestCase):
                 bad=[dict(f,relative_path=parent+'/'+f['file_name'] if parent else f['file_name']) for f in files]
                 self.assertIsNone(QuarkTransfer(None).select_share_video(bad,'各取所需 (2026)',1,1))
 
+    def test_confirmed_numeric_episode_is_not_reinterpreted_by_enabled_ai(self):
+        from quark_vod import config, name_parser
+        files=[{'file_name':'01.mp4','relative_path':'各取所需（2026）德剧/01.mp4','size':838310685}]
+        with patch.object(config,'AI_PARSE_ENABLED',True), patch.object(config,'AI_PARSE_SHADOW',False), \
+                patch.object(name_parser,'_cache_get_many',return_value={}), \
+                patch.object(name_parser,'_cache_put_many'), \
+                patch.object(name_parser,'_circuit_open',return_value=False), \
+                patch.object(name_parser,'_ask_model',return_value={0:(2,1.0)}) as model:
+            selected=QuarkTransfer(None).select_share_video(files,'各取所需 (2026)',1,1)
+        model.assert_not_called()
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected['name'],'01.mp4')
+
+    def test_confirmed_numeric_episode_keeps_rank_size_floor_and_other_weak_ai(self):
+        from quark_vod import config, name_parser
+        files=[{'file_name':name,'relative_path':'各取所需（2026）德剧/'+name,'size':size}
+               for name,size in [('01.mp4',838310685),('01.mkv',1024**3)]]
+        with patch.object(config,'AI_PARSE_ENABLED',True), patch.object(config,'AI_PARSE_SHADOW',False), \
+                patch.object(name_parser,'_cache_get_many',return_value={}), \
+                patch.object(name_parser,'_cache_put_many'), \
+                patch.object(name_parser,'_circuit_open',return_value=False), \
+                patch.object(name_parser,'_ask_model',side_effect=AssertionError('confirmed names must not reach AI')) as model:
+            selected=QuarkTransfer(None).select_share_video(files,'各取所需 (2026)',1,1)
+            self.assertEqual(selected['name'],'01.mkv')
+            tiny=[dict(files[0],size=10*1024**2)]
+            self.assertIsNone(QuarkTransfer(None).select_share_video(tiny,'各取所需 (2026)',1,1))
+            model.assert_not_called()
+        # A weak file without confirmed parent context still uses the original
+        # model parser; this fix does not globally disable weak-name handling.
+        with patch.object(config,'AI_PARSE_ENABLED',True), patch.object(config,'AI_PARSE_SHADOW',False), \
+                patch.object(name_parser,'_cache_get_many',return_value={}), \
+                patch.object(name_parser,'_cache_put_many'), \
+                patch.object(name_parser,'_circuit_open',return_value=False), \
+                patch.object(name_parser,'_ask_model',return_value={0:(1,1.0)}) as model:
+            result=QuarkTransfer.match_episode_video([{'name':'01.mp4','path':'01.mp4','size':838310685}],1,1)
+        model.assert_called_once()
+        self.assertIsNotNone(result)
+
     def test_episode_directory_context_does_not_relax_movie_selection(self):
         files=[{'file_name':name,'relative_path':'沙丘 (2021)/'+name,'size':2*1024**3}
                for name in ('Unknown.One.2160p.mkv','Unknown.Two.2160p.mkv')]
