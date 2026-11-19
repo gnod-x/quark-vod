@@ -90,6 +90,66 @@ class SearchTests(unittest.TestCase):
     def test_queries_retain_year_and_original_title(self):
         self.assertEqual(search.query_variants('沙丘 (2021)',['Dune']),['沙丘','沙丘2021','Dune'])
 
+    def test_translated_episode_in_verified_work_directory(self):
+        name='Joy.of.Life.2019.S01.EP01.WEB-DL.4K.HEVC.AAC-LeagueWEB.mp4'
+        parent='Q 庆余年 (2019) 4K 高码率 单集5G 国语中字 全46集'
+        item={'file_name':name,'relative_path':parent+'/'+name,'size':5733013617}
+        selected=QuarkTransfer(None).select_share_video([item],'庆余年 (2019)',1,1)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected['name'],name)
+
+    def test_translated_episode_directory_does_not_override_conflicts(self):
+        good='Joy.of.Life.2019.S01.EP01.WEB-DL.4K.mp4'
+        cases=[
+            ('其他作品 (2019)',good),
+            ('庆余年 (2020)',good),
+            ('庆余年2 (2019)',good),
+            ('庆余年 真人版 (2019)',good),
+            ('庆余年 (2019) 其他作品',good),
+            ('庆余年 (2019)/其他作品 (2019)',good),
+            ('庆余年 (2019)/Anime',good),
+            ('庆余年 (2019)/Movie',good),
+            ('庆余年 (2019)/Part2',good),
+            ('庆余年 (2019)/Joy.of.Life.2',good),
+            ('庆余年 (2019)','Joy.of.Life.2.2019.S01.EP01.4K.mp4'),
+            ('庆余年 (2019)','Joy.of.Life.Anime.2019.S01.EP01.4K.mp4'),
+            ('庆余年 (2019)','Joy.of.Life.Movie.2019.S01.EP01.4K.mp4'),
+            ('庆余年 (2019)','Joy.of.Life.2019.S01.EP01.Anime.4K.mp4'),
+            ('庆余年 (2019)','Joy.of.Life.2019.S01.EP01.Movie.4K.mp4'),
+            ('庆余年 (2019)','Joy.of.Life.2019.S01.EP01.错误剧名.4K.mp4'),
+            ('庆余年 (2019)','Joy.of.Life.2019.S01.EP01.Part2.4K.mp4'),
+            ('庆余年 (2019)','Joy.of.Life.2019.S01.EP01-02.4K.mp4'),
+            ('庆余年 (2019)','Joy.of.Life.2019.EP01.EP02.4K.mp4'),
+            ('庆余年 (2019) (2020)',good),
+            ('庆余年 (2019)','错误剧名.2019.S01.EP01.4K.mp4'),
+            ('庆余年 (2019)','庆余年2.2019.S01.EP01.4K.mp4'),
+            ('庆余年 (2019)','Joy.of.Life.2020.S01.EP01.4K.mp4'),
+            ('庆余年 (2019)','Joy.of.Life.2019.S02.EP01.4K.mp4'),
+            ('庆余年 (2019)','Joy.of.Life.2019.S01.EP02.4K.mp4'),
+            ('庆余年 (2019)','Joy.of.Life.2019.S01.EP01.EP02.4K.mp4'),
+            ('',good),
+        ]
+        for parent,name in cases:
+            with self.subTest(parent=parent,name=name):
+                item={'file_name':name,'relative_path':parent+'/'+name if parent else name,'size':5733013617}
+                self.assertIsNone(QuarkTransfer(None).select_share_video([item],'庆余年 (2019)',1,1))
+
+    def test_numeric_episode_uses_exact_enumerated_parent(self):
+        files=[{'file_name':f'{n:02}.mp4','relative_path':f'各取所需（2026）德剧/{n:02}.mp4','size':838310685} for n in range(1,9)]
+        selected=QuarkTransfer(None).select_share_video(files,'各取所需 (2026)',1,1)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected['name'],'01.mp4')
+        for parent in ('其他作品（2026）德剧','各取所需2（2026）德剧','各取所需（2025）德剧','各取所需（2026）真人版',''):
+            with self.subTest(parent=parent):
+                bad=[dict(f,relative_path=parent+'/'+f['file_name'] if parent else f['file_name']) for f in files]
+                self.assertIsNone(QuarkTransfer(None).select_share_video(bad,'各取所需 (2026)',1,1))
+
+    def test_episode_directory_context_does_not_relax_movie_selection(self):
+        files=[{'file_name':name,'relative_path':'沙丘 (2021)/'+name,'size':2*1024**3}
+               for name in ('Unknown.One.2160p.mkv','Unknown.Two.2160p.mkv')]
+        with self.assertRaises(TransferFailed):
+            QuarkTransfer(None).select_share_video(files,'沙丘 (2021)',0,0)
+
     def test_verified_nfo_original_title_matches_full_release_and_episode(self):
         original='수영부 또라이에게 찍혀버렸다!'
         exact=candidate(original+' S01E01 1080p')

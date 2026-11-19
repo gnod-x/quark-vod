@@ -273,6 +273,26 @@ class PlaybackTests(unittest.TestCase):
         with patch.object(coordination.os.path,'isfile',return_value=True),patch.object(config,'get_jellyfin2_key',return_value='synthetic'),patch.object(urllib.request,'urlopen',side_effect=OSError('offline')):
             with self.assertRaises(coordination.Busy):coordination.ensure_idle()
 
+    def test_maintenance_stops_when_jellyfin_database_is_missing(self):
+        import urllib.request
+        with patch.object(config, 'JELLYFIN2_DB', str(Path(TMP.name)/'missing.db')), \
+             patch.object(urllib.request, 'urlopen') as network:
+            with self.assertRaises(coordination.Busy):coordination.ensure_idle()
+        network.assert_not_called()
+
+    def test_session_guard_accepts_only_confirmed_idle_list(self):
+        import io
+        import json
+        import urllib.request
+        for sessions, allowed in (([], True), ([{'NowPlayingItem': {'Name': 'fixture'}}], False), ({}, False)):
+            with self.subTest(allowed=allowed), patch.object(coordination.os.path, 'isfile', return_value=True), \
+                 patch.object(config, 'get_jellyfin2_key', return_value='synthetic'), \
+                 patch.object(urllib.request, 'urlopen', return_value=io.BytesIO(json.dumps(sessions).encode())):
+                if allowed:
+                    coordination.ensure_idle()
+                else:
+                    with self.assertRaises(coordination.Busy):coordination.ensure_idle()
+
     def test_atomic_write_keeps_jellyfin_read_permissions(self):
         self.path.chmod(0o644)
         strm_manager._atomic_write(str(self.path),'http://fixture/media')
@@ -313,7 +333,8 @@ class PlaybackTests(unittest.TestCase):
         with coordination.playback_lease():
             with concurrent.futures.ThreadPoolExecutor(1) as pool:
                 with self.assertRaises(coordination.Busy):pool.submit(mutate).result()
-        self.assertEqual(mutate(),'changed')
+        with patch.object(coordination, 'ensure_idle'):
+            self.assertEqual(mutate(),'changed')
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

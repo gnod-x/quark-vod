@@ -79,30 +79,31 @@ def get_protected_titles():
     """获取所有受保护（不可被网盘配额清理删除）的影片标题集合。包含收藏、在看以及用户置顶/预热项目。"""
     from contextlib import closing
     protected = set()
+    if not os.path.isfile(JF_DB):
+        raise RuntimeError('Jellyfin 保护数据库缺失或不可访问，停止清理')
 
     # 1. 查询 jellyfin.db 中已收藏或在看条目（包含电影与剧集，免锁只读）
-    if os.path.exists(JF_DB):
-        try:
-            with closing(sqlite3.connect(f"file:{JF_DB}?mode=ro", uri=True, timeout=2)) as con:
-                cur = con.cursor()
-                cur.execute("""
-                    SELECT b.Type, b.Name, b.SeriesName FROM BaseItems b
-                    JOIN UserData u ON b.Id = u.ItemId
-                    WHERE u.IsFavorite = 1 OR u.Played = 1 OR u.PlayCount > 0 OR u.PlaybackPositionTicks > 0
-                """)
-                for row in cur.fetchall():
-                    item_type, name, series_name = row
-                    if str(item_type or '').endswith('.Episode'):
-                        if not series_name or not series_name.strip():
-                            raise RuntimeError('无法确认受保护剧集的所属作品')
+    try:
+        with closing(sqlite3.connect(f"file:{JF_DB}?mode=ro", uri=True, timeout=2)) as con:
+            cur = con.cursor()
+            cur.execute("""
+                SELECT b.Type, b.Name, b.SeriesName FROM BaseItems b
+                JOIN UserData u ON b.Id = u.ItemId
+                WHERE u.IsFavorite = 1 OR u.Played = 1 OR u.PlayCount > 0 OR u.PlaybackPositionTicks > 0
+            """)
+            for row in cur.fetchall():
+                item_type, name, series_name = row
+                if str(item_type or '').endswith('.Episode'):
+                    if not series_name or not series_name.strip():
+                        raise RuntimeError('无法确认受保护剧集的所属作品')
+                    protected.add(series_name.strip())
+                else:
+                    if name:
+                        protected.add(name.strip())
+                    if series_name:
                         protected.add(series_name.strip())
-                    else:
-                        if name:
-                            protected.add(name.strip())
-                        if series_name:
-                            protected.add(series_name.strip())
-        except Exception as e:
-            raise RuntimeError("无法读取 Jellyfin 保护状态，停止清理") from e
+    except Exception as e:
+        raise RuntimeError("无法读取 Jellyfin 保护状态，停止清理") from e
 
     # 2. 查询用户手动置顶/预热保护的项目
     try:

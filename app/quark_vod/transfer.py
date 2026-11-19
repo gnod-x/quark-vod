@@ -791,6 +791,24 @@ class QuarkTransfer:
     def select_share_video(self, files, title, season, episode, *, aliases=()):
         from .search import SearchResult, score_search_result, _extract_season_from_name
         from .identity import split_title
+        def trusted_parent(parent):
+            # Only a complete work label from this enumerated path supplies
+            # missing basename identity; arbitrary substring matches do not.
+            core, year = split_title(title)
+            label = re.sub(r'^[A-Za-z]\s+', '', parent).strip()
+            if not label.startswith(core):
+                return False
+            rest = label[len(core):]
+            if rest and rest[0] not in ' ._-([（【':
+                return False
+            years = re.findall(r'(?<!\d)((?:19|20)\d{2})(?!\d)', rest)
+            if year and any(value != year for value in years):
+                return False
+            # Do not erase arbitrary descriptions: another work, sequel,
+            # adaptation or special edition must keep this context untrusted.
+            rest = re.sub(r'(?<!\d)(?:19|20)\d{2}(?!\d)', '', rest)
+            rest = re.sub(r'(?i)4k|2160p?|1080p?|720p?|HDR\d*|WEB[- ]?DL|HEVC|AAC|国语中字|国语|中字|高码率|单集\s*\d+(?:\.\d+)?\s*[GM]B?|全\s*\d+\s*集|德剧|美剧|英剧|韩剧|日剧|国产剧', '', rest)
+            return not rest.strip(' ._-()[]（）【】')
         videos=[]
         for item in files:
             path=item.get('relative_path') or item['file_name']
@@ -813,19 +831,44 @@ class QuarkTransfer:
             if season and explicit_season is not None and explicit_season != season:
                 continue
             if season and episode:
-                token = re.search(r'(?i)S0*(\d{1,2})E0*(\d{1,4})\b', file_title)
+                # Variant subdirectories belong to the same file's identity;
+                # an exact ancestor must not hide a conflicting descendant.
+                variant_parent = False
+                for parent in parents:
+                    if re.search(r'(?i)(?<![A-Za-z])(?:Anime|Movie|OVA|OAD|Special|Live[ ._-]*Action|Part\s*\d+)(?![A-Za-z])', parent):
+                        variant_parent = True
+                    sequel_parent = re.sub(r'(?i)(?<!\d)(?:19|20)\d{2}(?!\d)|\b(?:Season\s*\d+|S\d+|2160p?|1080p?|720p?|4k)\b', '', parent)
+                    if re.search(r'(?i)[A-Za-z][ ._-]+[1-9]\d?\s*$', sequel_parent):
+                        variant_parent = True
+                if variant_parent:
+                    continue
+                file_title = os.path.splitext(file_title)[0]
+                # Reject combined episodes before trimming any identity text.
+                episode_tokens = re.findall(r'(?i)(?<![A-Za-z])EP?0*\d{1,4}\b|(?<=\d)EP?0*\d{1,4}\b', file_title)
+                if len(episode_tokens) > 1:
+                    continue
+                release_suffix = ''
+                token = re.search(r'(?i)S0*(\d{1,2})[ ._-]*EP?0*(\d{1,4})\b', file_title)
                 if token:
                     if (int(token.group(1)), int(token.group(2))) != (season, episode):
                         continue
-                    if re.match(r'(?i)\s*E0*\d{1,4}\b', file_title[token.end():]):
+                    if re.match(r'(?i)[ ._-]*EP?0*\d{1,4}\b', file_title[token.end():]):
                         continue
+                    release_suffix = file_title[token.end():]
                     file_title = file_title[:token.start()]
                 else:
-                    episode_match = re.search(r'(?i)\bE0*(\d{1,4})\b', file_title)
+                    episode_match = re.search(r'(?i)\bEP?0*(\d{1,4})\b', file_title)
                     if episode_match and int(episode_match.group(1)) != episode:
                         continue
                     if episode_match:
+                        release_suffix = file_title[episode_match.end():]
                         file_title = file_title[:episode_match.start()]
+                if re.match(r'\s*[-~～+]\s*\d{1,4}\b', release_suffix):
+                    continue
+                suffix_identity = re.sub(r'国语中字|简体中字|繁体中字|中文字幕|国语|中字', '', release_suffix)
+                if (re.search(r'(?i)(?<![A-Za-z])(?:Anime|Movie|OVA|OAD|Special|Live[ ._-]*Action|Part\s*\d+)(?![A-Za-z])', suffix_identity)
+                        or re.search(r'[一-龥\uac00-\ud7af\u3040-\u30ff]', suffix_identity)):
+                    continue
                 season_match = re.search(r'(?i)(?:第\s*\d+\s*季|Season\s*\d{1,2}|\bS0*\d{1,2}\b)', file_title)
                 if season_match:
                     file_title = file_title[:season_match.start()] + file_title[season_match.end():]
@@ -837,7 +880,26 @@ class QuarkTransfer:
                                          year='', poster='', episodes=[])
                     if score_search_result(score, title, year=wanted_year, season=season,
                                            episode=episode, aliases=aliases) < 30:
-                        continue
+                        # Unknown Latin translation or numeric episode labels
+                        # may inherit an exact directory's identity. Known
+                        # conflicting Chinese names/versions never do.
+                        unknown_name = not re.search(r'[一-龥\uac00-\ud7af\u3040-\u30ff]', file_title)
+                        explicit_variant = re.search(r'(?i)\b(?:OVA|OAD|SP|Special|Movie|Anime|Live[ ._-]*Action)\b|\d', file_title)
+                        numeric_episode = re.fullmatch(r'0*\d{1,4}', file_title)
+                        if numeric_episode:
+                            unknown_name = int(file_title) == episode
+                            explicit_variant = False
+                        parent_identity = any(trusted_parent(p) for p in parents)
+                        conflicting_parent = any(re.search(r'[一-龥]', p) and not trusted_parent(p)
+                                                 and not re.fullmatch(r'第\s*\d+\s*季', p) for p in parents)
+                        # A translated basename loses its title at the episode
+                        # token, but its tail must still be technical metadata.
+                        # Do not silently discard another work/adaptation/part.
+                        safe_suffix = re.sub(r'(?i)-(?:LeagueWEB)$', '', release_suffix)
+                        safe_suffix = re.sub(r'(?i)(?<![A-Za-z0-9])(?:WEB[- ]?DL|WEBRIP|BLURAY|REMUX|2160p?|1080p?|720p?|4k|HDR\d*|HEVC|AVC|AAC|H\.?26[45]|X26[45]|DDP?\d?(?:\.\d)?)(?![A-Za-z0-9])', '', safe_suffix)
+                        suffix_is_metadata = not safe_suffix.strip(' ._-()[]')
+                        if not (unknown_name and not explicit_variant and parent_identity and not conflicting_parent and suffix_is_metadata):
+                            continue
             videos.append({'path':path,'name':item['file_name'],'size':item.get('size') or 0,'share':item})
         if not season:
             features=[v for v in videos if v['size']>=350*1024**2]

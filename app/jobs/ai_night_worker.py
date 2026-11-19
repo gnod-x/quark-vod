@@ -26,6 +26,8 @@ import sys
 import time
 import json
 import sqlite3
+import tempfile
+import stat
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -606,8 +608,10 @@ def run_refine_movie_plots_and_tags():
         # 双重幂等防重：若已有【AI 精彩看点】，说明已被精修过，同步至 Jellyfin2 后直接登记为 existing 并跳过
         if original_plot and "【AI 精彩看点】" in original_plot:
             all_tags = [t.text for t in root_elem.findall("tag") if t.text]
-            _sync_nfo_to_jellyfin2(nfo_path, original_plot, all_tags)
-            mark_processed("refine_nfo", rel_key, model_used="existing")
+            if _sync_nfo_to_jellyfin2(nfo_path, original_plot, all_tags):
+                mark_processed("refine_nfo", rel_key, model_used="existing")
+            else:
+                log(f"NFO 已精修，Jellyfin 同步未确认，保留重试: {rel_key}")
             continue
 
         prompt = f"""请对以下影视条目进行深度文学重写与专业影评提炼：
@@ -647,8 +651,9 @@ def run_refine_movie_plots_and_tags():
                 final_plot = new_plot.strip() + hl_text
 
                 plot_node = root_elem.find("plot")
-                if plot_node is not None:
-                    plot_node.text = final_plot
+                if plot_node is None:
+                    plot_node = ET.SubElement(root_elem, "plot")
+                plot_node.text = final_plot
 
                 # 注入情绪与氛围标签 (<tag>)
                 existing_tags = {t.text for t in root_elem.findall("tag") if t.text}
@@ -657,12 +662,14 @@ def run_refine_movie_plots_and_tags():
                         t_node = ET.SubElement(root_elem, "tag")
                         t_node.text = mt
 
-                tree.write(nfo_path, encoding="utf-8", xml_declaration=True)
+                _atomic_text_replace(nfo_path, ET.tostring(root_elem, encoding="unicode", xml_declaration=True))
                 all_tags = [t.text for t in root_elem.findall("tag") if t.text]
-                _sync_nfo_to_jellyfin2(nfo_path, final_plot, all_tags)
-                mark_processed("refine_nfo", rel_key, model_used=model_name)
-                processed_count += 1
-                log(f"[{model_name}] 成功深度精修海报看点与标签: 《{title}》 ({rel_key})")
+                if _sync_nfo_to_jellyfin2(nfo_path, final_plot, all_tags):
+                    mark_processed("refine_nfo", rel_key, model_used=model_name)
+                    processed_count += 1
+                    log(f"[{model_name}] 成功精修并同步: 《{title}》 ({rel_key})")
+                else:
+                    log(f"NFO 已精修，Jellyfin 同步未确认，保留重试: {rel_key}")
         except Exception as e:
             log(f"解析并更新 NFO 异常 《{title}》: {e}")
 
@@ -748,7 +755,7 @@ def run_enrich_peoples_knowledge():
 
         try:
             res_by_id = {item["id"]: item for item in batch_res if isinstance(item, dict) and "id" in item}
-
+            batch_success = 0
             for it in batch:
                 target_pid = it["id"]
                 p_key = it["p_key"]
@@ -781,16 +788,114 @@ def run_enrich_peoples_knowledge():
                                 if resp.status in (200, 204):
                                     mark_processed("enrich_people", p_key, model_used=model_name)
                                     enriched_count += 1
+                                    batch_success += 1
                         except Exception as err:
                             log(f"Jellyfin API 写入失败 {raw_name}: {err}")
 
             names_summary = "、".join([it["name"] for it in batch])
-            log(f"[{model_name}] 批量精修完成 ({len(batch)}人): {names_summary}")
+            log(f"[{model_name}] 人物更新: 成功={batch_success}, 未确认={len(batch)-batch_success}, 总数={len(batch)}: {names_summary}")
         except Exception as e:
             log(f"微批次解析异常 ({[b['name'] for b in batch]}): {e}")
 
         # 微批次处理完一批等待 1.5 秒，极大释放吞吐量并防止 429
         time.sleep(1.5)
+
+
+def _atomic_text_replace(path, text):
+    """Commit local text only if file identity, permissions and ACL stay intact."""
+    original = os.lstat(path)
+    if not stat.S_ISREG(original.st_mode):
+        raise RuntimeError('refusing to replace a nonregular file')
+    def attributes(target):
+        return {name: os.getxattr(target, name, follow_symlinks=False)
+                for name in os.listxattr(target, follow_symlinks=False)}
+    original_attrs = attributes(path)
+    def identity(info):
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+                info.st_ctime_ns, info.st_uid, info.st_gid, info.st_mode)
+    fd, temporary = tempfile.mkstemp(prefix='.night-write-', dir=os.path.dirname(path))
+    try:
+        fresh = os.fstat(fd)
+        if (fresh.st_uid, fresh.st_gid) != (original.st_uid, original.st_gid):
+            os.fchown(fd, original.st_uid, original.st_gid)
+        os.fchmod(fd, stat.S_IMODE(original.st_mode))
+        # Includes POSIX ACL and any other existing extended attributes.
+        # Unsupported or forbidden metadata operations abort before replacement.
+        for name in os.listxattr(temporary, follow_symlinks=False):
+            if name not in original_attrs:
+                os.removexattr(temporary, name, follow_symlinks=False)
+        for name, value in original_attrs.items():
+            os.setxattr(temporary, name, value, follow_symlinks=False)
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as stream:
+            fd = None
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        saved = os.lstat(temporary)
+        if ((saved.st_uid, saved.st_gid, stat.S_IMODE(saved.st_mode)) !=
+                (original.st_uid, original.st_gid, stat.S_IMODE(original.st_mode))
+                or attributes(temporary) != original_attrs):
+            raise RuntimeError('replacement metadata could not be preserved')
+        if identity(os.lstat(path)) != identity(original) or attributes(path) != original_attrs:
+            raise RuntimeError('source file changed before replacement')
+        os.replace(temporary, path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _subtitle_dialogue_lines(lines, suffix):
+    """Return editable dialogue only; preserve every structural line verbatim."""
+    result = {}
+    if suffix == '.ass':
+        events = False
+        fields = ['layer', 'start', 'end', 'style', 'name', 'marginl', 'marginr', 'marginv', 'effect', 'text']
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('['):
+                events = stripped.lower() == '[events]'
+            elif events and stripped.lower().startswith('format:'):
+                fields = [part.strip().lower() for part in stripped.split(':', 1)[1].split(',')]
+            elif events and line.lower().startswith('dialogue:') and fields and fields[-1] == 'text':
+                parts = line.split(':', 1)[1].rstrip('\r\n').split(',', len(fields)-1)
+                if len(parts) == len(fields):
+                    result[index] = parts[-1]
+        return result
+    if suffix not in ('.srt', '.vtt'):
+        return result
+    in_cue = False
+    timestamp = re.compile(r'^\s*(?:\d{1,}:)?\d{2}:\d{2}[,.]\d{3}\s+-->\s+(?:\d{1,}:)?\d{2}:\d{2}[,.]\d{3}(?:\s+.*)?$')
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            in_cue = False
+        elif timestamp.fullmatch(stripped):
+            in_cue = True
+        elif in_cue:
+            result[index] = line.rstrip('\r\n')
+    return result
+
+
+def _blank_subtitle_dialogue(lines, dialogue, approved, suffix):
+    result = list(lines)
+    changed = 0
+    for index, text in dialogue.items():
+        if text.strip() not in approved:
+            continue
+        line = lines[index]
+        ending = '\r\n' if line.endswith('\r\n') else '\n' if line.endswith('\n') else ''
+        if suffix == '.ass':
+            # Dialogue text is the last field and can itself contain commas.
+            prefix = line[:len(line.rstrip('\r\n')) - len(text)]
+            result[index] = prefix + ending
+        else:
+            # Keep the cue nonempty, including multiline cues, so a blank line
+            # cannot terminate the cue early and orphan subsequent dialogue.
+            result[index] = '\u200b' + ending
+        changed += 1
+    return result, changed
 
 
 # ==============================================================================
@@ -825,29 +930,33 @@ def run_clean_all_subtitles():
             continue
 
         try:
-            with open(sub_path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(sub_path, "r", encoding="utf-8", errors="strict", newline="") as f:
                 lines = f.readlines()
 
-            # 快速正则检测是否包含可疑广告特征
+            # Only actual subtitle dialogue may be offered to the arbiter.
+            # Headers, cue identifiers/timestamps and ASS styling are immutable.
+            dialogue = _subtitle_dialogue_lines(lines, os.path.splitext(sub_path)[1].lower())
             ad_kw = ["qq群", "公众号", "防失联", "澳门", "威尼斯人", "首发群", "菠菜", "link3.cc"]
-            has_ad = any(any(kw in line.lower() for kw in ad_kw) for line in lines)
-            if not has_ad:
+            sample_lines = list(dict.fromkeys(text.strip() for text in dialogue.values()
+                                if any(kw in text.lower() for kw in ad_kw)))[:10]
+            if not sample_lines:
                 mark_processed("clean_sub", rel_key, model_used="clean_pass")
                 continue
-
-            # 调用大模型批量仲裁并剥离
-            sample_lines = [l.strip() for l in lines if any(kw in l.lower() for kw in ad_kw)][:10]
-            prompt = f"以下是从影视字幕中提取的可疑对白段落，请辨别哪些是真正的压制/商业广告（如QQ群、公众号、赌场、网址），哪些是剧情原版对白。仅输出被确认为违规广告的完整台词文本（每行一条）：\n" + "\n".join(sample_lines)
-
+            prompt = "以下是从影视字幕中提取的可疑对白段落，请辨别哪些是真正的压制/商业广告，哪些是剧情原版对白。仅输出被确认为违规广告的完整原始台词（每行一条，不得改写）：\n" + "\n".join(sample_lines)
             model_name, reply = call_llm(prompt, system_prompt="你是一位影视字幕质检专家，请精准识别并剔除商业导流广告。", max_tokens=2048, reasoning_effort="low")
             if reply:
-                ad_lines_to_remove = set([l.strip() for l in reply.split("\n") if l.strip()])
-                new_lines = [l for l in lines if l.strip() not in ad_lines_to_remove]
-                with open(sub_path, "w", encoding="utf-8") as f:
-                    f.writelines(new_lines)
-                mark_processed("clean_sub", rel_key, model_used=model_name)
-                cleaned_count += 1
-                log(f"[{model_name}] 成功清洗字幕广告 ({len(ad_lines_to_remove)}处): {rel_key}")
+                approved = set(sample_lines).intersection(line.strip() for line in reply.splitlines())
+                new_lines, changed = _blank_subtitle_dialogue(lines, dialogue, approved,
+                                                            os.path.splitext(sub_path)[1].lower())
+                if changed:
+                    _atomic_text_replace(sub_path, ''.join(new_lines))
+                    cleaned_count += 1
+                # At most ten candidates are reviewed per round; unreviewed
+                # suspicious dialogue must remain eligible for another round.
+                remaining = _subtitle_dialogue_lines(new_lines, os.path.splitext(sub_path)[1].lower())
+                if not any(any(kw in text.lower() for kw in ad_kw) for text in remaining.values()):
+                    mark_processed("clean_sub", rel_key, model_used=model_name)
+                log(f"[{model_name}] 字幕仲裁: 清空广告对白={changed}, 保留结构: {rel_key}")
         except Exception as e:
             log(f"字幕清洗异常 {sub_path}: {e}")
 

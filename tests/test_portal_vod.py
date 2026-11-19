@@ -11,7 +11,7 @@ os.environ.update(VOD_BASE_DIR=TMP.name,VOD_DATA_DIR=TMP.name+'/data',VOD_CINEMA
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'app'))
 # Import the authoritative host job, with quark_vod already loaded from app.
-from quark_vod import db, config
+from quark_vod import db, config, coordination
 sys.path.insert(0,str(ROOT.parent/'hometheater/scripts'))
 import vod_search_and_add as portal
 portal.CINEMA2=TMP.name+'/cinema2'
@@ -25,6 +25,9 @@ TV={'id':124,'name':'样例剧','first_air_date':'2020-01-01','media_type':'tv',
 
 class PortalTests(unittest.TestCase):
     def setUp(self):
+        idle = patch.object(coordination, 'ensure_idle')
+        idle.start()
+        self.addCleanup(idle.stop)
         portal.CINEMA2=str(Path(TMP.name)/'cinema2'/self.id().rsplit('.',1)[-1])
         portal._details.clear();portal._candidates.clear();portal._jobs.clear()
         con=db._conn()

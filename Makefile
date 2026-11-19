@@ -43,6 +43,9 @@ test-offline:
 	@python3 -I ../hometheater/scripts/tests/test_daily_prune_and_populate.py
 	@python3 -I tests/verify_tmdb_populate.py --offline-fixture
 	@python3 -I ../hometheater/scripts/tests/test_ai_worker_concurrency.py
+	@python3 -I ../hometheater/scripts/tests/test_ai_worker_content.py
+	@python3 -I ../hometheater/scripts/tests/test_ai_worker_subtitles.py
+	@python3 -I ../hometheater/scripts/tests/test_ai_worker_write_safety.py
 	@python3 -I ../hometheater/scripts/tests/test_ai_extractor.py
 
 check-sync:

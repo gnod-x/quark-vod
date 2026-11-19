@@ -89,11 +89,12 @@ def maintenance(fn):
 def ensure_idle():
     """Do not remove/relocate media while Jellyfin reports an active session.
 
-    A configured production Jellyfin that cannot be queried stops maintenance.
-    Offline fixtures without a Jellyfin database do not need a live server.
+    Missing database/credentials and unknown session state stop maintenance.
+    Offline business fixtures must explicitly substitute this external guard;
+    absence of a production database is never evidence that the library is idle.
     """
     if not os.path.isfile(config.JELLYFIN2_DB):
-        return
+        raise Busy('Jellyfin 保护数据库缺失或不可访问，暂缓维护')
     key = config.get_jellyfin2_key()
     if not key:
         raise Busy('无法读取 Jellyfin 凭证，暂缓维护')

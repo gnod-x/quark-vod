@@ -16,7 +16,7 @@ TMP = tempfile.TemporaryDirectory(prefix='vod-regression-')
 os.environ.update(VOD_BASE_DIR=TMP.name, VOD_DATA_DIR=TMP.name + '/data',
                   VOD_CINEMA2_DIR=TMP.name + '/cinema2', AI_PARSE_ENABLED='0')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
-from quark_vod import cleaner, cleanup, config, db, strm_manager
+from quark_vod import cleaner, cleanup, config, coordination, db, strm_manager
 from quark_vod.openlist_client import OpenListClient, OpenListError
 from quark_vod.transfer import QuarkTransfer, TransferFailed
 import main
@@ -130,6 +130,11 @@ class StreamTests(unittest.TestCase):
 
 class StateTests(unittest.TestCase):
     def setUp(self):
+        # Business fixtures have no running Jellyfin; the actual session guard
+        # is exercised separately rather than bypassed by a missing DB.
+        idle = patch.object(coordination, 'ensure_idle')
+        idle.start()
+        self.addCleanup(idle.stop)
         for table in ('transfers', 'strm_map', 'plays', 'cleanup_queue', 'user_pinned', 'playback_access'):
             db._conn().execute('DELETE FROM ' + table)
         db._conn().commit()
@@ -478,6 +483,19 @@ class StateTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 cleanup.get_protected_titles()
 
+    def test_missing_protection_database_aborts_cleanup_and_dry_run(self):
+        missing = Path(TMP.name)/'missing-protection'/ 'jellyfin.db'
+        original = self.path.read_text()
+        for dry in (False, True):
+            with self.subTest(dry_run=dry), patch.object(cleanup, 'JF_DB', str(missing)), \
+                 patch.object(cleanup, 'OpenListClient') as factory:
+                with self.assertRaises(RuntimeError):
+                    cleanup.run_cleanup(dry_run=dry, verbose=False)
+                factory.return_value.remove.assert_not_called()
+                self.assertEqual(db.get_transfer_by_id(self.tid)['status'], 'done')
+                self.assertEqual(self.path.read_text(), original)
+                self.assertFalse(missing.exists())
+
     def test_protection_query_maps_episode_progress_to_series(self):
         protected_db=Path(TMP.name)/'protected-jellyfin.db'
         with sqlite3.connect(protected_db) as con:
@@ -575,6 +593,17 @@ class StateTests(unittest.TestCase):
 
 
 class CleanupScheduleTests(unittest.TestCase):
+    def test_missing_jellyfin_database_blocks_actual_and_dry_run_work(self):
+        missing = str(Path(TMP.name)/'missing-session-guard.db')
+        for dry in (False, True):
+            with self.subTest(dry_run=dry), patch.object(config, 'JELLYFIN2_DB', missing), \
+                 patch.object(cleanup, 'OpenListClient') as factory, \
+                 patch.object(cleanup, 'resolve_quotas', return_value=(100, 70, 100, 1)), \
+                 patch.object(cleanup, 'get_vod_disk_usage', return_value=(1, [])):
+                with self.assertRaises(coordination.Busy):
+                    cleanup.enforce_vod_quota(dry_run=dry, verbose=False)
+                factory.assert_not_called()
+
     def test_default_lock_wait_allows_daily_scan_to_finish_after_six(self):
         import fcntl
         elapsed=[0]

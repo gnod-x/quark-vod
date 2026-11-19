@@ -18,6 +18,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 BASE = Path('/home/dong/projects/hometheater')
@@ -37,7 +38,7 @@ def worker(root, fixture):
         os.environ.pop(name, None)
     sys.path.insert(0, str(BASE/'scripts'))
     import tmdb_populate as job
-    from quark_vod import config, db, strm_manager
+    from quark_vod import config, coordination, db, strm_manager
     for path in (job.CINEMA2, job.STATE_FILE, job.LOG_DIR, config.STATE_DB, config.CINEMA2_DIR):
         if not Path(path).resolve().is_relative_to(root):
             raise RuntimeError('unexpected persistence path')
@@ -102,7 +103,12 @@ def worker(root, fixture):
         job.download_poster = lambda *a, **kw: False
         job.download_fanart = lambda *a, **kw: False
         job.download_image = lambda *a, **kw: False
-        with open(os.devnull, 'w') as sink, redirect_stdout(sink), redirect_stderr(sink):
+        # All persistence paths above are verified under the disposable root.
+        # Exercise the real maintenance lock, but isolate the external Jellyfin
+        # idle boundary: this metadata verifier never reads production user data
+        # or calls Sessions. Production must still fail closed if its DB is lost.
+        report['external_idle_boundary'] = 'isolated_temporary_library'
+        with patch.object(coordination, 'ensure_idle'), open(os.devnull, 'w') as sink, redirect_stdout(sink), redirect_stderr(sink):
             code = job.main(['--cats', ','.join(CATEGORIES), '--limit', '1', '--max-pages', '1'])
         state = json.loads(Path(job.STATE_FILE).read_text())
         files = list(Path(job.CINEMA2).rglob('*.strm'))
