@@ -61,8 +61,8 @@ def main():
         } for x in values]
 
     check('containers', containers)
-    for project in (BASE, PROJECT):
-        check('compose_' + project.name, lambda p=project: command(['docker', 'compose', '-f', str(p/'docker-compose.yml'), 'config', '--quiet']).strip() or 'valid')
+    check('compose_hometheater', lambda: command(['docker', 'compose', '-f', str(BASE/'docker-compose.yml'), 'config', '--quiet']).strip() or 'valid')
+    check('compose_quark_vod', lambda: command(['docker', 'compose', '-p', 'quark-vod', '-f', str(BASE/'quark-vod.compose.yml'), 'config', '--quiet']).strip() or 'valid')
     check('dgpu_power', lambda: pathlib.Path('/sys/bus/pci/devices/0000:01:00.0/power_state').read_text().strip())
     for name in ('jellyfin', 'jellyfin2', 'openlist', 'quark-vod'):
         check('cgroup_' + name, lambda n=name: command(['docker', 'exec', n, 'sh', '-c', 'for f in memory.current memory.peak memory.max memory.events; do echo $f; cat /sys/fs/cgroup/$f; done']))
@@ -74,13 +74,13 @@ def main():
 
     def cron():
         text = command(['crontab', '-l'])
-        return [{'schedule': ' '.join(l.split()[:5]), 'scripts': re.findall(r'[\w./-]+\.(?:py|sh)', l), 'cleanup_module': '-m quark_vod.cleanup' in l}
+        return [{'schedule': ' '.join(l.split()[:5]), 'scripts': re.findall(r'[\w./-]+\.(?:py|sh)', l), 'cleanup_module': '-m quark_vod.cleanup' in l or bool(re.search(r'run_vod_host\.py.*\bcleanup\b', l)), 'host_runtime_wrapper': 'run_vod_host.py' in l}
                 for l in text.splitlines() if l.strip() and not l.lstrip().startswith('#') and 'hometheater' in l]
     check('cron', cron)
     for port, endpoint in ((8096, '/health'), (8097, '/health'), (8099, '/health'), (8099, '/admin'), (8099, '/docs'), (8088, '/'), (5244, '/api/public/settings')):
         check('http_' + str(port) + endpoint, lambda p=port, e=endpoint: {'http': get('http://127.0.0.1:' + str(p) + e)[0]})
-    # /capability creates and deletes a remote directory in the current service.
-    # It is intentionally excluded from this read-only inventory.
+    # GET /capability is authenticated and read-only. Only explicit POST probe
+    # can create a remote write probe; neither is needed for this inventory.
 
     env = {}
     for l in (BASE/'.env').read_text().splitlines():

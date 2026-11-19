@@ -2,11 +2,16 @@
 import argparse,datetime,json,os,sys,tempfile,time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from homelab_runtime import load_runtime, isolate_state
+
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--candidates',required=True);ap.add_argument('--output',required=True);args=ap.parse_args()
     raw=json.loads(Path(args.candidates).read_text());checks=[]
     with tempfile.TemporaryDirectory(prefix='cinema-source-files-') as tmp:
+        load_runtime()
         os.environ.update(VOD_BASE_DIR='/home/dong/projects/hometheater',VOD_DATA_DIR=tmp+'/data',AI_PARSE_ENABLED='0')
+        isolate_state(tmp, data_dir=tmp+'/data', isolate_library=True)
         sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'app'))
         from quark_vod import search
         from quark_vod.transfer import QuarkTransfer

@@ -15,15 +15,20 @@ import urllib.request
 import urllib.error
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from homelab_runtime import load_runtime, isolate_state
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--output', required=True)
     ap.add_argument('--node', help='verify one configured node key')
     args = ap.parse_args()
     with tempfile.TemporaryDirectory(prefix='cinema-search-') as tmp:
+        load_runtime()
         os.environ.update(VOD_BASE_DIR=tmp, VOD_DATA_DIR=tmp+'/data', AI_PARSE_ENABLED='0')
+        isolate_state(tmp, data_dir=tmp+'/data', isolate_library=True)
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'app'))
-        from quark_vod import panshare_matrix as matrix, db
+        from quark_vod import panshare_matrix as matrix, db, search_plugins
         def check(node):
             start = time.monotonic()
             result = {'node':node['key']}
@@ -49,7 +54,7 @@ def main():
                 result.update(error_type=type(exc).__name__, **{'pass':False})
             result['seconds'] = round(time.monotonic()-start,3)
             return result
-        nodes = [node for node in matrix.ACTIVE_PAN_NODES if not args.node or node['key']==args.node]
+        nodes = [node for node in [n.as_dict() for n in search_plugins.get_registry().snapshot().enabled_nodes if n.provider == 'html'] if not args.node or node['key']==args.node]
         if not nodes:
             raise SystemExit('no configured node matched')
         with ThreadPoolExecutor(max_workers=6) as pool:

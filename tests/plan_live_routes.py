@@ -12,13 +12,18 @@ import tempfile
 import urllib.parse
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from homelab_runtime import load_runtime, isolate_state
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--output',required=True)
     args=ap.parse_args()
     base=Path('/home/dong/projects/hometheater')
     with tempfile.TemporaryDirectory(prefix='cinema-route-plan-') as tmp:
+        load_runtime()
         os.environ.update(VOD_BASE_DIR=str(base),VOD_DATA_DIR=tmp,AI_PARSE_ENABLED='0')
+        isolate_state(tmp, data_dir=tmp, isolate_library=False)
         with closing(sqlite3.connect((base/'data/quark_plays.db').as_uri()+'?mode=ro',uri=True,timeout=2)) as source,closing(sqlite3.connect(Path(tmp)/'quark_plays.db')) as target:
             source.backup(target)
         sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'app'))

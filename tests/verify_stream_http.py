@@ -32,7 +32,7 @@ class Upstream(BaseHTTPRequestHandler):
         header = self.headers.get('Range', '')
         start, end = 0, len(data)-1
         code = 200
-        if header and self.path != '/ignore':
+        if header and self.path != '/d/ignore':
             left, right = header[6:].split('-')
             if not left:
                 start = max(0, len(data) - int(right))
@@ -68,7 +68,16 @@ def main():
         sock = socket.socket()
         sock.bind(('127.0.0.1',0))
         port = sock.getsockname()[1]
-        env = dict(os.environ,VOD_BASE_DIR=tmp,VOD_DATA_DIR=tmp+'/data',AI_PARSE_ENABLED='0')
+        env = dict(os.environ, VOD_BASE_DIR=tmp, VOD_DATA_DIR=tmp+'/data',
+                   VOD_STATE_DB=tmp+'/data/quark_plays.db',
+                   QUARK_COOKIE_OVERRIDE_FILE=tmp+'/data/quark_cookie.txt',
+                   VOD_CINEMA2_DIR=tmp+'/cinema2', VOD_LOG_DIR=tmp+'/logs',
+                   VOD_LOG_FILE=tmp+'/logs/verify.log', VOD_ENV_FILE='',
+                   OPENLIST_PUBLIC=f'http://127.0.0.1:{upstream.server_port}',
+                   OPENLIST_API=f'http://127.0.0.1:{upstream.server_port}',
+                   AI_PARSE_ENABLED='0', SELFHEAL_ENABLED='0',
+                   VOD_JELLYFIN_ENABLED='0', VOD_MAINTENANCE_ENABLED='0',
+                   VOD_STARTUP_SCAN='0', VOD_STARTUP_WRITE_PROBE='0')
         project = Path(__file__).resolve().parents[1]
         proc = subprocess.Popen([sys.executable,'-m','uvicorn','main:app','--fd',str(sock.fileno()),'--lifespan','off','--no-access-log'],
                                 cwd=project/'app',env=env,pass_fds=(sock.fileno(),),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -80,7 +89,7 @@ def main():
                 except OSError:
                     if proc.poll() is not None:raise RuntimeError('isolated ASGI exited')
                     time.sleep(.1)
-            for endpoint in ('/range','/ignore'):
+            for endpoint in ('/d/range','/d/ignore'):
                 for rng,start,end in [('',0,len(PAYLOAD)),('bytes=0-0',0,1),('bytes=123-456',123,457),('bytes=123-',123,len(PAYLOAD)),('bytes=-333',len(PAYLOAD)-333,len(PAYLOAD)),('bytes=-999999',0,len(PAYLOAD)),('bytes=0-1,4-5',0,len(PAYLOAD))]:
                     raw=f'http://127.0.0.1:{upstream.server_port}'+endpoint
                     url=f'http://127.0.0.1:{port}/clean?'+urllib.parse.urlencode({'url':raw,'skip':8})

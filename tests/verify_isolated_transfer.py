@@ -16,6 +16,9 @@ import uuid
 from unittest.mock import patch
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from homelab_runtime import load_runtime, isolate_state
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--transfer-id',type=int,required=True)
@@ -35,7 +38,9 @@ def main():
     report['temporary_root']=root
     created=False
     with tempfile.TemporaryDirectory(prefix='cinema-transfer-') as tmp:
+        load_runtime()
         os.environ.update(VOD_BASE_DIR=str(base),VOD_DATA_DIR=tmp+'/data',VOD_CINEMA2_DIR=tmp+'/cinema2',AI_PARSE_ENABLED='0')
+        isolate_state(tmp, data_dir=tmp+'/data', isolate_library=True)
         sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'app'))
         from quark_vod import config,db,strm_manager
         from quark_vod.openlist_client import OpenListClient
@@ -66,8 +71,8 @@ def main():
             if tr._get_quark_fid(root):raise RuntimeError('unique root unexpectedly exists')
             created=True
             ol.mkdir(root)
+            config.QUARK_PLAY_ROOT=config.QUARK_PLAY_MOUNT + root[len(config.QUARK_MOUNT):]
             config.QUARK_VOD_ROOT=root
-            config.QUARK_PLAY_ROOT=config.play_path(root)
             season,episode=row[1],row[2]
             path=Path(config.CINEMA2_DIR)/'fixture'/test_name/'target.strm'
             path.parent.mkdir(parents=True)

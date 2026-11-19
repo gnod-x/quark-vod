@@ -14,6 +14,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import time
+import tempfile
 import urllib.parse
 import urllib.request
 
@@ -119,9 +120,14 @@ def main():
             backup.touch(mode=0o600)
             with closing(sqlite3.connect(backup)) as dest:
                 con.backup(dest, pages=128, sleep=0.05)
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
-        from quark_vod.transfer import QuarkTransfer
-        allowed, free = QuarkTransfer(None)._check_capacity(inspected['size'])
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from homelab_runtime import load_runtime, isolate_state
+        load_runtime()
+        with tempfile.TemporaryDirectory(prefix='cinema-portal-capacity-') as tmp:
+            isolate_state(tmp)
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
+            from quark_vod.transfer import QuarkTransfer
+            allowed, free = QuarkTransfer(None)._check_capacity(inspected['size'])
         if not allowed or free < inspected['size'] + 500 * 1024**2:
             raise RuntimeError('free_capacity_not_confirmed')
         check('preflight', {'sample_absent': True, 'playback_idle': True, 'transfers_idle': True, 'backup': str(backup), 'free_bytes': free})

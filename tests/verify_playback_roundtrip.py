@@ -27,6 +27,9 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))
 from media_result import assess
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from homelab_runtime import load_runtime, isolate_state
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     sources=ap.add_mutually_exclusive_group(required=True)
@@ -55,7 +58,9 @@ def main():
     created=False;container=None;httpserver=None;thread=None
     with tempfile.TemporaryDirectory(prefix='cinema-roundtrip-') as tmp:
         os.chmod(tmp,0o755)
+        load_runtime()
         os.environ.update(VOD_BASE_DIR=str(base),VOD_DATA_DIR=tmp+'/data',VOD_CINEMA2_DIR=tmp+'/cinema2',AI_PARSE_ENABLED='0')
+        isolate_state(tmp, data_dir=tmp+'/data', isolate_library=True)
         sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'app'))
         from quark_vod import config,db,strm_manager,server
         from quark_vod.transfer import QuarkTransfer
@@ -63,7 +68,8 @@ def main():
         from quark_vod.identity import Work
         import main as api
         import uvicorn
-        config.QUARK_VOD_ROOT=root;config.QUARK_PLAY_ROOT=config.play_path(root)
+        config.QUARK_PLAY_ROOT=config.QUARK_PLAY_MOUNT + root[len(config.QUARK_MOUNT):]
+        config.QUARK_VOD_ROOT=root
         config.SELFHEAL_ENABLED=False
         ol=OpenListClient();tr=QuarkTransfer(ol)
         def command(command,timeout=180):

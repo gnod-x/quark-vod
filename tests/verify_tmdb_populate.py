@@ -21,7 +21,9 @@ import urllib.request
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
-BASE = Path('/home/dong/projects/hometheater')
+BASE = Path(os.environ.get('HOMETHEATER_SOURCE_DIR', '/home/dong/projects/hometheater'))
+if not (BASE/'scripts/tmdb_populate.py').is_file():
+    BASE = Path(__file__).resolve().parents[2]/'hometheater'
 CATEGORIES = ('国产电影', '国产剧集')
 
 

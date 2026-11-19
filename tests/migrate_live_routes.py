@@ -22,6 +22,9 @@ def main():
     if not args.execute:raise SystemExit('--execute required')
     with urllib.request.urlopen('http://127.0.0.1:8099/openapi.json',timeout=5) as response:
         if '/play' not in json.load(response).get('paths',{}):raise RuntimeError('new endpoint not deployed')
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from homelab_runtime import load_runtime
+    load_runtime()
     sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'app'))
     from quark_vod import config,db,selfheal,server,strm_manager
     from quark_vod.coordination import maintenance_window

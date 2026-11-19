@@ -3,6 +3,7 @@ Read public indexes only; isolated DB/cache; no save/preheat. No URLs in report.
 """
 import argparse
 import datetime
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,9 @@ import urllib.parse
 from unittest.mock import patch
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from homelab_runtime import load_runtime, isolate_state
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--output',required=True)
@@ -22,10 +26,16 @@ def main():
     args=ap.parse_args()
     reports=[];private=[]
     with tempfile.TemporaryDirectory(prefix='cinema-search-coverage-') as tmp:
+        load_runtime()
         os.environ.update(VOD_BASE_DIR=tmp,VOD_DATA_DIR=tmp+'/data',AI_PARSE_ENABLED='0')
+        isolate_state(tmp, data_dir=tmp+'/data', isolate_library=True)
         sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'app'))
-        from quark_vod import panshare_matrix as matrix, search
+        from quark_vod import panshare_matrix as matrix, search, search_plugins
         from quark_vod.quality import quality_hint
+        snapshot = search_plugins.get_registry().snapshot()
+        snapshot = replace(snapshot, nodes=tuple(n for n in snapshot.enabled_nodes if n.provider == 'html'))
+        if not snapshot.nodes:
+            raise SystemExit('no configured HTML node matched')
         original=matrix._fetch_html
         for keyword in args.keyword or ['沙丘','凡人修仙传','庆余年']:
             pages={};lock=threading.Lock()
@@ -34,9 +44,9 @@ def main():
                 with lock:pages[url]=text
                 return text
             with patch.object(matrix,'_fetch_html',side_effect=capture):
-                report=matrix.PanshareMatrix.search_report(keyword,use_cache=False)
+                report=matrix.PanshareMatrix.search_report(keyword,use_cache=False,snapshot=snapshot)
             before=[];baseline_details=0
-            for node in matrix.ACTIVE_PAN_NODES:
+            for node in [n.as_dict() for n in snapshot.enabled_nodes]:
                 base=node['base'].rstrip('/')
                 url=base+'/index.php/vod/search.html?wd='+urllib.parse.quote(keyword)
                 text=pages.get(url,'')

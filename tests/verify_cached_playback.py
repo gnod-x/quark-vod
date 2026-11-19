@@ -20,6 +20,9 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))
 from media_result import assess
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from homelab_runtime import load_runtime, isolate_state
+
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--transfer-id',type=int,required=True)
@@ -32,7 +35,9 @@ def main():
     report={'time':datetime.datetime.now().astimezone().isoformat(),'source_transfer_id':args.transfer_id,'checks':[],'production_state_written':False}
     container='cinema-cache-'+uuid.uuid4().hex[:10]
     with tempfile.TemporaryDirectory(prefix='cinema-cache-') as tmp:
+        load_runtime()
         os.environ.update(VOD_BASE_DIR=str(base),VOD_DATA_DIR=tmp,AI_PARSE_ENABLED='0')
+        isolate_state(tmp, data_dir=tmp, isolate_library=True)
         sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'app'))
         from quark_vod import config,db,media_cache
         import main as api
