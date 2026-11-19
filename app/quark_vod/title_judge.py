@@ -72,22 +72,7 @@ _USER = (
 
 
 def _load_token():
-    v = (os.environ.get("OPENAI_API_KEY") or "").strip()
-    if v:
-        return v
-    for p in (os.environ.get("AI_PARSE_TOKEN_FILE", ""),
-              "/home/dong/.config/cliproxy/token",
-              os.path.expanduser("~/.config/cliproxy/token")):
-        if not p:
-            continue
-        try:
-            with open(p) as f:
-                t = f.read().strip()
-            if t:
-                return t
-        except Exception:
-            continue
-    return ""
+    return config.load_cliproxy_token()
 
 
 def _cache_key(title, kind, name):
@@ -118,8 +103,9 @@ def _ask(title, kind, names):
             {"role": "user", "content": _USER.format(
                 title=title, kind=kind, names=json.dumps(names, ensure_ascii=False))},
         ],
-        "max_tokens": 64 * len(names) + 128,
+        "max_tokens": config.AI_PARSE_MAX_TOKENS,
         "temperature": 0,
+        "reasoning_effort": config.AI_PARSE_REASONING_EFFORT,
     }
     req = urllib.request.Request(
         f"{config.AI_PARSE_BASE_URL.rstrip('/')}/chat/completions",
@@ -131,7 +117,7 @@ def _ask(title, kind, names):
     with urllib.request.urlopen(req, timeout=config.AI_PARSE_TIMEOUT) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     msg = data.get("choices", [{}])[0].get("message", {})
-    content = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+    content = (msg.get("content") or "").strip()
     raw = content
     if "```json" in raw:
         raw = raw.split("```json", 1)[1].split("```", 1)[0]

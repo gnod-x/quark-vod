@@ -89,6 +89,17 @@ def play_path(remote_path):
         return QUARK_PLAY_MOUNT + remote_path[len(QUARK_MOUNT):]
     return remote_path
 
+
+def write_path(remote_path):
+    """把播放挂载路径还原为转存/删除使用的 Web Cookie 挂载路径。"""
+    if not remote_path:
+        return remote_path
+    if remote_path == QUARK_PLAY_MOUNT:
+        return QUARK_MOUNT
+    if remote_path.startswith(QUARK_PLAY_MOUNT + "/"):
+        return QUARK_MOUNT + remote_path[len(QUARK_PLAY_MOUNT):]
+    return remote_path
+
 # ── Jellyfin2 ─────────────────────────────────────────
 def get_jellyfin2_key():
     k = os.environ.get("JELLYFIN2_KEY", "")
@@ -139,7 +150,7 @@ def get_quark_cookie():
         from contextlib import closing
         db_path = os.path.join(BASE_DIR, "openlist/data/data.db")
         if os.path.exists(db_path):
-            with closing(sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)) as con:
+            with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)) as con:
                 cur = con.cursor()
                 cur.execute("SELECT addition FROM x_storages WHERE mount_path=?", (QUARK_MOUNT,))
                 row = cur.fetchone()
@@ -255,10 +266,31 @@ SELFHEAL_ENABLED = True
 #      模型只能把可疑数字改成 None，或为漏判补集数，严禁推翻强证据。
 AI_PARSE_ENABLED = os.environ.get("AI_PARSE_ENABLED", "1") == "1"
 AI_PARSE_SHADOW = os.environ.get("AI_PARSE_SHADOW", "0") == "1"
-# 实测 cn/deepseek-v4.1-flash 批量 12 个文件名 2.56s；单条 1.85~2.5s
+# 实测 cn/deepseek-v4.1-flash 开启 low 思考：8 文件 ~2.8s，24 文件 / 标题复核 ~7~11s
 AI_PARSE_BASE_URL = os.environ.get("AI_PARSE_BASE_URL", "http://127.0.0.1:8317/v1")
 AI_PARSE_MODEL = os.environ.get("AI_PARSE_MODEL", "cn/deepseek-v4.1-flash")
-AI_PARSE_TIMEOUT = float(os.environ.get("AI_PARSE_TIMEOUT", "8.0"))
+AI_PARSE_TIMEOUT = float(os.environ.get("AI_PARSE_TIMEOUT", "20.0"))
+AI_PARSE_MAX_TOKENS = int(os.environ.get("AI_PARSE_MAX_TOKENS", "4096"))
+AI_PARSE_REASONING_EFFORT = os.environ.get("AI_PARSE_REASONING_EFFORT", "low")
+
+
+def load_cliproxy_token():
+    """读取 CLIProxyAPI 共享令牌：优先公共 token 文件（实时热同步），再回退环境变量。"""
+    for p in (
+        os.environ.get("AI_PARSE_TOKEN_FILE", ""),
+        "/home/dong/.config/cliproxy/token",
+        os.path.expanduser("~/.config/cliproxy/token"),
+    ):
+        if not p:
+            continue
+        try:
+            with open(p, encoding="utf-8") as f:
+                tok = f.read().strip()
+            if tok:
+                return tok
+        except Exception:
+            continue
+    return (os.environ.get("OPENAI_API_KEY") or "").strip()
 # 单次批量请求的文件名上限（超出分片，防止上下文过长导致 JSON 破损）
 AI_PARSE_BATCH_SIZE = int(os.environ.get("AI_PARSE_BATCH_SIZE", "24"))
 # 置信度门槛：低于此值一律判 None（宁可回落规则结果，也不采信模糊判断）

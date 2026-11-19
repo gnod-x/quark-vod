@@ -13,6 +13,8 @@ OpenList 客户端
 
 import json
 import time
+import threading
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,6 +33,8 @@ class OpenListClient:
         self.password = password or config.OPENLIST_ADMIN_PASS
         self.token = ""
         self.token_expires = 0
+        self._write_probe_lock = threading.Lock()
+        self._write_probe_cache = None
         self._login()
 
     # ── 基础请求 ──────────────────────────────────────
@@ -43,7 +47,12 @@ class OpenListClient:
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
+                result = json.loads(r.read().decode("utf-8"))
+            # OpenList also reports expired tokens as HTTP 200 / JSON code 401.
+            if isinstance(result, dict) and result.get("code") == 401 and retry:
+                self._login()
+                return self._request(path, data, method, timeout, retry=False)
+            return result
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", "ignore")
             # token 失效则重登录重试一次
@@ -128,7 +137,8 @@ class OpenListClient:
         for p in parts:
             cur += "/" + p
             try:
-                self._request("/api/fs/mkdir", {"path": cur})
+                resp = self._request("/api/fs/mkdir", {"path": cur})
+                self._ok(resp, f"mkdir {cur}")
             except OpenListError:
                 # 已存在则继续；真实失败向上抛
                 try:
@@ -214,21 +224,34 @@ class OpenListClient:
 
     # ── 自检 ──────────────────────────────────────────
     def check_write_capable(self):
-        """探测写能力：在点播根下建/删一个探针目录。
+        """创建独立临时目录、刷新回读、删除；结果缓存 60 秒。
 
-        返回 (可用, 原因)。UI/Allow 头层面缺 PUT/MKCOL 时这里会明确失败，
-        不会伪装成成功（CLAUDE.md 红线 #9 精神）。
+        此方法有云端写副作用，不能用于只读存活检测。每次使用唯一名称，
+        清理只针对本次成功创建的目录；回读失败也会尝试清理。
         """
-        probe = f"{config.QUARK_VOD_ROOT}/.write_probe"
-        try:
-            self.mkdir(probe)
-        except OpenListError as e:
-            return False, f"mkdir 失败: {e}"
-        # 必须回读确认真的存在（不能只看返回码）
-        if not self.exists(probe):
-            return False, "mkdir 返回成功但目录不存在（驱动假成功）"
-        try:
-            self.remove(probe)
-        except OpenListError as e:
-            return False, f"remove 失败: {e}"
-        return True, "写能力就绪"
+        with self._write_probe_lock:
+            cached = self._write_probe_cache
+            if cached and time.monotonic() - cached[0] < 60:
+                return cached[1]
+            name = "vod_write_probe_" + uuid.uuid4().hex
+            probe = f"{config.QUARK_VOD_ROOT}/{name}"
+            created = False
+            result = (False, "写能力未验证")
+            try:
+                self._ok(self._request('/api/fs/mkdir', {'path': probe}), 'probe mkdir')
+                created = True
+                listing = self._ok(self._request('/api/fs/list', {'path': config.QUARK_VOD_ROOT, 'refresh': True}), 'probe list')
+                if any(x.get('name') == name and x.get('is_dir') for x in (listing or {}).get('content', [])):
+                    result = (True, "写能力就绪")
+                else:
+                    result = (False, "创建后刷新回读未找到目录")
+            except OpenListError as exc:
+                result = (False, str(exc))
+            finally:
+                if created:
+                    try:
+                        self.remove(probe)
+                    except OpenListError as exc:
+                        result = (False, f"探针目录清理失败 {name}: {exc}")
+            self._write_probe_cache = (time.monotonic(), result)
+            return result

@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS plays (
 CREATE INDEX IF NOT EXISTS idx_plays_lookup
     ON plays(cat, title, season, episode);
 
+-- Media resolution access (not a watched/finished event).
+CREATE TABLE IF NOT EXISTS playback_access (
+    transfer_id INTEGER PRIMARY KEY,
+    accessed_at INTEGER NOT NULL
+);
+
 -- 清理队列：到期待删
 CREATE TABLE IF NOT EXISTS cleanup_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,7 +154,16 @@ CREATE INDEX IF NOT EXISTS idx_name_parse_cache_origin ON name_parse_cache(origi
 def init_db():
     con = _conn()
     con.executescript(SCHEMA)
-    con.commit()
+    con.execute('BEGIN IMMEDIATE')
+    try:
+        columns = {r[1] for r in con.execute('PRAGMA table_info(transfers)')}
+        for name, kind in [('save_task_id','TEXT'),('save_target','TEXT'),('save_started_at','INTEGER')]:
+            if name not in columns:
+                con.execute(f'ALTER TABLE transfers ADD COLUMN {name} {kind}')
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
 
 
 def save_source_audit(cat, title, season, episode, has_quark_source, is_4k,
@@ -304,27 +319,38 @@ def upsert_transfer(cat, title, season, episode, **fields):
     except Exception:
         pass
     con = _conn()
-    row = con.execute(
-        "SELECT id FROM transfers WHERE cat=? AND title=? AND season=? AND episode=?",
-        (cat, title, season, episode)).fetchone()
-    if row:
-        sets = ", ".join(f"{k}=?" for k in fields)
-        con.execute(f"UPDATE transfers SET {sets}, updated_at=? WHERE id=?",
-                    (*fields.values(), now(), row["id"]))
-        tid = row["id"]
-    else:
-        cols = ["cat", "title", "season", "episode", "created_at", "updated_at", *fields.keys()]
-        vals = [cat, title, season, episode, now(), now(), *fields.values()]
-        ph = ",".join("?" * len(cols))
-        cur = con.execute(f"INSERT INTO transfers ({','.join(cols)}) VALUES ({ph})", vals)
-        tid = cur.lastrowid
-    con.commit()
-    return tid
+    allowed = {'status', 'share_url', 'share_pwd', 'pan_type', 'error', 'remote_path', 'file_size', 'save_task_id', 'save_target', 'save_started_at'}
+    if not fields.keys() <= allowed:
+        raise ValueError('invalid transfer fields')
+    # Serialize SELECT+INSERT across threads and host cron processes.
+    # Historical duplicates keep their queue/play references.
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        row = con.execute(
+            "SELECT id FROM transfers WHERE cat=? AND title=? AND season=? AND episode=? "
+            "ORDER BY updated_at DESC,id DESC LIMIT 1",
+            (cat, title, season, episode)).fetchone()
+        if row:
+            sets = [f"{k}=?" for k in fields] + ['updated_at=?']
+            con.execute(f"UPDATE transfers SET {', '.join(sets)} WHERE id=?",
+                        (*fields.values(), now(), row['id']))
+            tid = row['id']
+        else:
+            cols = ['cat', 'title', 'season', 'episode', 'created_at', 'updated_at', *fields.keys()]
+            vals = [cat, title, season, episode, now(), now(), *fields.values()]
+            cur = con.execute(f"INSERT INTO transfers ({','.join(cols)}) VALUES ({','.join('?' for _ in vals)})", vals)
+            tid = cur.lastrowid
+        con.commit()
+        return tid
+    except BaseException:
+        con.rollback()
+        raise
 
 
 def get_transfer(cat, title, season, episode):
     return _conn().execute(
-        "SELECT * FROM transfers WHERE cat=? AND title=? AND season=? AND episode=?",
+        "SELECT * FROM transfers WHERE cat=? AND title=? AND season=? AND episode=? "
+        "ORDER BY updated_at DESC,id DESC LIMIT 1",
         (cat, title, season, episode)).fetchone()
 
 
@@ -343,53 +369,42 @@ def list_transfers(status=None, limit=200):
     return _conn().execute(q, args).fetchall()
 
 
-def find_done_transfer(cat, title, season, episode):
-    """已转存完成且未清理的记录。
-
-    2026-10-16 修复：原来用 cat+title+season+episode 四字段精确匹配，实际必挂：
-      1) strm 里的 t 参数带年份后缀（"霸王别姬 (1993)"），而转存时入库的 title
-         是搜索匹配到的名称（"霸王别姬"，无年份）；
-      2) 同一部片可能被 VOD 生成器放进多个专区（实测《霸王别姬 (1993)》同时存在
-         于 港台经典/ 与 国产电影/），cat 也会不一致。
-
-    2026-10-20 修复跨作品污染：原「任一方包含另一方」的兜底会把同名不同作品
-    串起来（《凡人修仙传》动漫 vs 《凡人修仙传 (2025)》真人剧）。现在：
-      - 名称必须去年份后完全相等，不再允许模糊包含；
-      - 请求带年份时，记录也带年份则必须一致；
-      - 同分时优先返回 cat 匹配的记录。
-    """
-    import re
-    raw = (title or "").strip()
-    m = re.search(r"[(（](\d{4})[)）]\s*$", raw)
-    want_year = m.group(1) if m else ""
-    core = re.sub(r"\s*[(（]\d{4}[)）]\s*$", "", raw).strip()
-    if not core:
-        return None
-
+def library_title(cat, title, season, episode):
+    """Recover a legacy row's missing year using its unique on-disk mapping."""
+    from .identity import split_title
+    if split_title(title)[1]:
+        return title
     rows = _conn().execute(
-        "SELECT * FROM transfers WHERE season=? AND episode=? "
-        "AND status='done' AND remote_path IS NOT NULL",
+        'SELECT strm_path FROM strm_map WHERE cat=? AND title=? AND season=? AND episode=?',
+        (cat, title, season, episode)).fetchall()
+    names = set()
+    for row in rows:
+        path = os.path.abspath(row['strm_path'])
+        root = os.path.abspath(config.CINEMA2_DIR)
+        if not path.startswith(root + os.sep):
+            continue
+        parts = os.path.relpath(path, root).split(os.sep)
+        if len(parts) >= 3 and split_title(parts[1])[0].casefold() == split_title(title)[0].casefold():
+            names.add(parts[1])
+    return next(iter(names)) if len(names) == 1 else title
+
+
+def find_done_transfer(cat, title, season, episode):
+    """Reuse only an identical work and media kind; never guess a missing year."""
+    from .identity import same_title, media_kind
+    rows = _conn().execute(
+        "SELECT * FROM transfers WHERE season=? AND episode=? AND status='done' "
+        "AND remote_path IS NOT NULL AND remote_path<>'' ORDER BY updated_at DESC,id DESC",
         (season, episode)).fetchall()
-    if not rows:
-        return None
-
-    matched = []
-    for r in rows:
-        rt = (r["title"] or "").strip()
-        rm = re.search(r"[(（](\d{4})[)）]\s*$", rt)
-        r_year = rm.group(1) if rm else ""
-        rn = re.sub(r"\s*[(（]\d{4}[)）]\s*$", "", rt).strip()
-        if rn != core:
+    candidates = []
+    for row in rows:
+        if media_kind(row['cat'], season) != media_kind(cat, season):
             continue
-        # 双方都带年份时必须一致，杜绝动漫/真人剧同名互串
-        if want_year and r_year and want_year != r_year:
-            continue
-        matched.append((0 if (cat and r["cat"] == cat) else 1, r))
-
-    if not matched:
-        return None
-    matched.sort(key=lambda x: x[0])
-    return matched[0][1]
+        actual_title = library_title(row['cat'], row['title'], season, episode)
+        if same_title(title, actual_title):
+            candidates.append(row)
+    candidates.sort(key=lambda row: row['cat'] != cat)
+    return candidates[0] if candidates else None
 
 
 # ── name_parse_cache（AI 文件名解析缓存）────────────────
@@ -431,6 +446,14 @@ def save_strm_map(cat, title, season, episode, strm_path):
     con.commit()
 
 
+def remove_strm_maps_below(directory, connection=None):
+    con = connection or _conn()
+    prefix = os.path.abspath(directory).rstrip(os.sep) + os.sep
+    con.execute('DELETE FROM strm_map WHERE substr(strm_path,1,?)=?', (len(prefix), prefix))
+    if connection is None:
+        con.commit()
+
+
 def get_strm_path(cat, title, season, episode):
     row = _conn().execute(
         "SELECT strm_path FROM strm_map WHERE cat=? AND title=? AND season=? AND episode=?",
@@ -439,6 +462,18 @@ def get_strm_path(cat, title, season, episode):
 
 
 # ── plays ─────────────────────────────────────────────
+def record_access(transfer_id):
+    with _conn() as con:
+        con.execute('INSERT INTO playback_access(transfer_id,accessed_at) VALUES (?,?) '
+                    'ON CONFLICT(transfer_id) DO UPDATE SET accessed_at=excluded.accessed_at',
+                    (transfer_id,now()))
+
+
+def recently_accessed(transfer_id, grace_seconds=6*3600):
+    return bool(_conn().execute('SELECT 1 FROM playback_access WHERE transfer_id=? AND accessed_at>?',
+                               (transfer_id,now()-grace_seconds)).fetchone())
+
+
 def record_play(cat, title, season, episode, transfer_id=None, finished=False):
     con = _conn()
     con.execute(
@@ -465,8 +500,13 @@ def enqueue_cleanup(transfer_id, remote_path, due_at):
 
 def due_cleanups(limit=50):
     return _conn().execute(
-        "SELECT * FROM cleanup_queue WHERE cleaned=0 AND due_at<=? LIMIT ?",
+        "SELECT * FROM cleanup_queue WHERE cleaned=0 AND due_at<=? ORDER BY due_at,id LIMIT ?",
         (now(), limit)).fetchall()
+
+
+def defer_cleanup(queue_id, seconds=86400):
+    with _conn() as con:
+        con.execute('UPDATE cleanup_queue SET due_at=? WHERE id=? AND cleaned=0',(now()+seconds,queue_id))
 
 
 def mark_cleaned(queue_id, transfer_id):
@@ -526,16 +566,8 @@ def is_pinned(title, cat=""):
 
 
 def get_all_pinned_titles():
-    """获取所有用户手动预热或置顶保护的影视标题集合。"""
-    pinned = set()
-    try:
-        rows = _conn().execute("SELECT cat, title FROM user_pinned").fetchall()
-        for r in rows:
-            if r["title"]:
-                pinned.add(r["title"].strip())
-    except Exception:
-        pass
-    return pinned
+    """Protection is safety-critical: database errors must propagate."""
+    return {r['title'].strip() for r in _conn().execute('SELECT title FROM user_pinned') if r['title']}
 
 
 init_db()

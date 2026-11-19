@@ -47,7 +47,7 @@ def main():
     print(f"发现已激活（Live 直链）的 .strm 文件共: {len(live_strms)} 部")
 
     from contextlib import closing
-    with closing(sqlite3.connect(f"file:{config.JELLYFIN2_DB}?mode=ro&immutable=1", uri=True)) as con:
+    with closing(sqlite3.connect(f"file:{config.JELLYFIN2_DB}?mode=ro", uri=True, timeout=2)) as con:
         cur = con.cursor()
 
         refreshed_dirs = set()

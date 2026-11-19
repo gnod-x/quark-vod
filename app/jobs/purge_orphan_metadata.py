@@ -7,7 +7,7 @@ Jellyfin2 孤儿剧照、演职员头像与僵尸元数据全量深度清理器
   1. 清理 metadata/library 下未被引用的历史孤儿剧照与海报。
   2. 清理 metadata/People 下随影视淘汰而残留的无主演职员头像目录。
   3. 通过官方 Jellyfin API 批量注销已淘汰影视遗留的僵尸 Person 实体记录。
-  4. 清理 cache/images 下已淘汰资源的过期缩略图缓存。
+  4. 缩略图缓存由 Jellyfin 管理，本任务不清空正在使用的缓存。
   5. 触发 Jellyfin 官方数据库优化任务 (OptimizeDatabaseTask)。
 """
 
@@ -21,18 +21,18 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 
-BASE = "/home/dong/projects/hometheater"
+BASE = os.environ.get("HOMETHEATER_BASE_DIR", "/home/dong/projects/hometheater")
 sys.path.insert(0, os.path.join(BASE, "scripts"))
 sys.path.insert(0, "/home/dong/projects/quark-vod/app")
 
 from quark_vod import config as vod_cfg
 from quark_vod import cleanup
+from quark_vod.coordination import maintenance, Busy
 
 JF_DB = os.path.join(BASE, "jellyfin2/config/data/jellyfin.db")
 METADATA_DIR = os.path.join(BASE, "jellyfin2/config/metadata")
 PEOPLE_DIR = os.path.join(METADATA_DIR, "People")
 LIB_DIR = os.path.join(METADATA_DIR, "library")
-CACHE_IMG_DIR = os.path.join(BASE, "jellyfin2/cache/images")
 
 
 def log(msg):
@@ -43,9 +43,9 @@ def log(msg):
 def get_active_people_names():
     """获取当前影视库中真实引用的演职员姓名集合（免锁只读）。"""
     if not os.path.exists(JF_DB):
-        return set()
+        raise RuntimeError('Jellyfin database missing')
     try:
-        with closing(sqlite3.connect(f"file:{JF_DB}?mode=ro&immutable=1", uri=True)) as con:
+        with closing(sqlite3.connect(f"file:{JF_DB}?mode=ro", uri=True, timeout=2)) as con:
             cur = con.cursor()
             cur.execute("""
                 SELECT DISTINCT lower(p.Name)
@@ -54,21 +54,15 @@ def get_active_people_names():
             """)
             return {r[0] for r in cur.fetchall() if r[0]}
     except Exception as e:
-        log(f"读取活跃演职员失败: {e}")
-        return set()
+        raise RuntimeError('读取活跃演职员失败，暂缓清理') from e
 
 
 def purge_orphan_library_metadata():
     """清理 metadata/library 下未引用的剧照/海报。"""
     log("=== 阶段 1: 清理 metadata/library 孤儿剧照与海报 ===")
-    try:
-        files, b = cleanup.prune_jellyfin2_orphan_metadata(dry_run=False, verbose=False)
-        mb = b / (1024 * 1024)
-        log(f"已清理孤儿剧照/海报: {files} 个文件, 释放 {mb:.2f} MB")
-        return files, b
-    except Exception as e:
-        log(f"清理 library 元数据失败: {e}")
-        return 0, 0
+    files, size = cleanup.prune_jellyfin2_orphan_metadata(dry_run=False, verbose=False, strict=True)
+    log(f"已清理孤儿剧照/海报: {files} 个文件, 释放 {size / (1024 * 1024):.2f} MB")
+    return files, size
 
 
 def purge_orphan_people_dirs(active_names):
@@ -81,6 +75,7 @@ def purge_orphan_people_dirs(active_names):
     deleted_dirs = 0
     deleted_bytes = 0
     empty_letters = 0
+    failures = 0
 
     for letter in os.listdir(PEOPLE_DIR):
         letter_dir = os.path.join(PEOPLE_DIR, letter)
@@ -97,8 +92,8 @@ def purge_orphan_people_dirs(active_names):
                     shutil.rmtree(p_dir)
                     deleted_dirs += 1
                     deleted_bytes += sz
-                except Exception:
-                    pass
+                except OSError:
+                    failures += 1
 
         if os.path.isdir(letter_dir) and not os.listdir(letter_dir):
             try:
@@ -109,6 +104,8 @@ def purge_orphan_people_dirs(active_names):
 
     mb = deleted_bytes / (1024 * 1024)
     log(f"已清理孤儿头像目录: {deleted_dirs} 个, 空字母层: {empty_letters} 个, 释放 {mb:.2f} MB")
+    if failures:
+        raise RuntimeError(f'头像目录清理失败 {failures} 项')
     return deleted_dirs, deleted_bytes
 
 
@@ -120,15 +117,14 @@ def purge_orphan_person_entities_via_api(active_names, max_workers=20):
 
     orphan_ids = []
     try:
-        with closing(sqlite3.connect(f"file:{JF_DB}?mode=ro&immutable=1", uri=True)) as con:
+        with closing(sqlite3.connect(f"file:{JF_DB}?mode=ro", uri=True, timeout=2)) as con:
             cur = con.cursor()
             cur.execute("SELECT Id, Name FROM BaseItems WHERE type='MediaBrowser.Controller.Entities.Person'")
             for pid, name in cur.fetchall():
                 if name and name.lower() not in active_names:
                     orphan_ids.append(pid)
     except Exception as e:
-        log(f"读取僵尸 Person 列表失败: {e}")
-        return 0
+        raise RuntimeError('读取 Person 列表失败') from e
 
     total = len(orphan_ids)
     log(f"发现待注销僵尸 Person 实体: {total} 个")
@@ -160,37 +156,9 @@ def purge_orphan_person_entities_via_api(active_names, max_workers=20):
         log(f"  注销进度: {min(i + batch_size, total)}/{total} ({deleted_count} 成功)")
 
     log(f"僵尸 Person 实体注销完成: 共注销 {deleted_count} 个")
+    if deleted_count != total:
+        raise RuntimeError(f'Person 注销未完成: {deleted_count}/{total}')
     return deleted_count
-
-
-def purge_resized_image_cache():
-    """清理 cache/images 下的旧客户端缩略图缓存。"""
-    log("=== 阶段 4: 清理 cache/images 过期缩略图缓存 ===")
-    if not os.path.isdir(CACHE_IMG_DIR):
-        return 0, 0
-
-    freed = 0
-    count = 0
-    for root, dirs, files in os.walk(CACHE_IMG_DIR, topdown=False):
-        for f in files:
-            fp = os.path.join(root, f)
-            try:
-                sz = os.path.getsize(fp)
-                os.remove(fp)
-                freed += sz
-                count += 1
-            except Exception:
-                pass
-        for d in dirs:
-            dp = os.path.join(root, d)
-            try:
-                os.rmdir(dp)
-            except Exception:
-                pass
-
-    mb = freed / (1024 * 1024)
-    log(f"已清理客户端缩略图缓存: {count} 个文件, 释放 {mb:.2f} MB")
-    return count, freed
 
 
 def trigger_db_optimization():
@@ -206,8 +174,7 @@ def trigger_db_optimization():
             tasks = json.loads(r.read().decode("utf-8"))
         task_id = next((t["Id"] for t in tasks if t.get("Key") == "OptimizeDatabaseTask"), None)
         if not task_id:
-            log("未找到 OptimizeDatabaseTask 任务 ID")
-            return
+            return {'status': 'not_available'}
 
         req = urllib.request.Request(
             f"{vod_cfg.JELLYFIN2_API}/ScheduledTasks/Running/{task_id}",
@@ -216,23 +183,49 @@ def trigger_db_optimization():
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            log(f"数据库优化任务已触发: HTTP {resp.status}")
+            if resp.status not in (200, 204):
+                raise RuntimeError('optimization not accepted')
+            log(f"数据库优化任务已入队: HTTP {resp.status}，未等待其执行完成")
+            return {'status': 'submitted'}
     except Exception as e:
-        log(f"触发数据库优化任务失败: {e}")
+        raise RuntimeError('触发数据库优化任务失败') from e
 
 
-def main():
+@maintenance
+def run_cleanup():
     log("开始执行全量孤儿剧照、演职员头像与元数据清理...")
     active_names = get_active_people_names()
+    if len(active_names) < 100:
+        raise RuntimeError('活跃演职员保护样本不足，暂缓所有清理')
     log(f"当前影院受保护的活跃演职员姓名总数: {len(active_names)}")
 
     purge_orphan_library_metadata()
     purge_orphan_people_dirs(active_names)
     purge_orphan_person_entities_via_api(active_names, max_workers=25)
-    purge_resized_image_cache()
     trigger_db_optimization()
-    log("全量孤儿元数据与头像瘦身治理完成！")
+    log("孤儿元数据与头像清理阶段完成；客户端缩略图缓存由 Jellyfin 管理")
+
+
+def main():
+    try:
+        run_cleanup()
+        return 0
+    except Exception as exc:
+        if isinstance(exc, cleanup.MetadataCleanupError):
+            detail = str(exc)
+        else:
+            causes = []
+            cause = exc
+            while cause is not None and len(causes) < 6:
+                label = type(cause).__name__
+                if isinstance(cause, OSError) and cause.errno is not None:
+                    label += f'(errno={cause.errno})'
+                causes.append(label)
+                cause = cause.__cause__
+            detail = ' <- '.join(causes)
+        log(f'元数据清理未完成: {detail}')
+        return 75 if isinstance(exc, Busy) else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -32,7 +32,11 @@ def check(desc, got, want):
 def main():
     # ── 测试隔离：把 STATE_DB 指向临时目录，避免污染生产库 ──
     import tempfile
-    tmp = tempfile.mkdtemp(prefix="np_test_")
+    import atexit
+    temp = tempfile.TemporaryDirectory(prefix="np_test_")
+    atexit.register(temp.cleanup)
+    tmp = temp.name
+    os.environ["VOD_BASE_DIR"] = tmp
     os.environ["VOD_DATA_DIR"] = tmp
     os.environ["AI_PARSE_ENABLED"] = "0"     # 本测试一律不触网
 
@@ -155,9 +159,9 @@ def main():
         ("某剧.S01E05.2160p.mkv",         0,     True,  True),
         ("某剧.S01E05.4K.mkv",            0,     True,  True),
         ("某剧.S01E05.UHD.HDR.mkv",       0,     True,  True),
-        ("某剧.S01E05.mkv",               2 * G, True,  True),   # 未标注，体积推断
+        ("某剧.S01E05.mkv",               2 * G, True,  False),  # 未标注，体积不能证明分辨率
         ("某剧.S01E05.mkv",               0,     True,  False),
-        ("Movie.2020.mkv",                5 * G, False, True),
+        ("Movie.2020.mkv",                5 * G, False, False),
     ]:
         check(f"4K {fn} {size // G}GB", is_4k_candidate(fn, size, is_series=series), want)
 

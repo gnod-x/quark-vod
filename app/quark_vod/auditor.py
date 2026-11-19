@@ -1,327 +1,207 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-片源真 4K 质量与存活预检审计引擎 (Pre-Flight VOD Auditor)
-========================================================================
-核心原则：
-  1. 真实可用性确立：
-     提前对片库资源进行全网夸克 4K 存活预检，彻底消灭用户选片点击时的“薛定谔盲盒”。
-  2. 纯轻量验票，0 存储占用：
-     仅调用夸克官方只读查询接口 (QUARK_SHARE_TOKEN + QUARK_SHARE_DETAIL)，
-     【绝对不调用 save_share】—— 零网盘存储占用，零配额消耗！
-  3. 4K 严格质量把关：
-     精准检测分享包内是否包含真实 2160p/4K/UHD/HDR 高码率正片视频文件。
-  4. 锁定健康源秒播：
-     经预检确认存活的 4K 资源直接在数据库中锁存，用户点击时 0 延迟秒开，100% 成功。
+"""Read-only share/file checks with persistent per-episode source hints.
+
+Never saves cloud media. File names provide resolution hints, not decoded
+resolution or a guarantee of future playback. Inconclusive probes retain locks.
 """
 
+import hashlib
+import json
 import os
 import re
-import sys
+import tempfile
 import time
-import urllib.parse
 
 from . import config
 from . import db
 from . import search as search_mod
-from .transfer import QuarkTransfer, TransferFailed, QUARK_SHARE_DETAIL, is_candidate_video
+from . import strm_manager
+from .transfer import QuarkTransfer, TransferFailed
 from .openlist_client import OpenListClient
 
-# ── 4K 判定（2026-11-13 根治）──────────────────────────────
-#
-# 旧实现：
-#   FOUR_K_REGEX = 2160p | 4K | UHD | HDR10 | DoVi | DV | REMUX | 原盘 | 蓝光原盘
-# 缺陷：把「编码/母版特征」当成了「分辨率」。
-#   实测 1080p.HDR → True、720p.DV → True、1080p.REMUX → True，
-#   而库里 18486 条 valid_4k 锁源中 17321 条（94%）标题根本不含 4K/2160。
-#   由于 is_4k 决定锁源是否被优先调取，等于整条「4K 优先」策略失效。
-#
-# 现在拆成两个概念：
-#   ① 分辨率是否真为 4K  —— 只有 2160p / 4K / UHD 才算
-#   ② 是否明确标注低分辨率 —— 1080p / 720p / 576p / 480p 出现即否证 4K
-# HDR / DV / REMUX / 原盘 一律不再参与分辨率判定（它们可与 1080p 共存）。
-#
-# 保留体积判据，但仅作「未标注分辨率时」的辅助推断：显式标了 1080p 的文件
-# 无论多大都不算 4K，避免把高码率 1080p REMUX（体积可超 4.5GB）误判为 4K。
-_4K_RES_RE = re.compile(
-    r'(?i)(?:2160\s*[pP]?|(?<![0-9A-Za-z])4\s*[kK](?![0-9A-Za-z])|(?<![0-9A-Za-z])UHD(?![0-9A-Za-z])|'
-    r'3840\s*[xX×]\s*2160)')
-
-_LOW_RES_RE = re.compile(r'(?i)(?:1080\s*[pP]|720\s*[pP]|576\s*[pP]|480\s*[pP]|(?<![0-9])1280\s*[xX×]\s*720)')
-
-# 兼容旧引用名（外部如有 import FOUR_K_REGEX 仍可用，但语义已收敛为「明确 4K 标记」）
-FOUR_K_REGEX = _4K_RES_RE
+# Compatibility function: a name hint, never inferred from size/HDR/REMUX.
+from .quality import quality_hint
+FOUR_K_REGEX = re.compile(r"(?i)2160p|4k|uhd")
 
 
 def is_4k_candidate(filename, size_bytes=0, is_series=False):
-    """裁定资源是否达到 4K 原画标准。
+    return quality_hint(filename)['level'] == '4k'
 
-    判定顺序（重要）：先看显式低分辨率否证，再看 4K 标记，最后才用体积推断。
-    """
-    fn = filename or ""
-    if _LOW_RES_RE.search(fn):
-        return False          # 明确标注 1080p/720p 等 → 无论体积多大都不是 4K
-    if _4K_RES_RE.search(fn):
-        return True
-    # 未标注任何分辨率时，按体积辅助推断
-    # 电影 > 4.5 GB，单集剧集 > 1.2 GB
-    if is_series and size_bytes >= 1.2 * 1024 * 1024 * 1024:
-        return True
-    if not is_series and size_bytes >= 4.5 * 1024 * 1024 * 1024:
-        return True
-    return False
+
+def _confirmed_dead(message):
+    # Expired login/stoken/cookie is not an expired public share.
+    text = str(message).lower()
+    if any(word in text for word in ('cookie', 'token', '登录', '身份', '鉴权', '权限')):
+        return False
+    return ('分享链接内没有文件' in text or
+            any(code in text for code in ('41011', '41012')) or
+            (any(word in text for word in ('分享', '链接')) and
+             any(word in text for word in ('已取消', '已失效', '已过期'))))
+
+
+def _load_cursor(filename, with_share=False):
+    try:
+        with open(os.path.join(config.DATA_DIR, filename), encoding='utf-8') as stream:
+            value = json.loads(stream.read(65536)).get('after')
+        if (isinstance(value, list) and len(value) == (4 if with_share else 3) and
+                all(isinstance(x, str) for x in value[:2]) and type(value[2]) is int and
+                (not with_share or isinstance(value[3], str) and re.fullmatch(r'[0-9a-f]{64}', value[3]))):
+            return tuple(value)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def _save_cursor(filename, position):
+    os.makedirs(config.DATA_DIR, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=config.DATA_DIR,
+                                         prefix='.'+filename[:-5].replace('_', '-')+'-', delete=False) as stream:
+            temporary = stream.name
+            os.fchmod(stream.fileno(), 0o644)
+            json.dump({'version': 1, 'after': list(position)}, stream, ensure_ascii=False)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, os.path.join(config.DATA_DIR, filename))
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _audit_cursor():
+    return _load_cursor('source_audit_cursor.json')
+
+
+def _advance_audit_cursor(cat, title, season):
+    _save_cursor('source_audit_cursor.json', (cat, title, season))
+
+
+def _locked_share_key(row):
+    # Persist stable ordering without exposing a public-share URL in a 0644 file.
+    digest = hashlib.sha256(row['best_share_url'].encode('utf-8')).hexdigest()
+    return row['cat'], row['title'], row['season'], digest
 
 
 class VodAuditor:
     def __init__(self, transfer=None):
-        self.ol = OpenListClient()
+        self.ol = transfer.ol if transfer is not None else OpenListClient()
         self.tr = transfer or QuarkTransfer(self.ol)
 
-    def audit_tv_season(self, cat, title, season=1, existing_episodes=None, force=False):
-        """以【整季大包】为单位进行审计与批量锁源（一次探测，整季通亮，彻底消除逐集重复请求）。"""
-        eps_to_check = set(existing_episodes or [1])
+    def _audit_targets(self, cat, title, season, episodes, force):
+        """Use the same recursive file/identity selection as actual transfer."""
+        targets = sorted(set(episodes))[:500]
+        cached = {ep: db.get_source_audit(cat, title, season, ep) for ep in targets}
+        invalid_status = {'dead', 'not_found', 'invalid', 'expired'}
+        if not force and all(row and row['has_quark_source'] and row['best_share_url']
+                and str(row['check_status'] or '').lower() not in invalid_status
+                and db.now()-row['checked_at'] < 86400 and not db.is_dead_source(row['best_share_url'])
+                for row in cached.values()):
+            return True, all(bool(row['is_4k']) for row in cached.values()), '', 'cached hints'
+        search_title, aliases = strm_manager.library_search_identity(cat, title, season)
+        best = {}
+        missing = set()
+        attempted = set()
 
-        # 检查是否整季都已经转存或审计有效
-        if not force:
-            unresolved = []
-            for ep in eps_to_check:
-                audit = db.get_source_audit(cat, title, season, ep)
-                if not (audit and audit["has_quark_source"] and audit["best_share_url"] and not db.is_dead_source(audit["best_share_url"])):
-                    unresolved.append(ep)
-            if not unresolved:
-                return True, True, "", f"整季已锁源 ({len(eps_to_check)}集)"
-
-        kw_core = re.sub(r"\s*[(（]\d{4}[)）]\s*$", "", title).strip()
-        share_candidates = search_mod.search_panshare(kw_core)
-        if not share_candidates and kw_core != title:
-            share_candidates = search_mod.search_panshare(title)
-
-        if not share_candidates:
-            for ep in eps_to_check:
-                db.save_source_audit(cat, title, season, ep,
-                                     has_quark_source=0, is_4k=0,
-                                     best_share_url="", best_share_title="",
-                                     check_status="not_found")
-            return False, False, "", "not_found"
-
-        for cand in share_candidates:
-            share_url = cand.share_url
-            if not share_url or db.is_dead_source(share_url):
-                continue
-
+        def inspect_source(url, label):
+            if url in attempted or db.is_dead_source(url):
+                return
+            attempted.add(url)
             try:
-                stoken, pwd_id, items = self.tr.resolve_share(share_url)
-            except TransferFailed as ex:
-                err_str = str(ex)
-                if any(k in err_str for k in ["已取消了分享", "已失效", "已过期", "链接内没有文件", "41011", "41012"]):
-                    db.mark_dead_source(share_url, "panshare", err_str)
-                continue
+                token, pwd_id, roots = self.tr.resolve_share(url)
+                files = self.tr.share_files(token, pwd_id, roots)
+                for ep in targets:
+                    video = self.tr.select_share_video(files, search_title, season, ep, aliases=aliases)
+                    if not video:
+                        row = cached[ep]
+                        if row and row['best_share_url'] == url:
+                            missing.add(ep)
+                        continue
+                    hint = quality_hint(video['name'], label)
+                    is4k = hint['level'] == '4k'
+                    if ep not in best or (is4k and not best[ep][0]):
+                        best[ep] = (is4k, url, label)
             except Exception:
-                continue
+                # A timeout or incomplete traversal does not prove a dead source.
+                return
 
-            # 2026-11-08「空心分享」熔断：
-            # 分享本身未过期、标题仍在，但根目录文件已被作者清空（_total=0）。
-            # 旧实现仅凭 resolve_share 不抛错就判 alive，导致这类空心源
-            # 长期霸占 source_audits 锁定位（末路兼职 5732d7e33c35 实测），
-            # 播放/预热永远优先选中它、反复验票失败，而后面明明有活源。
-            if not items:
-                db.mark_dead_source(share_url, "panshare", "分享目录为空（空心分享）")
-                continue
+        # Existing file evidence is independent of search coverage. Recheck up
+        # to two locked shares, even when the current search cannot find them.
+        locked = {}
+        for row in cached.values():
+            if (row and row['has_quark_source'] and row['best_share_url'] and
+                    str(row['check_status'] or '').lower() not in invalid_status):
+                locked.setdefault(row['best_share_url'], row['best_share_title'] or title)
+        for url, label in list(locked.items())[:2]:
+            inspect_source(url, label)
+        if not all(ep in best and best[ep][0] for ep in targets):
+            try:
+                candidates = search_mod.rank_candidates(
+                    search_mod.search(search_title, prefer_panshare=True, season=season,
+                                      episode=targets[0] if targets else 0, aliases=aliases),
+                    search_title, season, targets[0] if targets else 0, cat, aliases=aliases)
+            except Exception:
+                candidates = []
+            for candidate in candidates[:6]:
+                inspect_source(candidate.share_url, candidate.name)
+                if all(ep in best and best[ep][0] for ep in targets):
+                    break
+        # Complete enumeration can disprove this episode without disproving the
+        # public share or changing evidence for episodes outside this request.
+        for ep in missing - best.keys():
+            db.save_source_audit(cat, title, season, ep, has_quark_source=0, is_4k=0,
+                                 check_status='not_found')
+        for ep, (is4k, url, label) in best.items():
+            db.save_source_audit(cat, title, season, ep, has_quark_source=1, is_4k=int(is4k),
+                best_share_url=url, best_share_title=label,
+                check_status='valid_4k' if is4k else 'valid_hd')
+        # A season is usable only when every requested episode has an exact file.
+        # Partial enumeration must not be reported as a complete HD/4K source.
+        complete = bool(targets) and len(best) == len(targets)
+        status = f'checked files {len(best)}/{len(targets)}' if best else 'unconfirmed'
+        return complete, complete and all(x[0] for x in best.values()), \
+            next(iter(best.values()))[1] if best else '', status
 
-            share_title = cand.name or ""
-            is_4k_pack = is_4k_candidate(share_title)
-
-            # 遍历提取包内所有视频文件及对应集数
-            inspect_items = list(items)
-            for it in items:
-                if it.get("dir") and it.get("fid"):
-                    try:
-                        det_url = (f"{QUARK_SHARE_DETAIL}&pwd_id={pwd_id}"
-                                   f"&stoken={urllib.parse.quote(stoken)}&pdir_fid={it['fid']}&_page=1&_size=100")
-                        sub_resp = self.tr._request(det_url, method="GET", timeout=10)
-                        sub_list = (sub_resp.get("data") or {}).get("list", [])
-                        inspect_items.extend(sub_list)
-                    except Exception:
-                        pass
-
-            pack_episodes = {}
-            # 2026-11-13：整包一次性 AI 复核（锁源属后台任务，延迟不敏感）
-            _pack_names = [it.get("file_name", "") for it in inspect_items
-                           if not it.get("dir")
-                           and is_candidate_video(it.get("file_name", ""), it.get("size", 0) or 0)]
-            _ep_pack = self.tr.prefetch_episodes(_pack_names, season=season)
-            for fit in inspect_items:
-                fname = fit.get("file_name", "")
-                fsize = fit.get("size", 0) or 0
-                if not fit.get("dir") and is_candidate_video(fname, fsize):
-                    ep_no = self.tr._lookup_ep(fname, season, _ep_pack)
-                    if ep_no and ep_no > 0:
-                        is_single_4k = is_4k_pack or is_4k_candidate(fname, fsize, is_series=True)
-                        if ep_no not in pack_episodes or is_single_4k:
-                            pack_episodes[ep_no] = is_single_4k
-
-            if pack_episodes:
-                # 命中大包！批量将识别到的全部集数一次性锁存到数据库
-                status_str = "valid_4k" if any(pack_episodes.values()) else "valid_hd"
-                for ep_num, is_ep_4k in pack_episodes.items():
-                    db.save_source_audit(cat, title, season, ep_num,
-                                         has_quark_source=1, is_4k=int(is_ep_4k),
-                                         best_share_url=share_url, best_share_title=share_title,
-                                         check_status="valid_4k" if is_ep_4k else "valid_hd")
-                return True, any(pack_episodes.values()), share_url, f"大包命中 {len(pack_episodes)} 集 ({status_str})"
-
-        # 全部候选分享均无效
-        for ep in eps_to_check:
-            db.save_source_audit(cat, title, season, ep,
-                                 has_quark_source=0, is_4k=0,
-                                 best_share_url="", best_share_title="",
-                                 check_status="dead")
-        return False, False, "", "dead"
+    def audit_tv_season(self, cat, title, season=1, existing_episodes=None, force=False):
+        return self._audit_targets(cat, title, season, existing_episodes or [1], force)
 
     def audit_single_item(self, cat, title, season=0, episode=0, force=False):
-        """对单部电影执行前置预检与 4K 锁源。"""
-        if season > 0:
-            return self.audit_tv_season(cat, title, season=season, existing_episodes=[episode], force=force)
-
-        # 电影处理
-        done_row = db.find_done_transfer(cat, title, 0, 0)
-        if done_row and done_row["remote_path"]:
-            db.save_source_audit(cat, title, 0, 0,
-                                 has_quark_source=1, is_4k=1,
-                                 best_share_url="", best_share_title="已在网盘正片",
-                                 check_status="valid_4k")
-            return True, True, "", "valid_4k"
-
-        if not force:
-            audit = db.get_source_audit(cat, title, 0, 0)
-            if audit and (db.now() - audit["checked_at"]) < 86400:
-                if audit["has_quark_source"] and audit["best_share_url"]:
-                    if not db.is_dead_source(audit["best_share_url"]):
-                        return True, bool(audit["is_4k"]), audit["best_share_url"], audit["check_status"]
-
-        kw_core = re.sub(r"\s*[(（]\d{4}[)）]\s*$", "", title).strip()
-        share_candidates = search_mod.search_panshare(kw_core)
-        if not share_candidates and kw_core != title:
-            share_candidates = search_mod.search_panshare(title)
-
-        # 电影形态硬隔离：候选源必须过滤短剧与无关源，得分必须 >= 30.0
-        filtered_cands = []
-        for cand in (share_candidates or []):
-            if cand.share_url and not db.is_dead_source(cand.share_url):
-                sc = search_mod.score_search_result(cand, title, season=0, episode=0)
-                if sc >= 30.0:
-                    filtered_cands.append(cand)
-        share_candidates = filtered_cands
-
-        if not share_candidates:
-            db.save_source_audit(cat, title, 0, 0,
-                                 has_quark_source=0, is_4k=0,
-                                 best_share_url="", best_share_title="",
-                                 check_status="not_found")
-            return False, False, "", "not_found"
-
-        for cand in share_candidates:
-            share_url = cand.share_url
-            if not share_url or db.is_dead_source(share_url):
-                continue
-
-            try:
-                stoken, pwd_id, items = self.tr.resolve_share(share_url)
-            except TransferFailed as ex:
-                err_str = str(ex)
-                if any(k in err_str for k in ["已取消了分享", "已失效", "已过期", "链接内没有文件", "41011", "41012"]):
-                    db.mark_dead_source(share_url, "panshare", err_str)
-                continue
-            except Exception:
-                continue
-
-            # 2026-11-08「空心分享」熔断（同 audit_tv_season 的处理口径）：
-            if not items:
-                db.mark_dead_source(share_url, "panshare", "分享目录为空（空心分享）")
-                continue
-
-            is_4k = is_4k_candidate(cand.name or "")
-            matched_video = False
-
-            inspect_items = list(items)
-            for it in items:
-                if it.get("dir") and it.get("fid"):
-                    try:
-                        det_url = (f"{QUARK_SHARE_DETAIL}&pwd_id={pwd_id}"
-                                   f"&stoken={urllib.parse.quote(stoken)}&pdir_fid={it['fid']}&_page=1&_size=20")
-                        sub_resp = self.tr._request(det_url, method="GET", timeout=10)
-                        sub_list = (sub_resp.get("data") or {}).get("list", [])
-                        inspect_items.extend(sub_list)
-                    except Exception:
-                        pass
-
-            video_fits = []
-            for fit in inspect_items:
-                fname = fit.get("file_name", "")
-                fsize = fit.get("size", 0) or 0
-                if not fit.get("dir") and is_candidate_video(fname, fsize):
-                    video_fits.append((fname, fsize))
-                    if is_4k_candidate(fname, fsize, is_series=False):
-                        is_4k = True
-
-            # 电影防短剧/剧集冒充校验：若包含多个提取出集数的单集视频，坚决不作为单部电影锁存
-            #
-            # 2026-11-08（与 transfer 验票同口径的「强证据优先」）：
-            #   旧实现只要命中弱集数信号就跳过该源，导致含 50GB 正片的电影源
-            #   因 "4K_HDR_60"/"d3 1" 等规格残片被判为剧集大包而永远无法锁源。
-            #   现先看强证据：存在「非集数标记且 >= 350MB」的单片即认定为本片电影。
-            # 2026-11-13：整包一次性 AI 复核，两处判定复用同一份结果
-            _ep_movie = self.tr.prefetch_episodes([f[0] for f in video_fits], season=1)
-            _unmarked = [f for f in video_fits
-                         if f[1] >= 350 * 1024 * 1024
-                         and self.tr._lookup_ep(f[0], 1, _ep_movie) is None]
-            if len(video_fits) > 1 and not _unmarked:
-                ep_hits = 0
-                for fn, _ in video_fits:
-                    if self.tr._lookup_ep(fn, 1, _ep_movie) is not None:
-                        ep_hits += 1
-                if ep_hits >= 2 or (len(video_fits) >= 3 and ep_hits >= 1):
-                    continue  # 跳过该多集短剧包，继续寻找正片候选
-
-            if video_fits:
-                matched_video = True
-
-            if matched_video:
-                status_str = "valid_4k" if is_4k else "valid_hd"
-                db.save_source_audit(cat, title, 0, 0,
-                                     has_quark_source=1, is_4k=int(is_4k),
-                                     best_share_url=share_url, best_share_title=cand.name or "",
-                                     check_status=status_str)
-                return True, is_4k, share_url, status_str
-
-        # 注：下方 save_source_audit 已整体覆盖为 has_quark_source=0/check_status=dead，
-        # get_locked_4k_share 不会再返回该行，无需额外 purge。
-        db.save_source_audit(cat, title, 0, 0,
-                             has_quark_source=0, is_4k=0,
-                             best_share_url="", best_share_title="",
-                             check_status="dead")
-        return False, False, "", "dead"
+        if season:
+            return self.audit_tv_season(cat, title, season, [episode], force)
+        done = db.find_done_transfer(cat, title, 0, 0)
+        if done and done['remote_path']:
+            is4k = quality_hint(os.path.basename(done['remote_path']))['level'] == '4k'
+            return True, is4k, '', 'saved; resolution hint only'
+        return self._audit_targets(cat, title, 0, [0], force)
 
     def check_and_heal_locked_shares(self, limit=None, yield_fn=None, timeout_fn=None):
-        """存量已锁源健康体检与自动补位：
-        对数据库中所有已锁定的分享链接进行只读轻量存活性探测，
-        一旦发现原作者取消分享或失效，立即拉黑并自动调用多源矩阵打捞全新活源替换！
+        """Rotate root checks separately from per-episode file evidence.
+
+        Callers bound each phase by count/time. Unknown results retain locks;
+        only confirmed dead shares trigger replacement of their original targets.
         """
         con = db._conn()
-        # 查找所有已锁源且非空的独立分享条目（按 cat, title, season 去重，剧集整包只验一次）
         rows = con.execute("""
-            SELECT cat, title, season, best_share_url, is_4k, best_share_title, COUNT(*) as ep_cnt
+            SELECT cat, title, season, best_share_url,
+                   GROUP_CONCAT(episode) AS episodes
             FROM source_audits
             WHERE has_quark_source = 1 AND best_share_url != ''
             GROUP BY cat, title, season, best_share_url
-            ORDER BY checked_at ASC
         """).fetchall()
+        available = len(rows)
+        rows.sort(key=_locked_share_key)
+        cursor = _load_cursor('source_lock_cursor.json', with_share=True)
+        if cursor:
+            split = next((i for i, row in enumerate(rows) if _locked_share_key(row) > cursor), len(rows))
+            rows = rows[split:] + rows[:split]
+        if limit is not None:
+            rows = rows[:max(0, limit)]
 
-        if limit:
-            rows = rows[:limit]
-
-        print(f"[{config.SERVICE_NAME}] 开始对数据库中 {len(rows)} 个已锁存的夸克分享源执行健康体检与自愈换源...")
-        stats = {"total": len(rows), "healthy": 0, "healed_4k": 0, "healed_hd": 0, "failed_dead": 0}
+        print(f"[{config.SERVICE_NAME}] 本轮检查 {len(rows)}/{available} 组已锁源的分享根目录；不刷新分集文件证据。")
+        stats = {"available": available, "total": len(rows), "checked": 0, "healthy": 0, "unknown": 0,
+                 "healed_4k": 0, "healed_hd": 0, "failed_dead": 0, "errors": 0}
 
         for r in rows:
             if timeout_fn and timeout_fn():
@@ -329,67 +209,68 @@ class VodAuditor:
                 break
             if yield_fn:
                 yield_fn()
+            if timeout_fn and timeout_fn():
+                break
 
-            cat = r["cat"]
-            title = r["title"]
-            season = r["season"]
-            share_url = r["best_share_url"]
-
-            is_alive = False
-            # 轻量只读探测存活性
+            stats["checked"] += 1
             try:
-                stoken, pwd_id, listed = self.tr.resolve_share(share_url)
-                # 2026-11-08：根目录为空即判死（空心分享），不能只看「没抛错」
-                is_alive = bool(listed)
-                if not is_alive:
-                    db.mark_dead_source(share_url, "panshare", "分享目录为空（空心分享）")
-            except TransferFailed as ex:
-                err_str = str(ex)
-                if any(k in err_str for k in ["已取消了分享", "已失效", "已过期", "链接内没有文件", "41011", "41012"]):
-                    db.mark_dead_source(share_url, "panshare", err_str)
-            except Exception:
-                pass
+                outcome = self._check_locked_share(r)
+                stats[outcome] += 1
+            except Exception as exc:
+                stats['unknown'] += 1
+                stats['errors'] += 1
+                print(f" - [检查异常] {r['cat']}/{r['title']} -> {type(exc).__name__}")
+            finally:
+                # Even inconclusive/error results yield their turn. A budget
+                # stop before a request must not skip that unstarted group.
+                _save_cursor('source_lock_cursor.json', _locked_share_key(r))
+            time.sleep(1.0)
 
-            if is_alive:
-                stats["healthy"] += 1
-                # 刷新存活条目的检查时间戳
-                db.bump_audit_checked_at(cat, title, season, share_url)
-                tag = f"S{season:02d}" if season else "电影"
-                print(f" - [健康存活] 【{cat}】《{title}》({tag}) -> {share_url[:40]}...")
-            else:
-                # 发现死链！立即触发多源矩阵自动打捞全新活源替换！
-                # 2026-11-08：先显式作废该季全部锁定位，防止自愈换源失败后
-                # 播放链路仍优先调取这条已死的 locked 源。
-                db.purge_audit_locked_share(cat, title, season, share_url)
-                if not db.is_dead_source(share_url):
-                    db.mark_dead_source(share_url, "panshare", "分享链接已失效或取消")
-                tag = f"S{season:02d}" if season else "电影"
-                print(f" - [死链检测] 【{cat}】《{title}》({tag}) 链接已失效！立即启动多源矩阵自动换源补新...")
-                if season > 0:
-                    ok, is_4k, new_url, status_msg = self.audit_tv_season(cat, title, season=season, force=True)
-                else:
-                    ok, is_4k, new_url, status_msg = self.audit_single_item(cat, title, 0, 0, force=True)
-
-                if ok and new_url:
-                    if is_4k:
-                        stats["healed_4k"] += 1
-                    else:
-                        stats["healed_hd"] += 1
-                    print(f"   ★ [自动自愈成功] 已成功替换为全新存活源: {new_url[:40]}... ({status_msg})")
-                else:
-                    stats["failed_dead"] += 1
-                    print(f"   ▲ [自愈未找到新源] 全网暂未搜出新的替代夸克源，已标记为待补充")
-
-            time.sleep(1.0) # 轻量防频控
-
-        print(f"\n[{config.SERVICE_NAME}] 存量锁源体检与自愈完成: 检查={stats['total']}, 依然健康={stats['healthy']}, 成功自动换新4K={stats['healed_4k']}, 换新高清={stats['healed_hd']}, 待补源={stats['failed_dead']}")
+        print(f"\n[{config.SERVICE_NAME}] 存量锁源检查结束: 实查={stats['checked']}/{stats['total']}, 分享可读={stats['healthy']}, 未确认={stats['unknown']}, 换源4K标注={stats['healed_4k']}, 其他标注={stats['healed_hd']}, 待补源={stats['failed_dead']}")
         return stats
+
+    def _check_locked_share(self, row):
+        cat, title, season = row['cat'], row['title'], row['season']
+        share_url = row['best_share_url']
+        tag = f'S{season:02d}' if season else '电影'
+        confirmed_dead = False
+        unknown_reason = ''
+        try:
+            _, _, listed = self.tr.resolve_share(share_url)
+            if listed:
+                print(f" - [分享可读] 【{cat}】《{title}》({tag})，分集文件证据由片源审计更新")
+                return 'healthy'
+            confirmed_dead = True
+        except TransferFailed as exc:
+            confirmed_dead = _confirmed_dead(exc)
+            unknown_reason = type(exc).__name__
+        except Exception as exc:
+            unknown_reason = type(exc).__name__
+        if not confirmed_dead:
+            print(f" - [待确认] 【{cat}】《{title}》({tag}) 探测未能判定源状态: {unknown_reason}，保留原锁源")
+            return 'unknown'
+
+        db.purge_audit_locked_share(cat, title, season, share_url)
+        if not db.is_dead_source(share_url):
+            db.mark_dead_source(share_url, 'panshare', '分享链接已失效或取消')
+        print(f" - [死链检测] 【{cat}】《{title}》({tag}) 已确认失效，检查原目标的替代源。")
+        if season > 0:
+            episodes = sorted({int(x) for x in str(row['episodes'] or '').split(',') if x.isdigit()})
+            ok, is_4k, new_url, status = self.audit_tv_season(
+                cat, title, season=season, existing_episodes=episodes or [1], force=True)
+        else:
+            ok, is_4k, new_url, status = self.audit_single_item(cat, title, 0, 0, force=True)
+        if ok and new_url:
+            print(f"   [自动换源] 已确认原目标的替代文件 ({status})")
+            return 'healed_4k' if is_4k else 'healed_hd'
+        print('   [待补源] 本次搜索范围未确认覆盖原目标的替代源。')
+        return 'failed_dead'
 
     def audit_entire_library(self, only_pending=True, limit=None, yield_fn=None, timeout_fn=None):
         """遍历全库执行片源可用性与 4K 质量审计（剧集以整季为单位大包审计）。支持观影感知避让与时间窗口截止。"""
         cinema2 = config.CINEMA2_DIR
         if not os.path.isdir(cinema2):
-            return {"total_shows": 0, "valid_4k": 0, "valid_hd": 0, "no_source": 0}
+            return {"total_shows": 0, "checked": 0, "valid_4k": 0, "valid_hd": 0, "no_source": 0}
 
         targets = []
         for cat in sorted(os.listdir(cinema2)):
@@ -424,11 +305,16 @@ class VodAuditor:
                 else:
                     targets.append(("movie", cat, item_dir, 0, [0]))
 
-        if limit:
-            targets = targets[:limit]
+        targets.sort(key=lambda row: (row[1], row[2], row[3]))
+        cursor = _audit_cursor()
+        if cursor:
+            split = next((i for i, row in enumerate(targets) if (row[1], row[2], row[3]) > cursor), len(targets))
+            targets = targets[split:] + targets[:split]
+        if limit is not None:
+            targets = targets[:max(0, limit)]
 
-        stats = {"total_shows": len(targets), "valid_4k": 0, "valid_hd": 0, "no_source": 0}
-        print(f"[{config.SERVICE_NAME}] 开始对片库 {len(targets)} 部影视（剧集整季打包）执行片源存活性与真 4K 审计...")
+        stats = {"total_shows": len(targets), "checked": 0, "valid_4k": 0, "valid_hd": 0, "no_source": 0, "errors": 0}
+        print(f"[{config.SERVICE_NAME}] 本轮核验 {len(targets)} 组作品/季的目标文件与 4K 名称提示；不转存媒体。")
 
         for kind, cat, title, s_num, eps in targets:
             if timeout_fn and timeout_fn():
@@ -436,14 +322,17 @@ class VodAuditor:
                 break
             if yield_fn:
                 yield_fn()
+            if timeout_fn and timeout_fn():
+                break
 
+            stats['checked'] += 1
             try:
                 if kind == "tv":
                     has_src, is_4k, best_url, status_msg = self.audit_tv_season(cat, title, season=s_num, existing_episodes=eps)
                     print(f" - [{cat:<6}] 《{title}》 第{s_num}季 ({len(eps)}集) -> {status_msg}")
                 else:
                     has_src, is_4k, best_url, status_str = self.audit_single_item(cat, title, 0, 0)
-                    src_desc = f"4K源: {best_url[:40]}..." if is_4k else ("普通高清" if has_src else "无有效源")
+                    src_desc = "4K名称标注" if is_4k else ("其他分辨率标注" if has_src else "未确认有效源")
                     print(f" - [{cat:<6}] 《{title}》 (电影) -> {status_str} | {src_desc}")
 
                 if has_src and is_4k:
@@ -453,21 +342,24 @@ class VodAuditor:
                 else:
                     stats["no_source"] += 1
             except Exception as err:
-                print(f" - [ERROR   ] {cat}/{title} -> {err}")
+                stats['no_source'] += 1
+                stats['errors'] += 1
+                print(f" - [ERROR   ] {cat}/{title} -> {type(err).__name__}")
+            finally:
+                # Failed/empty targets also yield their turn; budget expiry
+                # before a request leaves that target eligible for next run.
+                _advance_audit_cursor(cat, title, s_num)
 
             time.sleep(1.2) # 轻量防频控
 
-        print(f"\n[{config.SERVICE_NAME}] 审计完成: 影视总数={stats['total_shows']}, 4K覆盖={stats['valid_4k']}, 高清={stats['valid_hd']}, 无有效网盘源={stats['no_source']}")
+        print(f"\n[{config.SERVICE_NAME}] 审计结束: 实查={stats['checked']}/{stats['total_shows']}, 全目标4K标注={stats['valid_4k']}, 其他完整覆盖={stats['valid_hd']}, 未确认完整覆盖={stats['no_source']}")
         return stats
 
     def fix_disguised_vod_files(self):
-        """巡检夸克点播目录（/夸克网盘/点播），自动嗅探并扶正所有伪装大文件（如大体积 .mp3/.pdf 等）。"""
-        print(f"[{config.SERVICE_NAME}] 开始巡检网盘点播目录伪装格式文件: {config.QUARK_VOD_ROOT}...", flush=True)
-        try:
-            vids = self.tr.scan_videos(config.QUARK_VOD_ROOT, max_depth=4)
-            print(f"[{config.SERVICE_NAME}] 网盘点播目录文件巡检与格式扶正完成，当前就绪视频总数: {len(vids)}", flush=True)
-            return len(vids)
-        except Exception as e:
-            print(f"[{config.SERVICE_NAME}] 伪装文件巡检异常: {e}", flush=True)
-            return 0
+        """Inspection-only inventory. Renaming live cloud files invalidates STRMs.
 
+        Disguised input handling belongs to the selected-file transfer pipeline;
+        scheduled broad scans must not rename existing media behind Jellyfin.
+        """
+        rows = db._conn().execute("SELECT COUNT(*) FROM transfers WHERE status='done'").fetchone()
+        return rows[0]

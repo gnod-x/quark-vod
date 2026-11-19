@@ -616,7 +616,7 @@
     </div>
     <div class="card stat-card" style="margin-bottom:0">
       <div>
-        <div class="stat-title">4K 锁源审计库</div>
+        <div class="stat-title">片源审计记录（历史标注）</div>
         <div class="stat-val" id="audit4kCount">-</div>
       </div>
       <div class="stat-sub" id="auditDetail" title="-">-</div>
@@ -626,7 +626,7 @@
         <div class="stat-title">网盘递归容量水位</div>
         <div class="stat-val" id="quotaVal" style="font-size:1.1rem">待测算</div>
       </div>
-      <div class="stat-sub" id="quotaSub" title="上限 2048 GB / 淘汰 1024 GB">上限 2048GB</div>
+      <div class="stat-sub" id="quotaSub" title="按账号使用率计算，测算后显示">待测算账号水位</div>
     </div>
   </div>
 
@@ -981,7 +981,7 @@ function renderSearchCandidates() {
     tr.innerHTML = `
       <td class="mono"><strong>${c.score}</strong></td>
       <td><span class="badge ${cls}">${c.qualified ? '准入' : '淘汰'}</span></td>
-      <td>${c.is_4k_hint ? '<span class="badge badge-ok">4K/HDR</span>' : '-'}</td>
+      <td>${c.is_4k_hint ? '<span class="badge badge-ok">4K 候选</span>' : '-'}</td>
       <td class="mono">${c.source || c.engine}</td>
       <td title="${c.name}"><div style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${c.name}</div></td>
       <td class="mono"><a href="${c.share_url}" target="_blank" style="color:var(--accent)">打开链接</a></td>
@@ -996,7 +996,7 @@ function renderSearchCandidates() {
         <div style="display:flex;align-items:center;gap:6px;">
           <span class="mono" style="font-size:0.95rem;font-weight:700;color:var(--accent)">${c.score}分</span>
           <span class="badge ${cls}">${c.qualified ? '准入' : '淘汰'}</span>
-          ${c.is_4k_hint ? '<span class="badge badge-ok">4K/HDR</span>' : ''}
+          ${c.is_4k_hint ? '<span class="badge badge-ok">4K 候选</span>' : ''}
         </div>
         <span class="badge badge-tag">${c.source || c.engine}</span>
       </div>
@@ -1017,12 +1017,12 @@ async function runSearchDebug() {
   const e = parseInt(document.getElementById('qEpisode').value || '0', 10);
   if (!title) { showToast('请输入片名'); return; }
 
-  document.getElementById('searchMeta').textContent = '⏳ 并发检索 6 大盘搜节点并计算五维打分...';
+  document.getElementById('searchMeta').textContent = '⏳ 正在多节点分页搜索并匹配作品，通常需要数十秒...';
   try {
     const u = `/api/admin/search-debug?title=${encodeURIComponent(title)}&cat=${encodeURIComponent(cat)}&season=${s}&episode=${e}`;
     const r = await fetch(u);
     const d = await r.json();
-    const lockInfo = d.locked_share ? ` | 🔒 最优锁源: ${d.locked_share.url} (${d.locked_share.is_4k ? '4K' : 'HD'})` : ' | 未锁源';
+    const lockInfo = d.locked_share ? ` | 已有锁源: ${d.locked_share.url} (${d.locked_share.is_4k ? '4K' : 'HD'})` : ' | 未锁源';
     document.getElementById('searchMeta').textContent =
       `耗时: ${d.elapsed_sec}s | 候选: ${d.total_candidates} 条 | 准入(>=30): ${d.qualified_count} 条${lockInfo}`;
     
@@ -1086,7 +1086,7 @@ async function checkQuota() {
     const d = await r.json();
     if (d.total_gb !== undefined) {
       document.getElementById('quotaVal').textContent = `${d.total_gb} GB`;
-      document.getElementById('quotaSub').textContent = `共 ${d.folder_count} 目录 / 上限 ${d.quota_limit_gb}G`;
+      document.getElementById('quotaSub').textContent = d.quota_scope === 'account' ? '账号 ' + d.account_used_gb + ' / ' + d.account_total_gb + ' GB；85% 触发清理' : '账号容量未知；点播备用上限 ' + d.quota_limit_gb + ' GB';
     } else {
       document.getElementById('quotaVal').textContent = '测算失败';
     }

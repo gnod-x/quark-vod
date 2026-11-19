@@ -23,16 +23,19 @@ import sys
 import time
 import shutil
 import sqlite3
+from contextlib import closing
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-BASE = "/home/dong/projects/hometheater"
+BASE = os.environ.get("HOMETHEATER_BASE_DIR", "/home/dong/projects/hometheater")
 CINEMA2 = os.path.join(BASE, "cinema2")
 sys.path.insert(0, os.path.join(BASE, "scripts"))
 
 from quark_vod import config as vod_cfg
 from quark_vod import db as vod_db
+from quark_vod.coordination import maintenance
+import tmdb_populate
 
 
 def log(msg):
@@ -62,6 +65,15 @@ MISPLACED_RULES = [
 TRASH_ARCHIVE = os.path.join(BASE, "data", ".category_archive")
 
 
+def protected_directory(path):
+    from daily_update_and_prune import get_protected_titles, is_item_active_or_done
+    name = os.path.basename(path)
+    titles = get_protected_titles()
+    return (name in titles or name.rsplit(' (',1)[0] in titles
+            or is_item_active_or_done(path, os.path.basename(os.path.dirname(path)), name))
+
+
+@maintenance
 def cleanup_known_misplaced(dry_run=False):
     """清理已知的跨专区错放与重复收录条目（采用安全归档模式，数据完全可逆）。"""
     log("=== [阶段 1] 扫描并治理跨专区错放与重复收录影视 ===")
@@ -72,7 +84,7 @@ def cleanup_known_misplaced(dry_run=False):
         bad_dir = os.path.join(CINEMA2, bad_cat, name)
         good_dir = os.path.join(CINEMA2, good_cat, name)
 
-        if os.path.exists(bad_dir):
+        if os.path.exists(bad_dir) and not protected_directory(bad_dir):
             if os.path.exists(good_dir):
                 log(f"发现跨专区重复: [{bad_cat}] {name} (正确归属: [{good_cat}]) -> {reason}")
                 if not dry_run:
@@ -95,6 +107,7 @@ def cleanup_known_misplaced(dry_run=False):
     return cleaned_count
 
 
+@maintenance
 def disambiguate_anime_vs_liveaction(dry_run=False):
     """重名影视形态消歧（以《凡人修仙传》真人剧 vs 动画版为例）。"""
     log("=== [阶段 2] 扫描并执行重名影视形态消歧治理 (真人剧 vs 动画版) ===")
@@ -104,7 +117,7 @@ def disambiguate_anime_vs_liveaction(dry_run=False):
     live_fr = os.path.join(CINEMA2, "国产剧集", "凡人修仙传")
     anime_fr = os.path.join(CINEMA2, "国产动漫", "凡人修仙传")
 
-    if os.path.exists(live_fr) and os.path.exists(anime_fr):
+    if os.path.exists(live_fr) and os.path.exists(anime_fr) and not protected_directory(live_fr):
         target_live_name = "凡人修仙传 (2025)"
         target_live_dir = os.path.join(CINEMA2, "国产剧集", target_live_name)
         log(f"发现高危重名 IP: 【国产剧集/凡人修仙传】(真人剧) 与 【国产动漫/凡人修仙传】(动画版) 完全重名！")
@@ -163,6 +176,7 @@ def disambiguate_anime_vs_liveaction(dry_run=False):
     return fixed_count
 
 
+@maintenance
 def clean_broken_empty_dirs(dry_run=False):
     """清理空目录与损坏孤立目录。"""
     log("=== [阶段 3] 扫描并清理无NFO的空目录与残破目录 ===")
@@ -192,6 +206,7 @@ def clean_broken_empty_dirs(dry_run=False):
     return cleaned
 
 
+@maintenance
 def deduplicate_by_tmdbid(dry_run=False):
     """阶段 4: 同专区同 TMDB ID 自动去重治理（彻底根治译名变迁产生重复目录与播放异常）。"""
     log("=== [阶段 4] 扫描并治理同专区 TMDB ID 影视目录重复 ===")
@@ -250,6 +265,8 @@ def deduplicate_by_tmdbid(dry_run=False):
 
             log(f"发现同剧/同片重复 (TMDB ID {tmdbid}): 保留 [{cat}/{os.path.basename(keep)}]")
             for r in remove:
+                if protected_directory(r):
+                    continue
                 r_name = os.path.basename(r)
                 log(f"  --> 淘汰旧译名/冗余条目: [{cat}/{r_name}]")
                 if not dry_run:
@@ -272,6 +289,79 @@ def deduplicate_by_tmdbid(dry_run=False):
     return cleaned
 
 
+@maintenance
+def purge_ai_shows(dry_run=False):
+    """扫描并全面淘汰清理所有 AI剧/AI短剧/AIGC 劣质生成条目。"""
+    log("=== [阶段 5] 扫描并治理 AI剧 / AIGC 劣质生成影视 ===")
+    cleaned_count = 0
+    tmdb_key = None
+    try:
+        tmdb_key = tmdb_populate.read_tmdb_key()
+    except Exception:
+        pass
+
+    jf_db = os.path.join(BASE, "jellyfin2/config/data/jellyfin.db")
+    jf_tags_cache = {}
+    if os.path.exists(jf_db):
+        try:
+            with closing(sqlite3.connect(f"file:{jf_db}?mode=ro", uri=True, timeout=2)) as con:
+                for row in con.cursor().execute("SELECT Path, Tags FROM BaseItems WHERE Tags IS NOT NULL"):
+                    if row[0] and row[1]:
+                        norm_p = row[0].replace("/cinema2", CINEMA2)
+                        jf_tags_cache[norm_p] = [t.strip().lower() for t in row[1].split("|")]
+        except Exception:
+            pass
+
+    for cat in os.listdir(CINEMA2):
+        cat_dir = os.path.join(CINEMA2, cat)
+        if not os.path.isdir(cat_dir) or cat.startswith("."):
+            continue
+        for show_dir_name in sorted(os.listdir(cat_dir)):
+            if show_dir_name.startswith("."):
+                continue
+            show_path = os.path.join(cat_dir, show_dir_name)
+            if not os.path.isdir(show_path):
+                continue
+
+            is_ai, reason = tmdb_populate.is_ai_directory(
+                show_path, jf_tags_cache=jf_tags_cache, cat=cat, tmdb_key=tmdb_key
+            )
+            if not is_ai:
+                for f in os.listdir(show_path):
+                    if f.endswith(".strm"):
+                        strm_full = os.path.join(show_path, f)
+                        strm_tags = jf_tags_cache.get(strm_full, [])
+                        if any(t in tmdb_populate.AI_KEYWORD_NAMES for t in strm_tags):
+                            is_ai = True
+                            reason = f"strm_tag:{strm_tags}"
+                            break
+
+            if is_ai and not protected_directory(show_path):
+                log(f"发现 AI 剧/AIGC 劣质条目: [{cat}] {show_dir_name} ({reason})")
+                if not dry_run:
+                    archive_target = os.path.join(TRASH_ARCHIVE, f"ai_{cat}_{show_dir_name}_{int(time.time())}")
+                    try:
+                        shutil.move(show_path, archive_target)
+                        log(f"  --> 已安全移入归档区: {archive_target}")
+                    except Exception as ex:
+                        log(f"  --> 移入归档区失败: {ex}")
+                    try:
+                        con = vod_db._conn()
+                        vod_db.remove_strm_maps_below(show_path, con)
+                        clean_t = show_dir_name.rsplit(" (", 1)[0].strip()
+
+
+
+                        con.commit()
+                    except Exception:
+                        pass
+                cleaned_count += 1
+
+    log(f"AI 剧治理清理完成，共清理/归档 {cleaned_count} 个条目")
+    return cleaned_count
+
+
+@maintenance
 def run_governance(dry_run=False):
     """一键执行全套影视分类纠偏与重名消歧治理。"""
     log(">>>>>>>> 开始执行全库影视分类精准度治理与重名消歧 <<<<<<<<")
@@ -279,8 +369,16 @@ def run_governance(dry_run=False):
     c2 = disambiguate_anime_vs_liveaction(dry_run=dry_run)
     c3 = clean_broken_empty_dirs(dry_run=dry_run)
     c4 = deduplicate_by_tmdbid(dry_run=dry_run)
-    total = c1 + c2 + c3 + c4
-    log(f">>>>>>>> 治理全部完成！累计处理 {total} 处错位/重名/空目录 <<<<<<<<")
+    c5 = purge_ai_shows(dry_run=dry_run)
+    total = c1 + c2 + c3 + c4 + c5
+    if total and not dry_run:
+        from quark_vod import strm_manager
+        con = vod_db._conn()
+        stale = [r[0] for r in con.execute('SELECT DISTINCT strm_path FROM strm_map') if not os.path.isfile(r[0])]
+        con.executemany('DELETE FROM strm_map WHERE strm_path=?', [(p,) for p in stale])
+        con.commit()
+        strm_manager.scan_and_register()
+    log(f">>>>>>>> 治理全部完成！累计处理 {total} 处错位/重名/空目录/AI剧 <<<<<<<<")
     return total
 
 

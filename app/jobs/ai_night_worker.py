@@ -6,9 +6,8 @@
 设计指标：
   1. 运行时长：设计为北京时间夜间通宵运行 5 ~ 8 小时 (23:00 ~ 06:30)
   2. 模型路由：
-     - 主力模型：deepseek-v4.1-flash / cn/step-5-preview (限时免费，0 积分消耗)
-     - 次级备用：cn/deepseek-v4-pro / cn/deepseek-v4.1-flash (国内极低积分)
-     - 终极兜底：gemini-3.8-flash (走用户 OAuth 授权，仅在免费模型全部不可用时启用)
+     - 主力模型：cn/deepseek-v4.1-flash（按任务分级 reasoning_effort：探测 none / 字幕 low / 演职员 medium / NFO high）
+     - 终极兜底：gemini-3.8-flash-high（仅在主力模型不可用时启用）
   3. 资源约束：
      - 白天常驻内存：0 MB（批处理完成后彻底退出）
      - 运行内存峰值：< 25 MB（流式单条处理，绝不堆叠大数组）
@@ -32,7 +31,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
 
-BASE_DIR = "/home/dong/projects/hometheater"
+BASE_DIR = os.environ.get("HOMETHEATER_BASE_DIR", "/home/dong/projects/hometheater")
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
@@ -42,34 +41,23 @@ from quark_vod.openlist_client import OpenListClient
 
 AI_BASE_URL = os.environ.get('OPENAI_BASE_URL', 'http://127.0.0.1:8317/v1')
 def _load_cliproxy_token():
-    # cron 不读 .bashrc / /etc/environment，直接读统一 token 文件
-    import os as _os
-    v = _os.environ.get('OPENAI_API_KEY', '').strip()
-    if v:
-        return v
-    try:
-        with open(_os.path.expanduser('~/.config/cliproxy/token')) as _f:
-            return _f.read().strip()
-    except Exception:
-        return ''
+    # 优先读取统一 token 文件（与 Claude Code / Codex 共用单一事实来源，支持热同步）
+    return vod_cfg.load_cliproxy_token()
 
 
 AI_API_KEY = _load_cliproxy_token()
 # ── 模型优先级阶梯 ─────────────────────────────────────
-# 1. 候选限时免费顶级模型 (性能对齐 deepseek-v4.1-flash / step-5，动态探测确认后优先使用)
+# 1. 主力模型：统一使用 cn/deepseek-v4.1-flash
 FREE_MODELS = [
-    "deepseek-v4.1-flash",
-    "deepseek-v4.1-flash-sg",
-    "step-5-preview",
-    "cn/step-5-preview"
+    "cn/deepseek-v4.1-flash",
 ]
-# 2. 国内版最新 DeepSeek 极低积分模型 (仅包含最新 v4.1 flash，坚决不使用老旧 pro)
+# 2. 次级重试列表（与主力对齐）
 LOW_COST_MODELS = [
-    "cn/deepseek-v4.1-flash"
+    "cn/deepseek-v4.1-flash",
 ]
-# 3. 终极兜底模型 (严格仅使用用户 Google OAuth 授权的 gemini-3.8-flash，平时绝不调用)
+# 3. 终极兜底模型 (OAuth 授权的 gemini-3.8-flash-high，主力不可用时触发)
 OAUTH_FALLBACK_MODELS = [
-    "gemini-3.8-flash-high"
+    "gemini-3.8-flash-high",
 ]
 
 LOG_FILE = os.path.join(BASE_DIR, "logs", "ai_night_worker.log")
@@ -78,6 +66,8 @@ LOCK_FILE = os.path.join(BASE_DIR, "data", "ai_night_worker.lock")
 
 _lock_fp = None
 MAX_RUNTIME_HOURS = 5.8
+SOURCE_LOCK_LIMIT = 250
+SOURCE_LOCK_BUDGET_SECONDS = 15 * 60
 START_TIME = 0.0
 
 
@@ -133,7 +123,7 @@ def release_single_instance_lock():
 
 
 def is_timeout():
-    """夜间时间窗口保护：超过最大运行时间（7.5小时）自动优雅退出，绝不把任务拖入白天。"""
+    """在工序/条目边界检查 5.8 小时预算；单次外部请求另有超时。"""
     if START_TIME > 0 and (time.time() - START_TIME) > MAX_RUNTIME_HOURS * 3600:
         return True
     return False
@@ -160,12 +150,16 @@ def log(msg):
 def check_and_yield_for_playback():
     """观影感知与智能避让机制：若检测到家庭成员正在观影，立即深度休眠让路。"""
     while True:
+        if is_timeout():
+            return
         try:
             req = urllib.request.Request(f"{vod_cfg.JELLYFIN2_API}/Sessions")
             if vod_cfg.JELLYFIN2_KEY:
                 req.add_header("Authorization", f'MediaBrowser Token="{vod_cfg.JELLYFIN2_KEY}"')
             with urllib.request.urlopen(req, timeout=3) as resp:
-                sessions = json.loads(resp.read().decode("utf-8"))
+                sessions = json.loads(resp.read(2 * 1024**2).decode("utf-8"))
+                if not isinstance(sessions, list):
+                    raise ValueError('invalid sessions response')
                 active_playing = []
                 for s in sessions:
                     item = s.get("NowPlayingItem")
@@ -178,7 +172,11 @@ def check_and_yield_for_playback():
                     time.sleep(30)
                     continue
         except Exception:
-            pass
+            # Missing protection data is not proof that the library is idle.
+            # Retry within the same time budget, without modifying metadata.
+            log("无法核对 Jellyfin 播放状态，暂缓本轮条目处理，30 秒后重试")
+            time.sleep(30)
+            continue
         break
 
 
@@ -203,7 +201,7 @@ init_state_db()
 
 def is_already_processed(task_type, item_key):
     try:
-        con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True)
+        con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=2)
         cur = con.cursor()
         r = cur.execute("SELECT 1 FROM processed_records WHERE task_type=? AND item_key=? AND status='done' LIMIT 1",
                         (task_type, item_key)).fetchone()
@@ -227,85 +225,92 @@ def mark_processed(task_type, item_key, model_used=""):
 
 
 ACTIVE_FREE_MODELS = []
-# 探测冷却：免费模型全不可用时，绝不能让 call_llm 每次调用都重探（历史上 2 秒一轮空转数千次）
+# 探测冷却：主力模型不可用时，禁止每次 call_llm 都重探造成阻塞死循环
 _last_probe_ts = 0.0
 PROBE_RETRY_SECONDS = 600
 
 
 def probe_free_models():
-    """启动时动态探针：轻量测出当前处于限时免费状态的最新顶级模型 (零积分消耗)
+    """启动时动态探针：轻量检测主力模型在线状态。
 
     失败时保留上一次探测结果，不清空 ACTIVE_FREE_MODELS——否则 call_llm 的
     `if not ACTIVE_FREE_MODELS` 会触发逐个 item 重探，形成阻塞式死循环。
     """
     global ACTIVE_FREE_MODELS, _last_probe_ts
     _last_probe_ts = time.time()
-    log("正在动态探测当前处于限时免费状态的最新顶级模型...")
+    api_key = _load_cliproxy_token()
+    log("正在动态探测当前主力模型可用性...")
     active = []
     for m in FREE_MODELS:
         payload = {
             "model": m,
             "messages": [{"role": "user", "content": "1+1="}],
-            "max_tokens": 5
+            "max_tokens": 16,
         }
+        if "deepseek" in m:
+            payload["reasoning_effort"] = "none"
         req = urllib.request.Request(f"{AI_BASE_URL.rstrip('/')}/chat/completions",
                                      data=json.dumps(payload).encode("utf-8"),
                                      method="POST")
-        if AI_API_KEY:
-            req.add_header('Authorization', f'Bearer {AI_API_KEY}')
+        if api_key:
+            req.add_header('Authorization', f'Bearer {api_key}')
         req.add_header('Content-Type', 'application/json')
         try:
-            with urllib.request.urlopen(req, timeout=4) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 msg = data.get('choices', [{}])[0].get('message', {})
-                txt = (msg.get('content') or msg.get('reasoning_content') or "").strip()
+                txt = (msg.get('content') or "").strip()
                 if txt:
                     active.append(m)
         except Exception:
             pass
     if active:
         ACTIVE_FREE_MODELS = active
-        log(f"动态探针锁定当前可用免费顶级模型 (0积分): {active}")
+        log(f"动态探针锁定当前可用主力模型: {active}")
     elif ACTIVE_FREE_MODELS:
-        log(f"动态探针警告：本次未探到可用免费模型，保留上次结果 {ACTIVE_FREE_MODELS}")
+        log(f"动态探针警告：本次未探到可用主力模型，保留上次结果 {ACTIVE_FREE_MODELS}")
     else:
-        log("动态探针警告：当前免费模型暂不可用，将自动使用最新版 DeepSeek 极低积分主力梯队")
+        log("动态探针警告：主力模型探测失败，将自动走容灾路由梯队")
     return active
 
 
-def call_llm(prompt, system_prompt="你是一位专业电影评论家与资料整理专家。请用中文回答，格式结构严谨，文风优雅专业。", max_tokens=800):
-    """三级智能容灾调度路由器：
-    1. 动态探针锁定的当前限时免费顶级模型 (deepseek-v4.1-flash / step-5 等，0 积分)
-    2. 最新版 DeepSeek 国内版模型 (积分极低)
-    3. 用户 OAuth 授权的 Gemini 3.8 终极兜底 (基本不用，全崩才触发)
-    """
+def call_llm(prompt, system_prompt="你是一位专业电影评论家与资料整理专家。请用中文回答，格式结构严谨，文风优雅专业。", max_tokens=2048, reasoning_effort="high"):
+    """分级容灾调度：主力 cn/deepseek-v4.1-flash -> 备选重试 -> gemini-3.8-flash-high 兜底。"""
     global ACTIVE_FREE_MODELS
     # 仅在列表为空且已过冷却期时才重探；探测失败后直接走梯队 2，不阻塞主流程
     if not ACTIVE_FREE_MODELS and (time.time() - _last_probe_ts) > PROBE_RETRY_SECONDS:
         probe_free_models()
 
-    # 梯队 1: 当前确认可用的限时免费顶级模型 (0 积分)
+    tried = set()
+    kw = {"max_tokens": max_tokens}
+    if reasoning_effort != "high":
+        kw["reasoning_effort"] = reasoning_effort
+    # 梯队 1: 当前确认可用的主力模型
     for m in ACTIVE_FREE_MODELS:
-        res = _request_chat(m, prompt, system_prompt, max_tokens=max_tokens)
+        tried.add(m)
+        res = _request_chat(m, prompt, system_prompt, **kw)
         if res:
-            return f"{m}(免费)", res
+            return f"{m}(主力)", res
 
-    # 梯队 2: 最新版 DeepSeek 极低积分主力模型
+    # 梯队 2: 低积分备选模型
     for m in LOW_COST_MODELS:
-        res = _request_chat(m, prompt, system_prompt, max_tokens=max_tokens)
+        if m in tried:
+            continue
+        tried.add(m)
+        res = _request_chat(m, prompt, system_prompt, **kw)
         if res:
-            return f"{m}(极低积分)", res
+            return f"{m}(备选)", res
 
     # 梯队 3: 终极 OAuth 授权兜底 (用户 Google OAuth，绝不轻易使用)
     for m in OAUTH_FALLBACK_MODELS:
-        res = _request_chat(m, prompt, system_prompt, max_tokens=max_tokens)
+        res = _request_chat(m, prompt, system_prompt, **kw)
         if res:
             return f"{m}(OAuth终极兜底)", res
 
     return None, None
 
 
-def _request_chat(model_name, prompt, system_prompt, max_tokens=800):
+def _request_chat(model_name, prompt, system_prompt, max_tokens=2048, reasoning_effort="high"):
     payload = {
         "model": model_name,
         "messages": [
@@ -315,17 +320,20 @@ def _request_chat(model_name, prompt, system_prompt, max_tokens=800):
         "max_tokens": max_tokens,
         "temperature": 0.7
     }
+    if "deepseek" in model_name and reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+    api_key = _load_cliproxy_token()
     req = urllib.request.Request(f"{AI_BASE_URL.rstrip('/')}/chat/completions",
                                  data=json.dumps(payload).encode("utf-8"),
                                  method="POST")
-    if AI_API_KEY:
-        req.add_header('Authorization', f'Bearer {AI_API_KEY}')
+    if api_key:
+        req.add_header('Authorization', f'Bearer {api_key}')
     req.add_header('Content-Type', 'application/json')
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=35) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             msg = data.get('choices', [{}])[0].get('message', {})
-            content = (msg.get('content') or msg.get('reasoning_content') or "").strip()
+            content = (msg.get('content') or "").strip()
             return content if content else None
     except Exception:
         return None
@@ -433,6 +441,8 @@ def run_library_integrity_check():
             log(f"达到夜间最大运行时间窗口，巡检中断退出。")
             break
         check_and_yield_for_playback()
+        if is_timeout():
+            break
 
         # 检查电影或电视剧的根目录图片
         if "movie.nfo" in files or "tvshow.nfo" in files:
@@ -475,23 +485,29 @@ def run_library_integrity_check():
 # 工序 1.8: 全库片源存活健康度、失效自动换新与夸克真 4K 前置预检锁源 (Pre-Flight Lock)
 # ==============================================================================
 def run_vod_source_audit_and_lock():
-    log("=== [工序 1.8] 全库片源存活性健康巡检、失效自动换新与夸克真 4K 锁源 ===")
+    log("=== [工序 1.8] 轮转检查锁源根目录、目标文件与 4K 名称提示 ===")
     try:
         from quark_vod.auditor import VodAuditor
         auditor = VodAuditor()
-        # 1. 存量已锁源健康体检：发现原作者取消或失效的，立即自动调用多源矩阵打捞全新活源替换！
-        heal_stats = auditor.check_and_heal_locked_shares(yield_fn=check_and_yield_for_playback, timeout_fn=is_timeout)
-        log(f"存量锁源自愈完成: 检查={heal_stats.get('total')}, 依然健康={heal_stats.get('healthy')}, 成功自动换新4K={heal_stats.get('healed_4k')}, 换新高清={heal_stats.get('healed_hd')}")
+        # Root liveness must not consume the whole night before exact-file
+        # audits start. The local deadline stops subsequent scheduling; an
+        # already started network probe/heal can finish after it.
+        root_deadline = time.monotonic() + SOURCE_LOCK_BUDGET_SECONDS
+        def root_timeout():
+            return is_timeout() or time.monotonic() >= root_deadline
+        heal_stats = auditor.check_and_heal_locked_shares(
+            limit=SOURCE_LOCK_LIMIT, yield_fn=check_and_yield_for_playback, timeout_fn=root_timeout)
+        log(f"存量锁源检查结束: 实查={heal_stats.get('checked')}/{heal_stats.get('total')}, 分享可读={heal_stats.get('healthy')}, 未确认={heal_stats.get('unknown')}, 换源4K标注={heal_stats.get('healed_4k')}, 其他标注={heal_stats.get('healed_hd')}")
 
-        # 2. 全库未锁源与新片全量打捞锁源
+        # The file phase retains the overall night budget and its own cursor.
         stats = auditor.audit_entire_library(yield_fn=check_and_yield_for_playback, timeout_fn=is_timeout)
-        log(f"全库片源 4K 锁源完成: 4K锁源={stats.get('valid_4k')}, 高清={stats.get('valid_hd')}, 无有效网盘源={stats.get('no_source')}")
+        log(f"片源审计结束: 实查={stats.get('checked')}/{stats.get('total_shows')}, 全目标4K标注={stats.get('valid_4k')}, 其他完整覆盖={stats.get('valid_hd')}, 未确认完整覆盖={stats.get('no_source')}")
 
-        # 3. 网盘点播目录伪装视频智能巡检与格式扶正
+        # 3. 已转存资源计数（定时任务不重命名云端文件）
         total_fixed = auditor.fix_disguised_vod_files()
-        log(f"网盘伪装视频巡检与格式扶正完成，当前就绪直链视频: {total_fixed} 个")
+        log(f"已转存记录数: {total_fixed} 个")
     except Exception as e:
-        log(f"全库片源审计执行异常: {e}")
+        log(f"片源审计执行异常: {type(e).__name__}")
 
 
 # ==============================================================================
@@ -504,7 +520,7 @@ def _sync_nfo_to_jellyfin2(nfo_path, final_plot, all_tags):
     try:
         from contextlib import closing
         item_dir = os.path.dirname(nfo_path).replace(vod_cfg.CINEMA2_DIR, "/cinema2")
-        with closing(sqlite3.connect(f"file:{vod_cfg.JELLYFIN2_DB}?mode=ro&immutable=1", uri=True)) as con:
+        with closing(sqlite3.connect(f"file:{vod_cfg.JELLYFIN2_DB}?mode=ro", uri=True, timeout=2)) as con:
             cur = con.cursor()
             if nfo_path.endswith("tvshow.nfo"):
                 row = cur.execute(
@@ -569,6 +585,8 @@ def run_refine_movie_plots_and_tags():
             log(f"达到夜间最大运行时间窗口 ({MAX_RUNTIME_HOURS}小时)，工序 2 自动优雅收工退出。")
             break
         check_and_yield_for_playback()
+        if is_timeout():
+            break
         rel_key = os.path.relpath(nfo_path, cinema2)
         if is_already_processed("refine_nfo", rel_key):
             continue
@@ -608,7 +626,7 @@ def run_refine_movie_plots_and_tags():
 }}
 注意：情绪标签请使用如：高智商犯罪、治愈下饭、硬核科幻、绝望反转、赛博朋克、双向奔赴等接地气且高精度的词汇。"""
 
-        model_name, reply = call_llm(prompt)
+        model_name, reply = call_llm(prompt, max_tokens=2048, reasoning_effort="high")
         if not reply:
             time.sleep(2)
             continue
@@ -662,7 +680,7 @@ def run_enrich_peoples_knowledge():
         return
 
     from contextlib import closing
-    with closing(sqlite3.connect(f"file:{jf_db}?mode=ro&immutable=1", uri=True)) as con:
+    with closing(sqlite3.connect(f"file:{jf_db}?mode=ro", uri=True, timeout=2)) as con:
         cur = con.cursor()
         # 查询 BaseItems 中所有人物条目，并按参演作品热度降序排序
         people_rows = cur.execute("""
@@ -698,6 +716,8 @@ def run_enrich_peoples_knowledge():
             log(f"达到夜间最大运行时间窗口 ({MAX_RUNTIME_HOURS}小时)，工序 3 自动优雅收工退出。")
             break
         check_and_yield_for_playback()
+        if is_timeout():
+            break
 
         batch = pending_items[i : i + BATCH_SIZE]
         batch_input = [{"id": it["id"], "name": it["name"]} for it in batch]
@@ -716,7 +736,7 @@ def run_enrich_peoples_knowledge():
   }}
 ]"""
 
-        model_name, reply = call_llm(prompt, max_tokens=1500)
+        model_name, reply = call_llm(prompt, max_tokens=3072, reasoning_effort="medium")
         if not reply:
             time.sleep(2.0)
             continue
@@ -798,6 +818,8 @@ def run_clean_all_subtitles():
             log(f"达到夜间最大运行时间窗口 ({MAX_RUNTIME_HOURS}小时)，工序 4 自动优雅收工退出。")
             break
         check_and_yield_for_playback()
+        if is_timeout():
+            break
         rel_key = os.path.relpath(sub_path, cinema2)
         if is_already_processed("clean_sub", rel_key):
             continue
@@ -817,7 +839,7 @@ def run_clean_all_subtitles():
             sample_lines = [l.strip() for l in lines if any(kw in l.lower() for kw in ad_kw)][:10]
             prompt = f"以下是从影视字幕中提取的可疑对白段落，请辨别哪些是真正的压制/商业广告（如QQ群、公众号、赌场、网址），哪些是剧情原版对白。仅输出被确认为违规广告的完整台词文本（每行一条）：\n" + "\n".join(sample_lines)
 
-            model_name, reply = call_llm(prompt, system_prompt="你是一位影视字幕质检专家，请精准识别并剔除商业导流广告。")
+            model_name, reply = call_llm(prompt, system_prompt="你是一位影视字幕质检专家，请精准识别并剔除商业导流广告。", max_tokens=2048, reasoning_effort="low")
             if reply:
                 ad_lines_to_remove = set([l.strip() for l in reply.split("\n") if l.strip()])
                 new_lines = [l for l in lines if l.strip() not in ad_lines_to_remove]
@@ -841,26 +863,30 @@ def main():
         log("检测到已有 AI 批处理实例正在运行中，当前进程自动退出，坚决杜绝多实例重复运行。")
         sys.exit(0)
 
+    import fcntl
+    maintenance = open(os.path.join(BASE_DIR, "data", "vod_maintenance.lock"), "a+")
+    try:
+        fcntl.flock(maintenance, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        maintenance.close()
+        release_single_instance_lock()
+        log('其他影院维护任务尚未结束，跳过本次夜间批处理')
+        return
     START_TIME = time.time()
     try:
         log("====================================================================")
-        log("家庭影院通宵 AI 深度批处理引擎启动 (智能锁定限时免费顶级模型 / Gemini 3.8 终极兜底)")
+        log("家庭影院通宵 AI 深度批处理引擎启动 (cn/deepseek-v4.1-flash / gemini-3.8-flash-high 兜底)")
         log("====================================================================")
 
-        # 启动时执行动态轻量探针，锁定当前可用的限时免费顶级模型 (0 积分)
+        # 启动时轻量探测主力模型在线状态
         probe_free_models()
 
         # 依次执行各实质性工序（重心彻底聚焦：点播 4K 秒播、分类纠偏与死链自愈）
         run_yesterday_playback_selfheal()
         run_library_integrity_check()
 
-        # 核心工序 A: 全库分类精准度治理与重名形态消歧（如《凡人修仙传》真人剧 vs 动画版）
-        try:
-            import category_governor
-            category_governor.run_governance(dry_run=False)
-        except Exception as e:
-            log(f"分类与重名消歧治理异常: {e}")
-
+        # Title/category migrations require a separate reviewed operation;
+        # scheduled work must not rename active library identities.
         # 核心工序 B: 全库片源存活性健康巡检、死链自动换新与夸克真 4K 锁源 (Pre-Flight Lock)
         run_vod_source_audit_and_lock()
 
@@ -876,10 +902,12 @@ def main():
 
         elapsed_hours = (time.time() - START_TIME) / 3600.0
         log(f"====================================================================")
-        log(f"通宵 AI 深度重构与自愈任务全量圆满完成！总计耗时: {elapsed_hours:.2f} 小时")
-        log("内存与系统资源已全量释放，独显全时保持 D3cold 挂起断电。")
+        result = "达到时间预算，未处理条目留待后续轮次" if is_timeout() else "工序调度结束；各工序结果以上方统计为准"
+        log(f"夜间任务结束：{result}；耗时 {elapsed_hours:.2f} 小时")
         log("====================================================================")
     finally:
+        fcntl.flock(maintenance, fcntl.LOCK_UN)
+        maintenance.close()
         release_single_instance_lock()
 
 

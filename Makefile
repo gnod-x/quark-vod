@@ -1,8 +1,11 @@
-.PHONY: up down restart build logs status test sync
+.PHONY: up down restart build logs status test sync sync-jobs test-offline test-ui check-sync verify-runtime
 
 sync:
 	@cp -f /home/dong/projects/quark-vod/app/quark_vod/*.py /home/dong/projects/hometheater/scripts/quark_vod/
 	@echo "[OK] Synced quark_vod modules to hometheater/scripts/quark_vod"
+
+sync-jobs:
+	@set -e; for name in ai_night_worker category_governor daily_update_and_prune people_manager purge_orphan_metadata tmdb_populate vod_search_and_add; do cp /home/dong/projects/hometheater/scripts/$$name.py app/jobs/$$name.py; done
 
 up:
 	docker compose up -d
@@ -21,18 +24,29 @@ logs:
 
 status:
 	@docker ps --filter "name=quark-vod" --filter "name=jellyfin2" --filter "name=openlist"
-	@echo "\n--- 8099 Capability ---"
-	@curl -s http://127.0.0.1:8099/capability | python3 -m json.tool
+	@curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8099/health | python3 -m json.tool
 
-test:
-	@echo "=== Running Quark-VOD Engine Verification Suite ==="
-	@docker compose config >/dev/null && echo "[PASS] 1. quark-vod compose syntax valid"
-	@[ "$$(cat /sys/bus/pci/devices/0000:01:00.0/power_state)" = "D3cold" ] && echo "[PASS] 2. dGPU is D3cold" || (echo "[FAIL] 2. dGPU woken up!" && exit 1)
-	@curl -sf http://127.0.0.1:8099/health >/dev/null && echo "[PASS] 3. 8099 /health is online"
-	@curl -sf http://127.0.0.1:8099/admin >/dev/null && echo "[PASS] 4. 8099 /admin Whitebox Console reachable"
-	@curl -sf http://127.0.0.1:8099/docs >/dev/null && echo "[PASS] 5. 8099 /docs Swagger UI reachable"
-	@python3 -c "import urllib.request, json, sys; d=json.loads(urllib.request.urlopen('http://127.0.0.1:8099/capability').read()); print('[PASS] 6. Capability ready:', d) if d.get('ready') else sys.exit(1)"
-	@python3 -m py_compile app/main.py app/quark_vod/*.py app/jobs/*.py && echo "[PASS] 7. All Python modules compile cleanly"
-	@diff -q /home/dong/projects/quark-vod/app/quark_vod/strm_manager.py /home/dong/projects/hometheater/scripts/quark_vod/strm_manager.py >/dev/null && echo "[PASS] 8. quark_vod dual-directory in sync" || (echo "[FAIL] 8. quark_vod drift detected!" && exit 1)
-	@python3 -I tests/test_name_parser.py >/tmp/name_parser_test.log 2>&1 && echo "[PASS] 9. name_parser offline regression (red-line 7/8 golden samples)" || (echo "[FAIL] 9. name_parser regression!" && tail -20 /tmp/name_parser_test.log && exit 1)
-	@for f in $$(ls app/quark_vod/*.py); do diff -q $$f /home/dong/projects/hometheater/scripts/quark_vod/$$(basename $$f) >/dev/null || (echo "[FAIL] 10. drift: $$f" && exit 1); done; echo "[PASS] 10. all quark_vod modules zero drift"
+test: test-offline check-sync
+
+test-ui:
+	@node tests/test_portal_ui.js
+
+test-offline:
+	@python3 -I tests/test_name_parser.py
+	@python3 -I tests/test_search_quality.py
+	@python3 -I tests/test_portal_vod.py
+	@python3 -I tests/test_stream_and_state.py
+	@python3 -I tests/test_playback_coordinator.py
+	@python3 -I tests/test_probe_wrapper.py
+	@python3 -I tests/test_media_cache.py
+	@python3 -I tests/test_sync_check.py
+	@python3 -I ../hometheater/scripts/tests/test_daily_prune_and_populate.py
+	@python3 -I tests/verify_tmdb_populate.py --offline-fixture
+	@python3 -I ../hometheater/scripts/tests/test_ai_worker_concurrency.py
+	@python3 -I ../hometheater/scripts/tests/test_ai_extractor.py
+
+check-sync:
+	@python3 -I tests/check_sync.py
+
+verify-runtime:
+	@python3 -I tests/verify_runtime.py --output /home/dong/.agent-context/verification/cinema-runtime-latest.json

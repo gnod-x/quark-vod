@@ -15,6 +15,9 @@ strm 生命周期管理
 """
 
 import os
+import tempfile
+import stat
+import urllib.parse
 import queue
 import threading
 import time
@@ -40,7 +43,7 @@ def _do_jellyfin_refresh_sync(strm_path: str):
         if not strm_path or not os.path.isfile(strm_path):
             return
         container_path = strm_path.replace(config.CINEMA2_DIR, "/cinema2")
-        with closing(sqlite3.connect(f"file:{config.JELLYFIN2_DB}?mode=ro&immutable=1", uri=True)) as con:
+        with closing(sqlite3.connect(f"file:{config.JELLYFIN2_DB}?mode=ro", uri=True, timeout=2)) as con:
             cur = con.cursor()
             row = cur.execute("SELECT Id FROM BaseItems WHERE Path = ? LIMIT 1", (container_path,)).fetchone()
         if not row or not row[0]:
@@ -94,6 +97,43 @@ def strm_path_for(cat, title, season, episode):
     return os.path.join(d, f)
 
 
+def library_search_identity(cat, title, season):
+    """Use the exact work's NFO for search, leaving its storage key unchanged."""
+    import re
+    from pathlib import Path
+    import xml.etree.ElementTree as ET
+    from .identity import normalize, split_title
+
+    if any(not part or part in ('.', '..') or '/' in part or chr(92) in part for part in (cat, title)):
+        return title, ()
+    root = Path(config.CINEMA2_DIR).absolute()
+    kind = 'tvshow' if season else 'movie'
+    path = root / cat / title / (kind + '.nfo')
+    try:
+        if path.resolve() != path or not path.is_file():
+            return title, ()
+        with path.open('rb') as stream:
+            raw = stream.read(128 * 1024 + 1)
+        if len(raw) > 128 * 1024:
+            return title, ()
+        metadata = ET.fromstring(raw)
+    except (OSError, ValueError, RuntimeError, ET.ParseError):
+        return title, ()
+
+    name, folder_year = split_title(title)
+    nfo_name, nfo_title_year = split_title(metadata.findtext('title'))
+    nfo_name = normalize(re.sub(r'[\\/:*?"<>|\r\n\t]', ' ', nfo_name)).rstrip('.')
+    if metadata.tag != kind or nfo_name.casefold() != name.casefold():
+        return title, ()
+    year = normalize(metadata.findtext('year'))
+    years = {y for y in (folder_year, nfo_title_year, year) if re.fullmatch(r'(?:19|20)\d{2}', y)}
+    if len(years) > 1:
+        return title, ()
+    original = normalize(metadata.findtext('originaltitle'))
+    aliases = (original,) if 0 < len(original) <= 120 and original.casefold() != name.casefold() else ()
+    return f'{name} ({next(iter(years))})' if years else title, aliases
+
+
 def scan_and_register():
     """扫描 cinema2，把 strm 登记到 strm_map（供回写定位）。
 
@@ -115,7 +155,7 @@ def scan_and_register():
             if not os.path.isdir(tdir):
                 continue
             # 去掉 " (2026)" 年份后缀，得到纯 title
-            title = re.sub(r"\s*\(\d{4}\)\s*$", "", title_dir).strip()
+            title = title_dir.strip()
 
             # 电影：目录下直接有 .strm
             for fn in sorted(os.listdir(tdir)):
@@ -135,7 +175,7 @@ def scan_and_register():
                 except (IndexError, ValueError):
                     continue
                 for fn in sorted(os.listdir(sdir)):
-                    m = re.search(r"- S(\d{2})E(\d{2})\.strm$", fn)
+                    m = re.search(r"- S(\d{1,3})E(\d{1,4})\.strm$", fn)
                     if not m:
                         continue
                     episode = int(m.group(2))
@@ -184,6 +224,12 @@ def parse_live_remote_path(content):
         return None
     try:
         parsed = urllib.parse.urlparse(content)
+        if parsed.path == '/play':
+            remote = (urllib.parse.parse_qs(parsed.query).get('r') or [''])[0]
+            remote = config.write_path(remote)
+            if remote.startswith(config.QUARK_VOD_ROOT + '/') and '..' not in remote.split('/'):
+                return remote
+            return None
         # clean 代理：解包内层真实直链（内层 url 可能已被 quote 一层）
         if parsed.path.rstrip("/") == "/clean" or parsed.path.endswith("/clean"):
             inner = (urllib.parse.parse_qs(parsed.query).get("url") or [""])[0]
@@ -226,6 +272,21 @@ def parse_pending_params(content):
         return None
 
 
+def _atomic_write(path, content):
+    previous = os.stat(path) if os.path.exists(path) else None
+    fd, temporary = tempfile.mkstemp(prefix='.strm-', dir=os.path.dirname(path))
+    try:
+        os.fchmod(fd, stat.S_IMODE(previous.st_mode) if previous else 0o644)
+        if previous and os.geteuid() == 0:
+            os.fchown(fd, previous.st_uid, previous.st_gid)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write(content + '\n')
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def write_live(path, direct_url, force=False):
     """把 strm 写成直链（原子写入）。若内容相同则跳过。
 
@@ -246,17 +307,14 @@ def write_live(path, direct_url, force=False):
             # 否则 clean→direct 的画质升级会被误判为降级而拒绝
             # （唐宫奇案：1080P clean 源挡住了 4K 臻彩 direct 源）。
             # 只有 CMS 第三方切片才应被网盘源覆盖，反之不允许。
-            if "/clean?" in u or "5244/d/" in u:
+            if "/clean?" in u or "/play?" in u or "5244/d/" in u:
                 return 2
             if ".m3u8" in u:
                 return 1
             return 0
         if _rank(direct_url) < _rank(cur):
             return False
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(direct_url + "\n")
-    os.replace(tmp, path)
+    _atomic_write(path, direct_url)
     return True
 
 
@@ -279,106 +337,57 @@ def restore_pending(path, cat, title, season, episode):
     cur = read_strm(path)
     if is_pending(cur):
         return False
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(url + "\n")
-    os.replace(tmp, path)
+    _atomic_write(path, url)
     return True
 
 
 def activate(cat, title, season, episode, direct_url, background_batch=False):
-    """转存成功后：登记 strm_map + 写 live + 同步 DB 记录状态。
-
-    具备工业级标题脱水与四级自适应定位容错能力：
-      1) 统一剥离 Unicode 控制符与 (2025) 年份后缀
-      2) 候选标题双向索引 (clean_title + raw_title)
-      3) 自适应匹配跨专区多重 strm
-
-    2026-10-21 修复（152 条 DB 滞后导致重复转存）：原实现只写 strm 文件与
-    strm_map，DB 状态完全依赖调用方 upsert。而 4 个调用方写入的 title 用的是
-    【原始带年份名】（如「霸王别姬 (1993)」），selfheal 作废时又按 remote_path
-    维度匹配，两者对不上 → 出现「strm 是活链、transfers 却是 cleaned/failed」，
-    `find_done_transfer` 查不到 → 下次点播重复跑 8~12s 搜索转存。
-    现在由 activate() 自己把该 (cat,title,season,episode) 的记录覆盖为 done，
-    覆盖时同时兼容带年份与无年份两种 title 形态，确保 DB 永不落后于磁盘。
-    """
-    from .search import sanitize_title
-    clean_title = sanitize_title(title)
-    title_candidates = [t for t in [clean_title, title] if t]
-    path = None
-
-    for t_cand in title_candidates:
-        # 1) strm_map 精确（cat+title+season+episode）
-        try:
-            p = db.get_strm_path(cat, t_cand, season, episode)
-            if p and os.path.isfile(p):
-                path = p
-                break
-        except Exception:
-            pass
-        # 2) strm_map 仅按 title 查（忽略脏 cat），但优先同专区
-        p = _strm_path_by_title(t_cand, season, episode, cat=cat)
-        if p and os.path.isfile(p):
-            path = p
-            break
-        # 3) 路径推导
-        p = strm_path_for(cat, t_cand, season, episode)
-        if p and os.path.isfile(p):
-            path = p
-            break
-        # 4) 模糊查找
-        p = _fuzzy_find(cat, t_cand, season, episode)
-        if p and os.path.isfile(p):
-            path = p
-            break
-
-    if not path:
-        raise FileNotFoundError(f"找不到 strm: {cat}/{title} S{season}E{episode}")
-
-    try:
-        db.save_strm_map(cat, clean_title, season, episode, path)
-        if clean_title != title:
-            db.save_strm_map(cat, title, season, episode, path)
-    except Exception:
-        pass
-
-    # 自动文件头混淆嗅探与透明清洗
-    try:
-        direct_url = cleaner.clean_url_if_obfuscated(direct_url)
-    except Exception:
-        pass
-
-    changed = write_live(path, direct_url)
-    trigger_jellyfin_refresh_item(path, throttled=background_batch)
-
-    # 同一部片可能存在于多个专区（实测《霸王别姬》同时在 国产电影/ 与 港台经典/），
-    # 必须把【所有】专区下的 strm 一并回写。
-    # 2026-10-20 修复跨专区污染：必须通过 _same_work 校验同作品（片名+年份），
-    # 严禁把《凡人修仙传》(2020 动漫) 的直链写进《凡人修仙传 (2025)》(真人剧)。
-    seen_paths = {os.path.abspath(path)}
-    for t_cand in title_candidates:
-        for p in _all_strm_paths_by_title(t_cand, season, episode):
-            ap = os.path.abspath(p)
-            if ap in seen_paths:
-                continue
-            if not _same_work(path, p):
-                continue
-            seen_paths.add(ap)
-            try:
-                if write_live(p, direct_url):
-                    trigger_jellyfin_refresh_item(p, throttled=True)
-            except Exception:
-                pass
-
-    # ── DB 覆盖：把该影片该集的记录同步为 done（2026-10-21）──
-    # strm 已确为活链，DB 必须跟上，否则 find_done_transfer 落空导致重复转存。
-    # 覆盖顺序：先精确四字段，再退化到 (title,season,episode) 忽略 cat 的脏记录，
-    # 两种 title 形态（带/不带年份）都试，确保历史脏数据被一并纠正。
-    _sync_transfer_done(cat, title_candidates, season, episode)
+    """Activate only paths whose folder identity agrees with the requested work."""
+    from .identity import same_title, media_kind
+    actual_title = db.library_title(cat, title, season, episode)
+    rows = db._conn().execute(
+        'SELECT cat,title,strm_path FROM strm_map WHERE season=? AND episode=?',
+        (season, episode)).fetchall()
+    paths = set()
+    for row in rows:
+        path = row['strm_path']
+        if not os.path.isfile(path):
+            continue
+        import re
+        episode_hint = re.search(r'S(\d+)E(\d+)\.strm$', os.path.basename(path))
+        if episode_hint and tuple(map(int, episode_hint.groups())) != (season, episode):
+            continue
+        kind, name, year = _work_identity(path)
+        path_title = f'{name} ({year})' if year else name
+        if kind == media_kind(cat, season) and same_title(actual_title, path_title):
+            paths.add(path)
+    # Support newly generated files not yet registered by a background scan.
+    fallback = _fuzzy_find(cat, actual_title, season, episode)
+    if fallback:
+        paths.add(fallback)
+    if not paths:
+        raise FileNotFoundError(f'找不到同一作品的 STRM: {cat}/{title} S{season}E{episode}')
+    remote = parse_live_remote_path(direct_url)
+    changed = False
+    for path in sorted(paths):
+        url = direct_url
+        if remote:
+            # Every new playback returns through the resolver. Deleting a leaf
+            # or expiring a save can no longer leave a permanent direct dead link.
+            rel = os.path.relpath(path, config.CINEMA2_DIR).split(os.sep)
+            query = urllib.parse.urlencode({'cat':rel[0], 't':rel[1], 's':season, 'e':episode, 'r':remote})
+            url = config.PENDING_BASE_URL + '/play?' + query
+        wrote = write_live(path, url)
+        changed = changed or wrote
+        if wrote:
+            trigger_jellyfin_refresh_item(path, throttled=background_batch)
+    primary = next((p for p in sorted(paths) if os.path.relpath(p, config.CINEMA2_DIR).split(os.sep)[0] == cat), sorted(paths)[0])
+    db.save_strm_map(cat, title, season, episode, primary)
+    _sync_transfer_done(cat, [title], season, episode, parse_live_remote_path(direct_url))
     return changed
 
 
-def _sync_transfer_done(cat, title_candidates, season, episode):
+def _sync_transfer_done(cat, title_candidates, season, episode, remote_path):
     """把 (cat, title, season, episode) 对应的 transfers 记录覆盖为 done。
 
     2026-10-21 新增：activate() 的 DB 自愈步骤。处理三类历史脏数据：
@@ -389,25 +398,29 @@ def _sync_transfer_done(cat, title_candidates, season, episode):
     仅打印提示交由调用方判断。
     """
     import time as _time
+    if not remote_path:
+        return
+    remote_candidates = (config.write_path(remote_path), config.play_path(remote_path))
     try:
         con = db._conn()
         now_ts = int(_time.time())
         touched = 0
         for t_cand in title_candidates:
             cur = con.execute(
-                "SELECT id FROM transfers WHERE cat=? AND title=? AND season=? AND episode=?",
-                (cat, t_cand, season, episode))
+                "SELECT id FROM transfers WHERE cat=? AND title=? AND season=? AND episode=? "
+                "AND remote_path IN (?,?)",
+                (cat, t_cand, season, episode, *remote_candidates))
             ids = [r["id"] for r in cur.fetchall()]
             if not ids:
                 # 退化：忽略 cat 与 title 年份形态，只按 season/episode + 名称包含
                 cur = con.execute(
                     "SELECT id, title FROM transfers WHERE season=? AND episode=? "
-                    "AND (title=? OR title=?)",
-                    (season, episode, t_cand, t_cand))
+                    "AND title=? AND remote_path IN (?,?)",
+                    (season, episode, t_cand, *remote_candidates))
                 ids = [r["id"] for r in cur.fetchall()]
             for tid in ids:
                 con.execute(
-                    "UPDATE transfers SET status='done', error=NULL, updated_at=? WHERE id=?",
+                    "UPDATE transfers SET status='done', error=NULL, updated_at=? WHERE id=? AND status<>'done'",
                     (now_ts, tid))
                 touched += 1
         if touched:
@@ -535,6 +548,7 @@ def _fuzzy_find(cat, title, season, episode):
 
     2026-10-16 修复：目录名与文件名存在年份差异时自适应匹配。
     """
+    import re
     from .search import sanitize_title
     catdir = os.path.join(config.CINEMA2_DIR, cat)
     if not os.path.isdir(catdir):
@@ -543,7 +557,8 @@ def _fuzzy_find(cat, title, season, episode):
 
     def _match(d):
         dn = sanitize_title(d)
-        return bool(core) and (dn == core or core in dn or dn in core)
+        from .identity import same_title
+        return same_title(title, d)
 
     cands = [d for d in os.listdir(catdir)
              if os.path.isdir(os.path.join(catdir, d)) and _match(d)]
@@ -558,7 +573,7 @@ def _fuzzy_find(cat, title, season, episode):
             if os.path.isdir(d):
                 target_token = f"S{season:02d}E{episode:02d}"
                 for fn in sorted(os.listdir(d)):
-                    if fn.endswith(".strm") and target_token in fn:
+                    if fn.endswith(".strm") and re.search(rf'S0*{season}E0*{episode}\.strm$', fn):
                         fp = os.path.join(d, fn)
                         if os.path.isfile(fp):
                             return fp
