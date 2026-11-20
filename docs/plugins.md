@@ -1,15 +1,18 @@
-# 搜索插件与热重载
+# 搜索插件与存储边界
 
-Quark-VOD 不内置公共搜索站地址。部署者通过 `VOD_SEARCH_CONFIG` 指定一份
-JSON 文件，文件只选择已经安装的 provider 和它们的 HTTP 端点；JSON 本身不
-包含 Python、脚本或远程代码。没有配置文件或没有启用节点时，服务仍可启动，
-但搜索报告会是 `configured=false`、`partial=true`，这表示当前部署没有完成
-搜索，不能解释为全网没有资源。
+Quark-VOD 的搜索配置只选择已经安装的 provider 及其 HTTP 端点。JSON 文件不
+包含 Python、脚本或远程代码，也不会安装插件。没有配置文件，或者配置文件中
+没有启用节点时，服务仍可启动，但搜索报告会返回 `configured=false` 和
+`partial=true`；这表示当前部署没有完成搜索，不能据此判断全网没有资源。
+节点目的地址和 Python provider 的信任边界见[安全说明](../SECURITY.md)。
+
+搜索 provider 只产生夸克分享候选。作品身份、年份、电影或剧集类型、季集、
+文件路径和画质证据仍由点播内核核验，provider 不能绕过这些选择条件。
 
 ## 配置文件
 
-文件必须是 UTF-8 JSON，大小不超过 256 KiB，顶层只能包含 `version` 和
-`nodes`，并且 `version` 必须为整数 `1`：
+通过 `VOD_SEARCH_CONFIG` 显式指定 UTF-8 JSON 文件。文件大小上限为 256 KiB，
+顶层只能有 `version` 和 `nodes`，且 `version` 必须是整数 `1`：
 
 ```json
 {
@@ -29,35 +32,54 @@ JSON 文件，文件只选择已经安装的 provider 和它们的 HTTP 端点�
 }
 ```
 
-每个节点的约束如下：
+节点字段按下面的规则校验：
 
-- `nodes` 最多 32 项，`id` 必须唯一，首字符为字母，其余可用字母、数字、
-  `.`, `_`, `-`，总长不超过 64。`name` 必须非空且不超过 100 个字符。
-- `provider` 是 provider 名称；内置名称为 `html` 和 `json`。`enabled` 必须是
-  JSON 布尔值。禁用节点可以暂存尚未安装的 provider，启用时必须能在进程中找到它。
-- `base` 只能是 `http` 或 `https` URL，不能包含用户名、密码、query 或 fragment，
-  端口必须在 1--65535。不要把 Cookie、token 或签名放进 URL。
-- `timeout` 是数字，范围为 0.1--7 秒；布尔值不算数字。
-- `path` 必须以单个 `/` 开头，不能带 query、fragment，长度不超过 1024；
-  `query_param` 只能包含字母、数字和下划线，首字符不能是数字。两者只有
-  `json` provider 使用，`html` provider 会忽略它们。
-- 未知字段、重复 ID、坏 URL、坏类型或其他校验失败会拒绝整次配置。需要关闭
-  全部源时，写入合法的 `{ "version": 1, "nodes": [] }`，不要删除配置文件。
+- `nodes` 最多 32 项，`id` 必须唯一，首字符是字母，其余字符只能是字母、数字、
+  `.`, `_`, `-`，长度最多 64。`name` 默认使用 `id`；原始字符串最多 100 个字符，
+  去掉首尾空白后必须非空，且不能含控制字符。
+- `provider` 名称必须符合同样的标识符规则。内置 provider 是 `html` 和 `json`。
+- `provider` 默认是 `html`。`enabled` 必须是 JSON 布尔值，默认是 `true`；禁用节点
+  可以暂存尚未安装的 provider，启用时该 provider 必须已经在进程中注册。
+- `base` 必须是 `http` 或 `https` URL，必须有主机名，不能包含用户名、密码、
+  query 或 fragment，端口（如有）必须在 1--65535，长度最多 2048，不能含空格或
+  C0 控制字符。不要把 Cookie、token 或签名地址放进 URL。
+- `timeout` 是有限的数字，范围为 0.1--7 秒，默认 4 秒；布尔值不算数字。
+- `path` 默认是 `/search`，必须以 `/` 开头且不能以 `//` 开头，不能含空格、C0
+  控制字符、query 或 fragment，长度最多 1024。`query_param` 默认是 `q`，只能是
+  字母、数字和下划线，首字符不能是数字，长度最多 64。两者只由 `json` provider
+  使用，`html` provider 会忽略它们。
+- 未知字段、重复 ID、坏 URL、坏类型、非法 provider 或其他校验失败会拒绝整份
+  配置。需要关闭全部源时，写入合法的 `{ "version": 1, "nodes": [] }`，
+  不要删除配置文件。
 
-配置由部署者维护。节点地址可以指向本机或私有网络，因此编辑配置的人也必须
-负责确认这些目的地可信且适合服务进程访问。
+`key` 是旧配置兼容字段；如果同时出现，必须与 `id` 完全相同。新的配置应只写
+`id`。节点地址可以指向本机或私有网络，因此配置维护者必须确认目标可信，并且
+适合服务进程访问。
 
 ## 内置 provider
 
-`html` 使用有界的 HTML 搜索和详情解析器。它请求
-`/index.php/vod/search.html?wd=<关键词>`，只接受同源的搜索下一页和详情链接，
-再从详情页提取夸克分享。每个节点最多处理三页，详情请求有单节点截止时间、
-响应体上限和并发限制。provider 只提供候选，作品身份、季集、类型和画质证据
-仍由核心选择逻辑核验。
+### `html`
 
-`json` 对每个关键词只发一次 GET 请求：
-`<base><path>?<query_param>=<URL 编码的关键词>`。响应必须是对象，且 `items`
-必须为数组：
+`html` 对每个关键词从以下路径开始搜索：
+
+```text
+/index.php/vod/search.html?wd=<URL 编码的关键词>
+```
+
+它只接受与节点 `base` 具有相同 scheme 和主机的搜索下一页及详情链接，再从详情页
+提取夸克分享。单个节点最多遍历 3 页；每次 HTTP 响应最多读取 2 MiB；单节点总
+截止时间为 22 秒；详情页最多同时请求 3 个。`limit_per_node` 限制详情页数量，
+一页详情可以产生多条候选，所以最终候选数可能超过这个值。
+
+### `json`
+
+`json` 对每个关键词只发送一次 GET：
+
+```text
+<base><path>?<query_param>=<URL 编码的关键词>
+```
+
+响应必须是对象，且 `items` 必须是数组：
 
 ```json
 {
@@ -71,56 +93,78 @@ JSON 文件，文件只选择已经安装的 provider 和它们的 HTTP 端点�
 }
 ```
 
-单次响应最多 2 MiB。每个 item 的 `name` 不得超过 1000 个字符，`share_url`
-不得超过 4096 个字符，并且必须能规范化为夸克分享地址；无效 item 会计入错误
-并跳过。`partial` 会按 Python `bool()` 解释；调用方应提供 JSON 布尔值 `true`
-或 `false`，不要依赖字符串等其他类型的隐式转换。它表示该 provider 自己没有
-完整枚举，不能表示整个互联网的资源结论。JSON provider 不猜测第三方分页协议，
-需要分页时由第三方接口聚合，或实现下面的 Python provider。
+响应体同样最多 2 MiB。每个 item 的 `name` 长度最多 1000，`share_url` 长度最多
+4096，并且必须能规范化为夸克分享地址；无效 item 会计入错误并跳过。`items` 超过
+本次 `limit_per_node` 时会标记 `truncated`，多出的项不会被接收。`partial` 按
+Python `bool()` 解释，调用方应提供 JSON 布尔值 `true` 或 `false`，不要依赖其他
+类型的隐式转换。它只表示这个 provider 自己没有完成枚举，不能表示整个互联网的
+资源结论。该 provider 不猜测第三方分页协议；需要分页时由第三方接口聚合，或
+安装可信 Python provider。
 
-不同节点返回同一分享时，核心按规范化分享地址去重，保留多个标题和来源，并
-保留可提取的原始提取码。候选仍须通过身份匹配，provider 不能绕过安全选择。
+不同节点返回同一分享时，核心按规范化分享地址去重，保留多个标题和来源，并保留
+能够提取的提取码。自定义 provider 返回的条目还会经过同样的字段限制；不能规范
+化为夸克地址的条目会在合并阶段丢弃。
 
-## 搜索预算与结果状态
+## 请求预算、缓存与结果状态
 
-调度器将 `limit_per_node` 限制在 1--30，默认值为 24；这是传给每个 provider
-的单节点预算，不等于最终候选条数。HTML provider 用它限制要请求的详情页数，
-一页详情可以产生多条候选；JSON provider 最多接收该数量的 `items`；trusted Python
-provider 会收到该值并应自行遵守。HTML 每个节点最多请求 3 页，节点最多 5 路并行；
-全局最多同时运行 2 组搜索和 12 个 HTTP 请求。单 provider 返回超过 1200 条会被
-视为无效，异常不会阻止其他节点。公开报告只保留节点、provider、
-页数、详情数、错误数、是否截断、是否 partial、耗时和候选数；插件的 URL、异常
-文本和其他任意字段不会透传。
+一次 `PanshareMatrix` 搜索的 `limit_per_node` 会被限制在 1--30，默认 24；它是
+传给每个 provider 的单节点预算，不等于最终候选数。`max_pages` 被限制在 1--3，
+默认 3。
 
-有候选且 `partial=false` 的结果缓存 30 分钟；空结果或 `partial=true` 的结果缓存
-约 45 秒。全局 `partial` 由配置错误、provider 错误或 provider 自报 partial 决定；
-`truncated` 单独不会将结果标记为 partial，也不会改变缓存时长。缓存键包含有效配置的 SHA-256
-fingerprint，因此增删、启停、地址或参数变化不会命中
-旧配置的结果。已标记为失效的分享会在返回前过滤。
+- 一次搜索最多让 5 个启用节点的 provider 并行执行；HTML 节点内部的详情请求另有
+  固定的 3 路并发限制。
+- 进程最多同时运行 2 组完整搜索，内置 HTTP 读取共享最多 12 个并发槽位。一个
+  provider 返回超过 1200 条会被视为无效；异常只使该节点失败，不阻断其他节点。
+- 可信 Python provider 不自动获得 HTML provider 的 22 秒节点截止时间，也不一定
+  使用内置的 12 个 HTTP 槽位。它必须自行实现请求超时、分页上限、响应大小限制和
+  退出条件，并遵守收到的 `limit` 与 `max_pages`。
+- 对外节点报告只保留节点、provider、页数、详情数、错误数、是否截断、是否 partial、
+  耗时和候选数。provider 的 URL、异常文本和任意自定义字段不会透传；错误会归一为
+  安全的 `ProviderError` 诊断。
 
-## 热重载
+搜索结果缓存保存在 `VOD_DATA_DIR/search_cache`，进程内最多保留 128 个条目。缓存
+键包含关键词、页数、单节点预算和有效配置的 SHA-256 fingerprint：
 
-配置文件的设备、inode、纳秒级 mtime 和大小在请求开始时检查。发现变化后，服务
-会完整读取和校验，再切换到不可变快照。一次搜索（包括它的多个标题变体）持有
-同一个快照；搜索已经开始后，配置变化只影响新搜索，正在播放的流不受影响。
+- 有候选且 `partial=false` 时缓存 1800 秒（30 分钟）。
+- 空结果、provider 故障或 `partial=true` 时缓存 45 秒。
+- `truncated` 单独不会把结果标成 partial，也不会缩短缓存时间。
+- 结果返回前会过滤已经标记失效的分享。
 
-有效配置的语义 fingerprint 不变时，JSON 格式化和对象字段顺序变化不会增加
-generation；`nodes` 数组顺序属于配置语义，调整顺序会改变 fingerprint。语义
-变化才会切换快照和 generation，并使新缓存键生效。文件暂时不可读或内容
-无效时，服务保留上一份有效快照并记录通用错误代码；旧快照产生的结果标记为
-partial。首次就无有效快照时，结果为空且仍标记 partial。
+没有启用节点、配置错误、节点错误或 provider 自报 `partial` 时，结果的 `partial`
+为 `true`。配置为空和“已完成搜索但没有符合身份的候选”是不同状态，调用方必须
+保留这个区别。
 
-配置文件建议在同一目录内用临时文件加 `os.replace` 原子替换；Docker 部署应挂载
-整个目录而不是只挂载某个 inode，以便容器看到替换后的文件。
+## 热重载与请求快照
 
-管理 API 提供两个受 Bearer 保护的操作：
+每次请求开始时，registry 会比较配置文件的设备号、inode、纳秒级 mtime 和大小。
+发现变化后，服务会完整读取、解析和校验文件，再切换到不可变 `SearchSnapshot`。
+一次搜索及其最多四个标题变体会持有同一个 snapshot；搜索开始后发生的文件变化
+只影响后续搜索，已经开始的播放流不受影响。
 
-- `GET /api/admin/plugins` 返回 `configured`、`config_file_set`、generation、
-  fingerprint、节点摘要、已知 provider、当前配置错误和进程级
-  `entrypoint_errors`。节点摘要只含 ID、名称、provider、timeout 和 enabled，
+配置的语义 fingerprint 由规范化后的节点内容和顺序计算：JSON 格式化、字段顺序
+或兼容 `key` 的内部表示变化不改变 fingerprint；`nodes` 数组顺序属于语义，调整
+顺序会改变 fingerprint。只有 fingerprint 变化才增加 generation，并使新缓存键生效。
+
+文件暂时不可读或内容无效时，registry 保留上一份有效 snapshot，并记录通用错误码；
+使用旧 snapshot 的搜索会标记 `partial`。首次就没有有效 snapshot 时，搜索为空且
+同样标记 `partial`。显式 reload 在失败时返回错误，绝不会替换上一份有效 snapshot。
+
+编辑时应在同一目录写临时文件，再用 `os.replace` 原子替换。Docker 部署应挂载整个
+配置目录，而不是只挂载某一个 inode，否则宿主机替换文件后容器可能仍然看到旧文件。
+
+## 管理 API
+
+以下两个端点都需要管理 Bearer token：
+
+- `GET /api/admin/plugins` 会刷新并返回 `configured`、`config_file_set`、
+  `generation`、`fingerprint`、节点数量、节点摘要、已知 provider、当前配置错误和
+  `entrypoint_errors`。节点摘要只含 `id`、`name`、`provider`、`timeout`、`enabled`，
   不返回 `base`、`path` 或凭据。
-- `POST /api/admin/plugins/reload` 立即严格校验并应用文件。失败返回错误，上一份
-  有效快照保持不变。
+- `POST /api/admin/plugins/reload` 立即严格读取并应用配置。成功返回当前状态；失败
+  返回 `422` 和通用错误，上一份有效 snapshot 保持不变。
+
+配置状态也会出现在受保护的能力信息中。`/health` 只证明 HTTP 服务响应，不证明
+搜索源已经配置或可用。
 
 ## 可信 Python provider
 
@@ -131,16 +175,17 @@ Python provider 通过安装包的 entry point 注册：
 my-search = "my_package.provider:fetch"
 ```
 
-只有在 `VOD_SEARCH_PLUGINS` 中显式列出名称时才会加载，例如：
+只有在 `VOD_SEARCH_PLUGINS` 中显式列出的名称才会尝试加载：
 
 ```dotenv
 VOD_SEARCH_PLUGINS=my-search,another-search
 ```
 
-未列出的 entry point 不会执行。名称必须符合节点 ID 的字符规则，不能覆盖内置
-`html` 或 `json`。加载失败会记录通用的 `entrypoint_load_failed`；同一进程会记住
-这次尝试，修复安装或 entry point 后需要重启服务才能重试。安装或更新 Python
-代码也需要重启；只修改已加载 provider 的 JSON 节点可以热加载。
+未列出的 entry point 不会执行。名称必须符合节点 ID 的标识符规则，不能覆盖内置
+`html` 或 `json`。同名 entry point 必须唯一；加载失败只记录通用的
+`entrypoint_load_failed`。进程会记录每个名称已经尝试过，即使失败也不会在同一进程
+重试；修复安装、entry point 或依赖后必须重启服务。安装或更新 Python provider 代码
+也需要重启，已加载 provider 的 JSON 节点参数才支持热加载。
 
 provider 函数接收四个位置参数，并返回 `(items, report)`：
 
@@ -160,44 +205,58 @@ def fetch(node, keyword, limit, max_pages):
     return items, report
 ```
 
-返回的 item 至少要有字符串 `name` 和 `share_url`。调度器会覆盖 `source`，限制
-字段长度和计数，并把插件异常或错误计数统一为 `ProviderError`；不可信的异常文本
-不会进入 API 响应。provider 应自行实现请求超时、分页上限、响应上限和退出条件。
+`node` 是字典，包含 `id`、`key`、`name`、`provider`、`base`、`timeout`、`enabled`、
+`path` 和 `query_param`；`keyword` 是当前搜索词，`limit` 与 `max_pages` 是已经
+限制在支持范围内的整数。`report` 可提供 `errors`、`pages`、`details` 计数以及
+`truncated`、`partial` 布尔标记；其他字段会被忽略。
 
-这些 provider 是安装在服务进程中的可信 Python 代码，不是沙箱。它们可使用服务
-账号能使用的文件、网络和凭据；只应从信任来源安装。JSON 配置不支持上传、安装或
-远程执行代码。
+`items` 和 `report` 必须分别是 list 和 dict。每个 item 至少包含字符串 `name` 和
+`share_url`，字段长度上限与内置 provider 相同；单次返回不得超过 1200 条。调度器
+会覆盖 `source`，限制公开计数，过滤异常条目，并把插件异常转成安全错误报告。它
+不会把任意报告字段、上游 URL 或异常文本返回给调用方。
 
-## 存储后端边界
+这些 provider 是安装在服务进程中的可信 Python 代码，不是沙箱。它们可以使用服务
+账号能够访问的文件、网络和凭据，只应从可信来源安装。JSON 配置不支持上传、安装
+或远程执行代码。
 
-搜索 provider 与媒体存储不是同一个插件接口。公开包提供代码级 `RemoteStore`
-协议和 `OpenListStore` 适配器，但当前通过 Python 构造注入，没有运行时 backend
-选择、entry point 发现或热加载。夸克分享解析、官方目录核验、转存任务和生命周期
-仍由 `QuarkTransfer` 负责，不能仅修改搜索 JSON 来替换网盘。
+## 存储后端不是搜索插件
 
-实现新的存储适配器时遵循四个方法：
+搜索 provider 与媒体存储使用不同的接口。公共包提供代码级 `RemoteStore` 协议和
+`OpenListStore` 适配器，但当前通过 Python 构造注入，没有运行时 backend 选择、entry
+point 发现或热加载。夸克分享解析、官方目录核验、转存任务和任务恢复仍由
+`QuarkTransfer` 负责；修改搜索 JSON 不能替换网盘。
 
-- `mkdir(write_path)`、`remove(write_path)` 接收写挂载路径，只有后端接受操作后
-  才返回 `True`；失败返回 `False` 或抛异常。
-- `direct_url(playback_path)`、`refresh_path_tree(playback_path)` 接收经过
+新的存储适配器必须实现四个操作：
+
+- `mkdir(write_path)` 和 `remove(write_path)` 接收写挂载路径。只有后端确认操作成功
+  才返回 `True`；返回 `False` 或抛异常都会让生命周期停在失败状态。
+- `direct_url(playback_path)` 和 `refresh_path_tree(playback_path)` 接收经过
   `config.play_path()` 的播放挂载路径。
-- `refresh_path_tree` 只是最佳努力刷新提示，返回值不能证明对象存在；查询或刷新
-  失败也不能当作文件缺失。
-- 转存内核会把失败的变更转成 `TransferFailed`，不推进新的保存或清理状态；删除
-  未确认时保留原远端路径和可重试记录。
+- `refresh_path_tree` 只是最佳努力的刷新提示，返回值不能证明文件存在；刷新失败或
+  查询不到对象也不能直接当作文件缺失。
+- 删除未确认成功时，内核保留原远端路径和可重试的清理记录，不把对象标为已清理。
 
-这组接口的实现和测试见 `app/quark_vod/backends.py`、`tests/test_backends.py`。
+实现和回归见 `app/quark_vod/backends.py`、`tests/test_backends.py`。这一边界允许
+替换播放存储适配器，但不会把 Quark 专属的分享、鉴权和官方保存流程变成通用网盘
+协议。
 
-## 开发验证
+## 验证
 
-搜索插件的隔离回归使用随机 loopback HTTP 端口、合成分享和临时目录，不访问公共
-搜索站、夸克账号或 AI：
+插件专项回归使用随机 loopback HTTP 端口、合成分享和临时目录，不访问公共搜索站、
+夸克账号或 AI：
 
 ```sh
 python -I tests/test_search_plugins.py
 ```
 
-它覆盖 HTML/JSON 请求、节点增删启停、坏配置保留、显式重载错误、fingerprint
-隔离缓存、在途快照、单节点故障、凭据不回显和 entry point allowlist。完整变更仍
-应运行 `make test`，provider 代码或服务依赖变更还要按[贡献指南](../CONTRIBUTING.md)
-验证打包和容器边界。
+它覆盖 HTML/JSON 请求、节点增删启停、坏配置保留、显式重载错误、fingerprint 隔离
+缓存、在途请求快照、单节点故障、凭据不回显和 entry point allowlist。完整代码变更
+还应运行：
+
+```sh
+make test
+python -m build
+```
+
+修改 provider 代码、依赖或容器时，还要按[贡献指南](../CONTRIBUTING.md)完成源码树外
+wheel 安装及受限容器边界验证。
