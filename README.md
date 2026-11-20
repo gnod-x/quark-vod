@@ -19,12 +19,14 @@ maintenance are explicit opt-ins.
 - A standalone data directory with no required home-server layout.
 
 The service can start without Quark or OpenList account credentials, but management
-APIs require a token from `VOD_ADMIN_TOKEN` or `VOD_ADMIN_TOKEN_FILE`. Actual
-saving/playback requires your Quark authorization and a reachable OpenList
-integration. Standalone mode
-returns ready playback URLs without generating STRM files; optional Jellyfin
-mode uses an existing stable STRM library mapping. No external AI,
-cloud-write probe, self-healing loop or maintenance is enabled by default.
+APIs require a token from `VOD_ADMIN_TOKEN` or `VOD_ADMIN_TOKEN_FILE`. Search
+requires an enabled, reachable search provider. Saving a new item requires Quark
+authorization and a reachable OpenList integration; playback of an item already
+saved in the service state requires that state and an OpenList endpoint reachable
+by the service and player. Standalone mode returns ready playback URLs without
+generating STRM files; optional Jellyfin mode uses an existing stable STRM library
+mapping. No external AI, cloud-write probe, self-healing loop or maintenance is
+enabled by default.
 
 ## Quick start with Docker
 

@@ -83,8 +83,11 @@ and must be explicitly allowlisted. Installing provider code is separate from
 reloading JSON configuration. See [Search plugins](plugins.md) for the schema,
 provider contract, limits, and reload behavior.
 
-Quark credentials and a reachable OpenList are needed for saving and resolving
-remote media, but the API can start without them. Jellyfin, startup scans,
+Saving a new item requires Quark credentials and a reachable OpenList. Resolving
+an item already saved in service state requires that state and an OpenList address
+reachable by both the service process and the player; it does not require another
+Quark save request. Search requires an enabled, reachable provider. The API can
+start without these account credentials or providers. Jellyfin, startup scans,
 self-healing, and write probes are optional integrations controlled by explicit
 settings. A health response only proves that the HTTP service is responding.
 

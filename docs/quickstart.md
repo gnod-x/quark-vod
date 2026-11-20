@@ -6,7 +6,7 @@
 
 - Docker Engine 与 Docker Compose v2；或者 Linux、Python 3.11+，用于原生安装。
 - 从项目发布渠道取得源码包，解压后进入包含 `docker-compose.yml`、`Dockerfile` 和 `pyproject.toml` 的项目根目录。当前仓库没有配置可直接 `docker pull` 的镜像地址，也没有在本文中假设 PyPI 发布渠道。
-- 实际保存和播放需要有效的夸克 Cookie、可从服务进程访问的 OpenList，以及由操作者维护的搜索源。空配置可以启动，但健康检查成功不代表这些依赖已就绪。
+- 搜索本身只需要已启用且网络可达的搜索源；新转存还需要有效的夸克 Cookie 和可从服务进程访问的 OpenList。已经保存并写入状态库的内容，播放时主要需要状态记录，以及服务进程和实际播放器均可访问的 OpenList；不需要再次搜索或提交夸克保存。空配置可以启动，但健康检查成功不代表搜索、转存或播放依赖已就绪。
 
 搜索配置由操作者自行提供。Compose 已挂载 `examples/` 目录；`examples/search.json`
 是本机私有运行文件，新检出默认不存在，公开源码包也不会包含它。首次需要启用搜索
@@ -23,24 +23,38 @@ test -e examples/search.json || cp examples/search.example.json examples/search.
 在项目根目录创建私有环境文件，并在首次启动前设置管理员令牌。以下命令用随机 256 位令牌替换 `.env` 中的空 `VOD_ADMIN_TOKEN`；令牌不会打印到终端：
 
 ```sh
+(
+set -eu
 umask 077
 test -e .env || cp .env.example .env
 chmod 600 .env
-export QUARK_VOD_ADMIN_TOKEN="$(openssl rand -hex 32)"
-python3 - <<'PY'
+QUARK_VOD_ADMIN_TOKEN="$(openssl rand -hex 32)" python3 - <<'PY'
 import os
 from pathlib import Path
+import tempfile
 
 path = Path(".env")
 lines = path.read_text(encoding="utf-8").splitlines()
 key = "VOD_ADMIN_TOKEN="
-if not any(line.startswith(key) for line in lines):
+matches = [line for line in lines if line.startswith(key)]
+if len(matches) != 1:
     raise SystemExit(".env 中缺少 VOD_ADMIN_TOKEN 项")
-lines = [key + os.environ["QUARK_VOD_ADMIN_TOKEN"] if line.startswith(key) else line
-         for line in lines]
-path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+if matches[0][len(key):].strip():
+    raise SystemExit(".env 已有 VOD_ADMIN_TOKEN，未覆盖现有令牌")
+lines = [key + os.environ["QUARK_VOD_ADMIN_TOKEN"] if line.startswith(key) else line for line in lines]
+descriptor, temporary = tempfile.mkstemp(prefix=".env.", dir=".")
+try:
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.write("\n".join(lines) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+except BaseException:
+    os.unlink(temporary)
+    raise
 PY
-unset QUARK_VOD_ADMIN_TOKEN
+)
 ```
 
 编辑 `.env`，至少按你的环境设置 `OPENLIST_API`、`OPENLIST_PUBLIC`、`PENDING_BASE_URL`、`OPENLIST_ADMIN_PASS` 和 `QUARK_COOKIE`。不要把 Cookie、密码或管理员令牌提交到版本库。`.env` 已被 Git 忽略；仍应保留 `chmod 600`。
@@ -48,7 +62,7 @@ unset QUARK_VOD_ADMIN_TOKEN
 三个地址的用途不同：
 
 - `OPENLIST_API` 是 Quark-VOD 服务进程访问 OpenList API 的地址。Compose 示例使用 `host.docker.internal`，只适用于 Docker 容器能够通过该名称访问宿主机服务的场景。
-- `OPENLIST_PUBLIC` 必须是实际播放器能够打开的 OpenList 地址；不能只在 Docker 宿主机或容器内可达。
+- `OPENLIST_PUBLIC` 必须同时是服务进程用于探测直链、实际播放器能够打开的 OpenList 地址；不能只在 Docker 宿主机或容器内可达。
 - `PENDING_BASE_URL` 是播放器访问 Quark-VOD `/play` 等路径时使用的基础地址。远端电视或手机不能使用指向自身的 `localhost`。
 
 检查 Compose 配置并启动：
@@ -85,7 +99,7 @@ PENDING_BASE_URL=http://192.168.1.10:8099
 OPENLIST_PUBLIC=http://192.168.1.10:5244
 ```
 
-请替换成自己的地址，并确认 OpenList 的端口也确实向播放设备开放。修改后执行 `docker compose up -d` 使端口和环境变量生效。若通过反向代理或 VPN 提供访问，应确保播放器能访问配置的两个公共地址，并由网络边界限制访问范围。
+请替换成自己的地址，并确认 OpenList 的端口同时对服务进程和播放设备可达。修改后执行 `docker compose up -d` 使端口和环境变量生效。若通过反向代理或 VPN 提供访问，应确保服务进程和播放器都能访问配置的两个公共地址，并由网络边界限制访问范围。
 
 播放接口 `/play`、`/pending`、`/media/{id}` 和 `/clean` 不要求管理员 Bearer；管理令牌不是媒体用户认证系统。不要把服务端口直接暴露到公网。远程访问应放在适合播放器的 TLS、VPN 或访问控制网关之后。
 
@@ -152,15 +166,31 @@ services:
 在 Linux 上从项目源码根目录安装。创建原生专用配置，生成独立令牌文件并引用它；同时把 OpenList 地址改为本机或服务进程实际可达的地址：
 
 ```sh
+(
+set -eu
 test -e .env.native || cp .env.example .env.native
 chmod 600 .env.native
 install -d -m 700 "$HOME/.config/quark-vod"
-openssl rand -hex 32 > "$HOME/.config/quark-vod/admin-token"
-chmod 600 "$HOME/.config/quark-vod/admin-token"
+token_path="$HOME/.config/quark-vod/admin-token"
+if test -e "$token_path"; then
+  printf '令牌文件已存在，未覆盖：%s\n' "$token_path" >&2
+  exit 1
+fi
+token_tmp="$(mktemp "${token_path}.tmp.XXXXXX")"
+trap 'rm -f "$token_tmp"' EXIT
+openssl rand -hex 32 > "$token_tmp"
+chmod 600 "$token_tmp"
+if ! ln "$token_tmp" "$token_path"; then
+  printf '无法创建令牌文件，目标可能已存在：%s\n' "$token_path" >&2
+  exit 1
+fi
+rm -f "$token_tmp"
+trap - EXIT
 sed -i '/^VOD_ADMIN_TOKEN=/d; /^VOD_ADMIN_TOKEN_FILE=/d' .env.native
 printf 'VOD_ADMIN_TOKEN_FILE=%s\n' "$HOME/.config/quark-vod/admin-token" >> .env.native
 python3 -m venv .venv
 .venv/bin/python -m pip install .
+)
 ```
 
 编辑 `.env.native`，设置实际服务地址；令牌文件路径已写入配置，不要再添加普通的 `VOD_ADMIN_TOKEN` 值。需要搜索时，再复制并配置 `examples/search.json`。然后运行：
@@ -179,7 +209,7 @@ Compose 将整个 `examples/` 目录以只读方式挂载到容器 `/config`，�
 
 ## Jellyfin 与独立播放模式
 
-关闭 Jellyfin 时，成功解析后直接返回已验证的播放 URL，不创建 STRM 文件。实际保存和解析仍需要搜索源、夸克授权及 OpenList。
+关闭 Jellyfin 时，成功解析后直接返回已验证的播放 URL，不创建 STRM 文件。搜索本身只需要已启用的搜索源；新转存还需要夸克授权及 OpenList；已有保存记录的播放只需状态记录，以及服务进程和播放器均可访问的 OpenList。
 
 启用 Jellyfin 是可选集成。请求的影片或剧集必须已有稳定 STRM 映射；缺失映射是集成配置问题，不代表夸克云端没有资源。Jellyfin 的密钥、库路径和保护数据库必须按本机部署单独配置。启用维护或删除操作前，先阅读[架构说明](architecture.md)和对应集成契约。
 
