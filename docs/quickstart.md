@@ -8,7 +8,9 @@
 - 从项目发布渠道取得源码包，解压后进入包含 `docker-compose.yml`、`Dockerfile` 和 `pyproject.toml` 的项目根目录。当前仓库没有配置可直接 `docker pull` 的镜像地址，也没有在本文中假设 PyPI 发布渠道。
 - 实际保存和播放需要有效的夸克 Cookie、可从服务进程访问的 OpenList，以及由操作者维护的搜索源。空配置可以启动，但健康检查成功不代表这些依赖已就绪。
 
-搜索配置由操作者自行提供。Compose 已挂载 `examples/` 目录；Git 源码树中的 `examples/search.json` 是空节点配置，公开源码包会排除这份运行配置。若文件不存在，首次需要启用搜索源时，可复制禁用占位项，再按[搜索插件文档](plugins.md)修改：
+搜索配置由操作者自行提供。Compose 已挂载 `examples/` 目录；`examples/search.json`
+是本机私有运行文件，新检出默认不存在，公开源码包也不会包含它。首次需要启用搜索
+源时，可复制禁用占位项，再按[搜索插件文档](plugins.md)修改：
 
 ```sh
 test -e examples/search.json || cp examples/search.example.json examples/search.json

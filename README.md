@@ -59,10 +59,14 @@ the [native setup guide](docs/quickstart.md).
 
 ## Reloadable search providers
 
-Edit `examples/search.json` using the schema in
-[the provider guide](docs/plugins.md). Changes are checked on subsequent searches;
-the authenticated reload endpoint can validate and apply them immediately.
-An invalid replacement keeps the last valid snapshot.
+In a source checkout, copy `examples/search.example.json` to a private
+`examples/search.json` and set `VOD_SEARCH_CONFIG` to that file, using the schema
+in [the provider guide](docs/plugins.md). The supplied Docker Compose mounts the
+whole `examples/` directory as `/config` and reads `/config/search.json`; an
+installed wheel has no operator search file and must be given one explicitly.
+Changes are checked on subsequent searches; the authenticated reload endpoint can
+validate and apply them immediately. An invalid replacement keeps the last valid
+snapshot.
 
 Built-in `html` and `json` providers require no code installation. Trusted Python
 providers can be registered through `quark_vod.search` entry points and explicitly

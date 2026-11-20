@@ -23,4 +23,5 @@ logs/
 cinema2/
 jellyfin2/
 openlist/
+examples/search.json
 .backups/
