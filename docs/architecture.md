@@ -6,6 +6,9 @@ external integrations.
 Remote storage operations used by the transfer lifecycle sit behind the small
 `RemoteStore` contract; write operations use the write mount, while direct-link
 and refresh operations use the playback mount. The default adapter wraps OpenList.
+Creation and deletion require a successful backend result; rejected mutations
+stop the lifecycle, and failed deletions retain remote-path and cleanup retry
+evidence instead of being recorded as cleaned.
 Quark share parsing, official save tasks and account authorization remain in the transfer component,
 so this seam does not yet make arbitrary cloud drives drop-in backends.
 

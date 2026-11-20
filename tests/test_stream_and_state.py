@@ -460,6 +460,59 @@ class StateTests(unittest.TestCase):
             self.assertEqual(cleanup.enforce_vod_quota(ol=ol,verbose=False),(0,0,size))
         self.assertEqual(db.get_transfer_by_id(self.tid)['status'],'done')
 
+    def test_quota_remove_false_preserves_state_and_can_retry(self):
+        size = 300*1024**3
+        remote = db.get_transfer_by_id(self.tid)['remote_path']
+        item = {'name':'样例', 'remote_path':'/夸克网盘/点播/样例', 'size':size}
+        ol = Mock()
+        ol.remove.side_effect = [False, True]
+        with patch.object(cleanup, 'get_vod_disk_usage', return_value=(size,[item])), \
+                patch.object(cleanup, 'resolve_quotas', return_value=(1,1,0,0)), \
+                patch.object(cleanup, 'get_protected_titles', return_value=set()):
+            self.assertEqual(cleanup.enforce_vod_quota(ol=ol, verbose=False), (0,0,size))
+            row = db.get_transfer_by_id(self.tid)
+            self.assertEqual((row['status'], row['remote_path']), ('done', remote))
+            self.assertEqual(len(db.due_cleanups()), 1)
+            self.assertEqual(cleanup.enforce_vod_quota(ol=ol, verbose=False), (1,size,0))
+        self.assertEqual(db.get_transfer_by_id(self.tid)['status'], 'cleaned')
+
+    def test_expiry_remove_false_keeps_queue_and_can_retry(self):
+        remote = db.get_transfer_by_id(self.tid)['remote_path']
+        ol = Mock()
+        ol.remove.side_effect = [False, True]
+        with patch.object(cleanup, 'OpenListClient', return_value=ol), \
+                patch.object(cleanup, 'get_protected_titles', return_value=set()):
+            self.assertEqual(cleanup.run_cleanup(verbose=False), (0,1,0))
+            row = db.get_transfer_by_id(self.tid)
+            self.assertEqual((row['status'], row['remote_path']), ('done', remote))
+            due = db.due_cleanups()
+            self.assertEqual(len(due), 1)
+            self.assertEqual(due[0]['remote_path'], remote)
+            self.assertEqual(cleanup.run_cleanup(verbose=False), (1,0,0))
+        self.assertEqual(len(db.due_cleanups()), 0)
+        row = db.get_transfer_by_id(self.tid)
+        self.assertEqual((row['status'], row['remote_path']), ('cleaned', None))
+
+    def test_mismatch_remove_false_keeps_evidence_and_can_retry(self):
+        remote = '/夸克网盘/点播/短剧包/video.mkv'
+        db.upsert_transfer('电影', '样例 (2026)', 0, 0, status='done', remote_path=remote)
+        db._conn().execute('UPDATE cleanup_queue SET remote_path=? WHERE transfer_id=?',
+                           (remote, self.tid))
+        db._conn().commit()
+        self.path.write_text('http://fixture.invalid/d/夸克/点播/短剧包/video.mkv\n')
+        ol = Mock()
+        ol.remove.side_effect = [False, True]
+        with patch.object(cleanup, 'OpenListClient', return_value=ol), \
+                patch.object(cleanup, 'get_protected_titles', return_value=set()):
+            self.assertEqual(cleanup.clean_mismatched_short_dramas(verbose=False), 0)
+            row = db.get_transfer_by_id(self.tid)
+            self.assertEqual((row['status'], row['remote_path']), ('done', remote))
+            due = db.due_cleanups()
+            self.assertEqual(len(due), 1)
+            self.assertEqual(due[0]['remote_path'], remote)
+            self.assertEqual(cleanup.clean_mismatched_short_dramas(verbose=False), 1)
+        self.assertEqual(db.get_transfer_by_id(self.tid)['status'], 'cleaned')
+
     def test_quota_path_boundary_does_not_clean_similar_title(self):
         size=300*1024**3
         other=db.upsert_transfer('电影','另一个作品',0,0,status='done',remote_path='/夸克网盘/点播/样例续集/video.mkv')

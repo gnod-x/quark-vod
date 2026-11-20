@@ -287,7 +287,8 @@ class QuarkTransfer:
             return self._vod_fid
         if not self.storage:
             raise TransferNotReady("未注入远程存储后端，无法创建点播目录")
-        self.storage.mkdir(config.QUARK_VOD_ROOT)
+        if not self.storage.mkdir(config.QUARK_VOD_ROOT):
+            raise TransferFailed("远程存储后端未确认创建点播目录")
         vod_fid = self._get_quark_fid(config.QUARK_VOD_ROOT)
         if not vod_fid:
             raise TransferFailed(f"无法获取 {config.QUARK_VOD_ROOT} 的夸克 fid")
@@ -955,7 +956,8 @@ class QuarkTransfer:
             identity = repr((work.cat, work.title, season, pwd_id, selected.get('fid'))).encode()
             slot = config.QUARK_VOD_ROOT + '/vod_' + hashlib.sha256(identity).hexdigest()[:24]
             self.ensure_vod_dir()
-            self.storage.mkdir(slot)
+            if not self.storage.mkdir(slot):
+                raise TransferFailed('远程存储后端未确认创建转存目录')
             fid = self._get_quark_fid(slot)
             if not fid:
                 raise TransferFailed('无法确认转存目标目录')
@@ -1021,4 +1023,6 @@ class QuarkTransfer:
     def delete_remote(self, remote_path):
         if not self.storage:
             raise TransferNotReady("未注入远程存储后端")
-        return self.storage.remove(remote_path)
+        if not self.storage.remove(remote_path):
+            raise TransferFailed("远程存储后端未确认删除")
+        return True

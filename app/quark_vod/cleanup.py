@@ -378,7 +378,8 @@ def enforce_vod_quota(ol=None, max_bytes=None, target_bytes=None,
 
         removed = True
         try:
-            ol.remove(remote)
+            if not ol.remove(remote):
+                raise OpenListError("存储后端未确认删除")
             print(f"  [已移入回收站] {remote} ({title}, 释放 {sz / gb:.2f} GB)", flush=True)
         except OpenListError as e:
             removed = False
@@ -492,7 +493,8 @@ def run_cleanup(dry_run=False, verbose=True):
 
         removed = True
         try:
-            ol.remove(remote)
+            if not ol.remove(remote):
+                raise OpenListError("存储后端未确认删除")
         except OpenListError as e:
             removed = False
             if verbose:
@@ -621,7 +623,8 @@ def clean_mismatched_short_dramas(dry_run=False, verbose=True):
                 continue
             removed = True
             try:
-                tr_engine.delete_remote(write_dir)
+                if not tr_engine.delete_remote(write_dir):
+                    raise OpenListError("存储后端未确认删除")
                 print(f"  [已删除短剧大包] {write_dir}", flush=True)
             except Exception as e:
                 removed = False
