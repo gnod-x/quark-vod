@@ -2,6 +2,7 @@ include README.md LICENSE NOTICE SECURITY.md CONTRIBUTING.md pyproject.toml requ
 recursive-include app/quark_vod *.py *.html
 include app/main.py
 recursive-include examples *.json
+exclude examples/search.json
 recursive-include .github/workflows *.yml *.yaml
 include tests/test_*.py
 include tests/check_sync.py
