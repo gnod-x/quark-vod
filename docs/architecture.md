@@ -32,7 +32,8 @@ flowchart LR
 
 ## State and identity
 
-The data base is configurable and contains state, locks and optional STRM output.
+The base directory is configurable. SQLite state, lock files and optional STRM
+output use separate configured paths rather than sharing one database file.
 Movie/episode identity is checked before quality ordering. Exact directory
 context can disambiguate numeric/translated episode names; conflicting years,
 seasons, sequels and multi-episode files remain rejected.
