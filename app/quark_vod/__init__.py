@@ -1,4 +1,4 @@
-"""cinema-quark 点播服务包。
+"""Quark-VOD package metadata and public module exports.
 
 模块划分：
   config           配置单一事实来源（.env 注入 cookie）
@@ -15,4 +15,4 @@ __all__ = [
     "strm_manager", "server", "cleanup",
 ]
 
-__version__ = "1.0.0"
+__version__ = "3.0.0"

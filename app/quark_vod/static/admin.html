@@ -16,7 +16,7 @@
 <section><h2>资源搜索</h2><form id="search" class="bar"><label>作品标题<input id="title" required></label><label>分类<input id="category" placeholder="如 国产剧集"></label><label>季<input id="season" type="number" min="0" value="0"></label><label>集<input id="episode" type="number" min="0" value="0"></label><button>搜索</button></form><p id="searchState"></p><div class="table"><table><thead><tr><th>名称</th><th>来源</th><th>身份评分</th><th>4K名称提示</th></tr></thead><tbody id="results"></tbody></table></div></section>
 <section><h2>最近转存</h2><div class="table"><table><thead><tr><th>ID</th><th>作品</th><th>季集</th><th>状态</th><th>大小</th><th>操作</th></tr></thead><tbody id="transfers"></tbody></table></div></section>
 <section><h2>账号与维护</h2><form id="cookieForm"><label>新的夸克 Cookie<textarea id="cookie" autocomplete="off" required></textarea></label><button>更新并验证 Cookie</button></form><p>维护操作受服务端开关、媒体库保护和播放状态检查约束。</p><div class="bar"><button id="quota" class="secondary">检查空间</button><button id="heal" class="secondary">执行自愈检查</button></div><p id="maintenance"></p></section>
-</div><p><a href="/docs">API 文档</a> · Quark VOD 3.0.0</p>
+</div><p><a href="/docs">API 文档</a> · <span id="footer-version">Quark VOD</span></p>
 </main>
 <script>
 'use strict';
@@ -55,6 +55,6 @@ byId('search').addEventListener('submit',event=>{event.preventDefault();run(asyn
 byId('cookieForm').addEventListener('submit',event=>{event.preventDefault();const cookie=byId('cookie').value;byId('cookie').value='';run(async()=>{const result=await api('/api/admin/cookie',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie})});notify(result.cookie_status||'Cookie已更新。');await refresh();});});
 byId('quota').addEventListener('click',()=>run(async()=>{const result=await api('/api/admin/quota');byId('maintenance').textContent=`点播占用 ${result.total_gb} GiB，空间统计已完成。`;}));
 byId('heal').addEventListener('click',()=>run(async()=>{await api('/api/admin/selfheal',{method:'POST'});byId('maintenance').textContent='自愈检查已完成。';await refresh();}));
-fetch('/health',{cache:'no-store'}).then(r=>r.json()).then(data=>{byId('health').textContent='服务在线 · '+(data.version||'');}).catch(()=>{byId('health').textContent='服务连接失败';});
+fetch('/health',{cache:'no-store'}).then(r=>r.json()).then(data=>{byId('health').textContent='服务在线 · '+(data.version||'');byId('footer-version').textContent='Quark VOD '+(data.version||'');}).catch(()=>{byId('health').textContent='服务连接失败';});
 </script>
 </html>

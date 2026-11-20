@@ -19,6 +19,7 @@ from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
+from quark_vod import __version__
 
 from quark_vod import cleaner, cleanup, config, db, search as search_mod, selfheal, server as legacy_srv, strm_manager
 from quark_vod.transfer import QuarkTransfer
@@ -120,7 +121,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Quark VOD",
     description="可独立部署的夸克点播服务，支持搜索源热加载和可选媒体库集成。",
-    version="3.0.0",
+    version=__version__,
     lifespan=lifespan,
 )
 
@@ -161,7 +162,7 @@ async def maintenance_busy(request, exc):
 def health(request: Request):
     if request.method == "HEAD":
         return Response(status_code=200, media_type="application/json")
-    return {"status": "ok", "service": config.SERVICE_NAME, "engine": "fastapi-v3", "version": "3.0.0"}
+    return {"status": "ok", "service": config.SERVICE_NAME, "engine": "fastapi-v3", "version": __version__}
 
 
 @app.get("/stats", tags=["Core VOD"])

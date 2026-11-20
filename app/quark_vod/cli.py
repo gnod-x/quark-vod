@@ -2,6 +2,8 @@
 import argparse
 import os
 
+from . import __version__
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="quark-vod", description="Standalone Quark VOD service")
@@ -9,7 +11,7 @@ def main(argv=None):
     parser.add_argument("--host", help="Bind address (default: VOD_HOST or 127.0.0.1)")
     parser.add_argument("--port", type=int, help="Listen port (default: VOD_PORT or 8099)")
     parser.add_argument("--data-dir", help="Directory for state, logs and the media library")
-    parser.add_argument("--version", action="version", version="Quark VOD 3.0.0")
+    parser.add_argument("--version", action="version", version=f"Quark VOD {__version__}")
     args = parser.parse_args(argv)
     if args.port is not None and not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")

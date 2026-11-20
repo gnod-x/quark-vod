@@ -13,8 +13,12 @@ APP = str(Path(__file__).resolve().parents[1] / "app")
 class IntegrationPathTests(unittest.TestCase):
     def test_explicit_database_is_the_only_cleanup_protection_source(self):
         with tempfile.TemporaryDirectory() as directory:
-            env = dict(os.environ, PYTHONPATH=APP, VOD_BASE_DIR=directory,
-                       JELLYFIN2_DB=os.path.join(directory, "explicit.sqlite"))
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(("VOD_", "QUARK_", "OPENLIST_", "JELLYFIN_", "AI_PARSE_", "SELFHEAL_"))}
+            env.update(PYTHONPATH=APP, VOD_BASE_DIR=directory,
+                       JELLYFIN2_DB=os.path.join(directory, "explicit.sqlite"),
+                       VOD_STARTUP_SCAN="0", VOD_STARTUP_WRITE_PROBE="0",
+                       SELFHEAL_ENABLED="0", AI_PARSE_ENABLED="0")
             code = """
 import os, sqlite3
 from unittest.mock import patch
@@ -45,9 +49,12 @@ with patch.object(cleanup.db, 'get_all_pinned_titles', return_value=[]):
 
     def test_library_mapping_uses_custom_root_and_rejects_sibling(self):
         with tempfile.TemporaryDirectory() as directory:
-            env = dict(os.environ, PYTHONPATH=APP, VOD_BASE_DIR=directory,
-                       CINEMA2_DIR=os.path.join(directory, "library"),
-                       JELLYFIN_LIBRARY_ROOT="/media/custom")
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(("VOD_", "QUARK_", "OPENLIST_", "JELLYFIN_", "AI_PARSE_", "SELFHEAL_"))}
+            env.update(PYTHONPATH=APP, VOD_BASE_DIR=directory,
+                       VOD_CINEMA2_DIR=os.path.join(directory, "library"),
+                       JELLYFIN_LIBRARY_ROOT="/media/custom", VOD_STARTUP_SCAN="0",
+                       VOD_STARTUP_WRITE_PROBE="0", SELFHEAL_ENABLED="0", AI_PARSE_ENABLED="0")
             code = """
 import os
 from quark_vod import config, repair_metadata

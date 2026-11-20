@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quark-vod"
-version = "3.0.0"
+dynamic = ["version"]
 description = "Portable Quark on-demand playback with reloadable search providers"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,6 +37,9 @@ quark-vod = "quark_vod.cli:main"
 package-dir = {"" = "app"}
 py-modules = ["main"]
 include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "quark_vod.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["app"]
