@@ -18,56 +18,57 @@ maintenance are explicit opt-ins.
 - Token-protected management APIs and a packaged administration page.
 - A standalone data directory with no required home-server layout.
 
-The service starts without account credentials. Actual saving/playback requires
-your Quark authorization and a reachable OpenList integration. Standalone mode
-returns ready playback URLs without generating STRM files; optional Jellyfin
-mode uses an existing stable STRM library mapping. No external AI,
-cloud-write probe, self-healing loop or maintenance is enabled by default.
+The service can start without Quark or OpenList account credentials, but management
+APIs require a token from `VOD_ADMIN_TOKEN` or `VOD_ADMIN_TOKEN_FILE`. Search
+requires an enabled, reachable search provider. Saving a new item requires Quark
+authorization and a reachable OpenList integration; playback of an item already
+saved in the service state requires that state and an OpenList endpoint reachable
+by the service and player. Standalone mode returns ready playback URLs without
+generating STRM files; optional Jellyfin mode uses an existing stable STRM library
+mapping. No external AI, cloud-write probe, self-healing loop or maintenance is
+enabled by default.
 
 ## Quick start with Docker
 
 Requires Docker Engine with Compose v2.
 
-```sh
-cp .env.example .env
-docker compose up -d --build
-curl --fail http://127.0.0.1:8099/health
-```
+Follow [installation and configuration](docs/quickstart.md) to create a private
+`.env`, set the required administrator token before first startup, configure
+playback-reachable OpenList and Quark-VOD URLs, and then build and start the
+service. The supplied Compose file builds from the local source tree; its image
+tag is not a promise that a public registry image is available.
 
 The supplied Compose file publishes only on loopback, runs the image as a
 non-root user, keeps its root filesystem read-only and limits memory to 256 MiB.
-Persistent state is stored in the `quark_vod_data` volume. The initial
-`examples/search.json` contains no enabled nodes.
+Persistent state is stored in a Compose-managed named volume. Search nodes are
+operator-owned; start from `examples/search.example.json` and enable only
+sources you operate.
 
-Set a private `VOD_ADMIN_TOKEN` in your local `.env` before using the management
-APIs. Configure your OpenList addresses and Quark authorization locally. Never
-commit that file. URLs in `OPENLIST_PUBLIC` and `PENDING_BASE_URL` must be
-reachable by the actual playback client.
-
-See [installation and configuration](docs/quickstart.md).
+Keep `.env` private and never commit it. URLs in `OPENLIST_PUBLIC` and
+`PENDING_BASE_URL` must be reachable by the actual playback client.
 
 ## Python installation
 
-Python 3.11+ on Linux:
-
-```sh
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install .
-quark-vod --help
-quark-vod --host 127.0.0.1 --port 8099
-```
+Python 3.11+ on Linux is supported. Follow the [native setup guide](docs/quickstart.md)
+for a virtual environment, a private native configuration file and the startup
+command with management authentication enabled.
 
 The default native data base is `./var`. Use `VOD_BASE_DIR` to choose another
 location. Native startup reads an environment file only when `VOD_ENV_FILE` is
-explicitly set.
+explicitly set. The Docker `.env.example` contains a Docker-specific OpenList
+address and should not be reused unchanged for native Linux installation; see
+the [native setup guide](docs/quickstart.md).
 
 ## Reloadable search providers
 
-Edit `examples/search.json` using the schema in
-[the provider guide](docs/plugins.md). Changes are checked on subsequent searches;
-the authenticated reload endpoint can validate and apply them immediately.
-An invalid replacement keeps the last valid snapshot.
+In a source checkout, copy `examples/search.example.json` to a private
+`examples/search.json` and set `VOD_SEARCH_CONFIG` to that file, using the schema
+in [the provider guide](docs/plugins.md). The supplied Docker Compose mounts the
+whole `examples/` directory as `/config` and reads `/config/search.json`; an
+installed wheel has no operator search file and must be given one explicitly.
+Changes are checked on subsequent searches; the authenticated reload endpoint can
+validate and apply them immediately. An invalid replacement keeps the last valid
+snapshot.
 
 Built-in `html` and `json` providers require no code installation. Trusted Python
 providers can be registered through `quark_vod.search` entry points and explicitly

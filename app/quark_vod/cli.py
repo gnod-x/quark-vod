@@ -24,4 +24,4 @@ def main(argv=None):
     import uvicorn
     from . import config
     uvicorn.run("quark_vod.api:create_app", factory=True, host=config.HOST,
-                port=config.PORT, workers=1, log_config=None)
+                port=config.PORT, workers=1, log_config=None, access_log=False)

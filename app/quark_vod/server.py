@@ -348,7 +348,7 @@ def _cleanup_stale_transfers(max_age=3600):
 
 def main():
     import uvicorn
-    uvicorn.run('main:app', host=config.HOST, port=config.PORT)
+    uvicorn.run('main:app', host=config.HOST, port=config.PORT, access_log=False)
 
 
 if __name__ == '__main__':
