@@ -1,4 +1,4 @@
-"""Run the actual shell wrappers against synthetic curl/ffprobe executables."""
+"""Run the host-owned shell wrappers against synthetic curl/ffprobe executables."""
 import json
 import os
 from pathlib import Path
@@ -7,7 +7,9 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = (ROOT / 'custom-ffmpeg') if (ROOT / 'custom-ffmpeg').is_dir() else (ROOT.parent / 'hometheater/custom-ffmpeg')
+# Jellyfin mounts the hometheater wrappers. The old local copy is not deployed
+# and must not silently replace the authoritative host integration under test.
+SOURCE = ROOT.parent / 'hometheater/custom-ffmpeg'
 
 
 class WrapperTests(unittest.TestCase):
@@ -45,7 +47,9 @@ else:sys.stdout.buffer.write(b'plain media bytes')
             text = text.replace('/custom-ffmpeg/bin/jq', '/usr/bin/jq')
             text = text.replace('/cache/ffprobe_cache', str(self.root/'cache'))
             (self.root/name).write_text(text)
-        self.env = dict(os.environ, FIXTURE_LOG=str(self.log))
+        self.env = dict(os.environ, FIXTURE_LOG=str(self.log),
+                        FFPROBE_BINARY=str(probe), FFPROBE_JQ='/usr/bin/jq',
+                        FFPROBE_CACHE_DIR=str(self.root/'cache'))
 
     def run_probe(self, target, mode='ok', fmt='-print_format'):
         env = dict(self.env, FIXTURE_MODE=mode)
