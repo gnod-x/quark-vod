@@ -221,7 +221,9 @@ def clean_url_if_obfuscated(direct_url):
     if is_obf and skip > 0:
         enc_url = urllib.parse.quote(direct_url)
         clean_url = f"{config.PENDING_BASE_URL}/clean?url={enc_url}&skip={skip}"
-        print(f"[{config.SERVICE_NAME}] [自动流清洗] 检测到 {skip} 字节混淆头({fmt})，激活纯净路由: {direct_url} -> {clean_url}", flush=True)
+        # Direct URLs may carry short-lived signatures. Keep them out of logs;
+        # the returned URL still contains the upstream address for the player.
+        print(f"[{config.SERVICE_NAME}] [自动流清洗] 检测到 {skip} 字节混淆头({fmt})，已激活纯净路由（URL 已省略）", flush=True)
         return clean_url
     return direct_url
 
