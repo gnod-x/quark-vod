@@ -11,7 +11,7 @@
 """
 
 __all__ = [
-    "config", "db", "openlist_client", "transfer",
+    "config", "db", "openlist_client", "transfer", "backends",
     "strm_manager", "server", "cleanup",
 ]
 

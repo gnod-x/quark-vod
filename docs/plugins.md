@@ -108,6 +108,14 @@ def fetch(node, keyword, limit, max_pages):
 扩展是管理员信任的本地Python代码，不是安全沙箱；它必须自行保证超时、资源上限和退出条件。
 JSON不支持上传、下载或远程执行插件代码。内置html/json不能被第三方同名覆盖。
 
+搜索 provider 与媒体存储是两个边界。当前公开包提供代码级 `RemoteStore` 契约和
+OpenList 适配器，供转存生命周期使用；该 seam 目前通过 Python 构造注入，尚无
+运行时后端选择、entry point 发现或热加载；夸克分享解析、转存任务及官方目录核验
+仍由 Quark transfer 内核负责。实现新的存储适配器要遵循路径约定：`mkdir`/`remove` 使用写挂载路径；
+`direct_url`/`refresh_path_tree` 使用经过 `config.play_path()` 的播放挂载路径。
+目录刷新是最佳努力提示，不代表对象存在；查询失败不得当作对象缺失。该代码边界
+目前不提供运行时选择或热加载，也不能仅通过搜索插件配置替换网盘。
+
 ## 开发接口与验证
 
 quark_vod.search_plugins.get_registry() 返回共享注册表：
