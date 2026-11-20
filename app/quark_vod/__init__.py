@@ -12,7 +12,7 @@
 
 __all__ = [
     "config", "db", "openlist_client", "transfer",
-    "strm_manager", "server", "cleanup",
+    "strm_manager", "server", "cleanup", "backends",
 ]
 
 __version__ = "1.0.0"

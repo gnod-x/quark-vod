@@ -32,6 +32,7 @@ from . import config
 from . import db
 from . import strm_manager
 from . import name_parser
+from .backends import RemoteStore, openlist_store
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -127,8 +128,9 @@ class QuarkTransfer:
         finally:
             _request_context.deadline = previous
 
-    def __init__(self, openlist_client=None):
+    def __init__(self, openlist_client=None, *, storage: RemoteStore | None = None):
         self.ol = openlist_client
+        self.storage = storage if storage is not None else (openlist_store(openlist_client) if openlist_client else None)
         self._vod_fid = None
 
     def get_cookie(self):
@@ -283,9 +285,9 @@ class QuarkTransfer:
         """确保点播根目录存在，并返回夸克侧 fid（带内存缓存，消除重复查询延迟）。"""
         if getattr(self, "_vod_fid", None):
             return self._vod_fid
-        if not self.ol:
-            raise TransferNotReady("OpenList 客户端未注入，无法建目录")
-        self.ol.mkdir(config.QUARK_VOD_ROOT)
+        if not self.storage:
+            raise TransferNotReady("未注入远程存储后端，无法创建点播目录")
+        self.storage.mkdir(config.QUARK_VOD_ROOT)
         vod_fid = self._get_quark_fid(config.QUARK_VOD_ROOT)
         if not vod_fid:
             raise TransferFailed(f"无法获取 {config.QUARK_VOD_ROOT} 的夸克 fid")
@@ -399,7 +401,7 @@ class QuarkTransfer:
         real_path = f"{parent_path}/{name}"
         play_path = config.play_path(real_path)
         try:
-            url = self.ol.direct_url(play_path) if self.ol else None
+            url = self.storage.direct_url(play_path) if self.storage else None
             if url:
                 req = urllib.request.Request(url, headers={"Range": "bytes=0-15", "User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=5) as resp:
@@ -424,9 +426,9 @@ class QuarkTransfer:
             ok = self.rename_quark_file(fid, new_name)
             if ok:
                 print(f"[QuarkTransfer] [格式扶正] 发现伪装视频: {name} ({size/1024/1024:.1f}MB) -> 自动重命名为: {new_name}", flush=True)
-                if self.ol:
+                if self.storage:
                     try:
-                        self.ol.refresh_path_tree(config.play_path(parent_path))
+                        self.storage.refresh_path_tree(config.play_path(parent_path))
                     except Exception:
                         pass
                 return {"path": f"{parent_path}/{new_name}", "name": new_name, "size": size, "fid": fid}
@@ -784,7 +786,7 @@ class QuarkTransfer:
                                  save_target=None,save_task_id=None,save_started_at=None)
         db.enqueue_cleanup(tid,target,db.now()+config.KEEP_DAYS*86400)
         try:
-            self.ol.refresh_path_tree(config.play_path(target))
+            self.storage.refresh_path_tree(config.play_path(target))
         except Exception:
             pass
         return tid,target
@@ -953,7 +955,7 @@ class QuarkTransfer:
             identity = repr((work.cat, work.title, season, pwd_id, selected.get('fid'))).encode()
             slot = config.QUARK_VOD_ROOT + '/vod_' + hashlib.sha256(identity).hexdigest()[:24]
             self.ensure_vod_dir()
-            self.ol.mkdir(slot)
+            self.storage.mkdir(slot)
             fid = self._get_quark_fid(slot)
             if not fid:
                 raise TransferFailed('无法确认转存目标目录')
@@ -1005,7 +1007,7 @@ class QuarkTransfer:
                                save_target=None,save_task_id=None,save_started_at=None)
             db.enqueue_cleanup(tid,target,db.now()+config.KEEP_DAYS*86400)
             try:
-                self.ol.refresh_path_tree(config.play_path(target))
+                self.storage.refresh_path_tree(config.play_path(target))
             except Exception:
                 pass
             return tid,target
@@ -1017,6 +1019,6 @@ class QuarkTransfer:
 
     # ── 删除 ──────────────────────────────────────────
     def delete_remote(self, remote_path):
-        if not self.ol:
-            raise TransferNotReady("OpenList 客户端未注入")
-        return self.ol.remove(remote_path)
+        if not self.storage:
+            raise TransferNotReady("未注入远程存储后端")
+        return self.storage.remove(remote_path)

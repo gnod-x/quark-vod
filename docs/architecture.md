@@ -3,6 +3,12 @@
 Quark-VOD has a standalone FastAPI API, a shared playback/state core and optional
 external integrations.
 
+Remote storage operations used by the transfer lifecycle sit behind the small
+`RemoteStore` contract; write operations use the write mount, while direct-link
+and refresh operations use the playback mount. The default adapter wraps OpenList.
+Quark share parsing, official save tasks and account authorization remain in the transfer component,
+so this seam does not yet make arbitrary cloud drives drop-in backends.
+
 ```mermaid
 flowchart LR
     Client --> API[FastAPI / play and management]
@@ -12,8 +18,10 @@ flowchart LR
     Search --> Custom[Explicit trusted providers]
     API --> Work[Identity and playback coordinator]
     Work --> State[SQLite and transfer intent]
-    Work --> Quark[Quark single-file transfer]
-    Work --> OpenList[OpenList read resolution]
+    Work --> Transfer[Quark transfer and task recovery]
+    Transfer --> Quark[Quark official API]
+    Transfer --> Store[RemoteStore contract]
+    Store --> OpenList[OpenList adapter]
     Work --> Range[Bounded Range proxy]
     Work --> STRM[Stable STRM output]
     STRM --> Media[Optional media server]
