@@ -22,9 +22,9 @@ os.environ.update(
 )
 sys.path.insert(0, str(ROOT / "app"))
 
-from quark_vod import config
+from quark_vod import config, db
 from quark_vod.backends import OpenListStore
-from quark_vod.transfer import QuarkTransfer, TransferNotReady
+from quark_vod.transfer import QuarkTransfer, TransferFailed, TransferNotReady
 
 
 class FakeStore:
@@ -84,6 +84,49 @@ class StorageContractTests(unittest.TestCase):
             transfer.ensure_vod_dir()
         with self.assertRaises(TransferNotReady):
             transfer.delete_remote("/夸克网盘/点播/episode.mp4")
+
+    def test_root_mkdir_false_stops_before_lookup_and_allows_retry(self):
+        store = FakeStore()
+        store.mkdir = Mock(side_effect=[False, True])
+        transfer = QuarkTransfer(storage=store)
+        with patch.object(transfer, "_get_quark_fid", return_value="fid") as lookup:
+            with self.assertRaises(TransferFailed):
+                transfer.ensure_vod_dir()
+            lookup.assert_not_called()
+            self.assertIsNone(transfer._vod_fid)
+            self.assertEqual(transfer.ensure_vod_dir(), "fid")
+
+    def test_remove_false_raises_and_allows_retry(self):
+        store = FakeStore()
+        store.remove = Mock(side_effect=[False, True])
+        transfer = QuarkTransfer(storage=store)
+        with self.assertRaises(TransferFailed):
+            transfer.delete_remote("/夸克网盘/点播/episode.mp4")
+        self.assertTrue(transfer.delete_remote("/夸克网盘/点播/episode.mp4"))
+
+    def test_slot_mkdir_false_cannot_submit_save_intent_or_request(self):
+        store = FakeStore()
+        store.mkdir = Mock(side_effect=[True, False])
+        transfer = QuarkTransfer(storage=store)
+        transfer.ensure_ready = Mock()
+        transfer._get_quark_fid = Mock(return_value="root-fid")
+        transfer.resolve_share = Mock(return_value=("token", "share-id", []))
+        transfer.share_files = Mock(return_value=[])
+        transfer.select_share_video = Mock(return_value={
+            "size": 400 * 1024**2,
+            "share": {"fid": "source-fid", "file_name": "Fixture.mkv"},
+        })
+        transfer._request = Mock()
+        with self.assertRaises(TransferFailed):
+            transfer._do_transfer("电影", "Rejected slot (2026)", 0, 0,
+                                  "https://pan.quark.cn/s/fixture")
+        transfer._get_quark_fid.assert_called_once_with(config.QUARK_VOD_ROOT)
+        transfer._request.assert_not_called()
+        row = db.get_transfer("电影", "Rejected slot (2026)", 0, 0)
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNone(row["save_started_at"])
+        self.assertIsNone(row["save_target"])
+        self.assertIsNone(row["remote_path"])
 
     def test_selected_transfer_uses_injected_storage_for_create_and_refresh(self):
         store = FakeStore()

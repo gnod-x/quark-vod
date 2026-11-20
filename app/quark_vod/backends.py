@@ -20,7 +20,9 @@ class RemoteStore(Protocol):
     * ``direct_url`` and ``refresh_path_tree`` receive playback-mount paths
       after ``config.play_path`` (normally ``/夸克/...``).
 
-    ``mkdir`` and ``remove`` return true only after their operation is accepted.
+    ``mkdir`` and ``remove`` return true only after their operation is accepted;
+    return false or raise on failure. QuarkTransfer turns false mutation results
+    into TransferFailed, without advancing the save or cleanup lifecycle.
     ``refresh_path_tree`` is best-effort: its return value is advisory and must
     never be used as proof that an object exists. Implementations may raise
     provider exceptions; callers must not treat read or refresh failures as a
