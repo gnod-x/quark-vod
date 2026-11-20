@@ -25,12 +25,145 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
+from dataclasses import dataclass
 from . import config
 
 # 伪装特征常量
 PNG_MAGIC_HEX = "89504e470d0a1a0a"
 MKV_MAGIC_HEX = "1a45dfa3"
 MP4_FTYP_HEX = "66747970"
+
+
+class CleanStreamError(Exception):
+    def __init__(self, status, message, headers=None):
+        super().__init__(message)
+        self.status = status
+        self.headers = headers or {}
+
+
+def parse_range_header(value):
+    """Only single byte ranges are supported. Ignore malformed/multipart ranges."""
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", (value or "").strip(), re.I)
+    if not match:
+        return None
+    left, right = match.groups()
+    if not left:
+        return (None, int(right)) if right and int(right) > 0 else None
+    start, end = int(left), int(right) if right else None
+    return (start, end) if end is None or end >= start else None
+
+
+@dataclass
+class CleanStream:
+    response: object
+    status: int
+    headers: dict
+    discard: int
+    length: object
+
+    def close(self):
+        self.response.close()
+
+    def chunks(self):
+        discard, remaining = self.discard, self.length
+        try:
+            while discard:
+                part = self.response.read(min(discard, 128 * 1024))
+                if not part:
+                    raise OSError("upstream ended before clean stream start")
+                discard -= len(part)
+            while remaining is None or remaining > 0:
+                part = self.response.read(128 * 1024 if remaining is None else min(remaining, 128 * 1024))
+                if not part:
+                    if remaining:
+                        raise OSError("upstream ended before clean stream end")
+                    break
+                yield part
+                if remaining is not None:
+                    remaining -= len(part)
+        finally:
+            self.close()
+
+
+def open_clean_stream(url, skip, range_header="", request_headers=None, *, opener=None):
+    """Open and validate a prefixed stream; body reads are bounded and lazy."""
+    if not isinstance(skip, int) or skip < 0:
+        raise CleanStreamError(400, "invalid skip")
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        raise CleanStreamError(400, "HTTP URL required")
+    selected = parse_range_header(range_header)
+    headers = {"Accept-Encoding": "identity"}
+    for key in ("User-Agent", "Accept"):
+        value = (request_headers or {}).get(key.lower()) or (request_headers or {}).get(key)
+        if value:
+            headers[key] = value
+    if selected is None:
+        translated = f"bytes={skip}-"
+    elif selected[0] is None:
+        translated = f"bytes=-{selected[1]}"
+    else:
+        start, end = selected
+        translated = f"bytes={start + skip}-{end + skip if end is not None else ''}"
+    headers["Range"] = translated
+    try:
+        response = (opener or urllib.request.urlopen)(urllib.request.Request(url, headers=headers), timeout=20)
+    except urllib.error.HTTPError as exc:
+        try:
+            if exc.code == 416:
+                match = re.fullmatch(r"bytes \*/(\d+)", exc.headers.get("Content-Range", ""))
+                out = {"Content-Range": f"bytes */{max(0, int(match[1]) - skip)}"} if match else {}
+                raise CleanStreamError(416, "range not satisfiable", out) from None
+            if exc.code in (404, 410) or exc.code >= 500:
+                _trigger_selfheal_for(url)
+            raise CleanStreamError(502, f"upstream HTTP {exc.code}") from None
+        finally:
+            exc.close()
+    try:
+        if response.status not in (200, 206):
+            raise CleanStreamError(502, "unexpected upstream status")
+        if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+            raise CleanStreamError(502, "encoded upstream cannot be byte translated")
+        actual_start = 0
+        actual_end = total = None
+        if response.status == 206:
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
+            if not match:
+                raise CleanStreamError(502, "invalid upstream Content-Range")
+            actual_start, actual_end, total = map(int, match.groups())
+            if not (0 <= actual_start <= actual_end < total):
+                raise CleanStreamError(502, "invalid upstream byte bounds")
+        elif response.headers.get("Content-Length") is not None:
+            total = int(response.headers["Content-Length"])
+            actual_end = total - 1
+        clean_total = max(0, total - skip) if total is not None else None
+        # If a server ignores Range without declaring a size, a full 200 is valid.
+        if total is None:
+            selected = None
+        if selected is None:
+            start, end = 0, clean_total - 1 if clean_total is not None else None
+        elif selected[0] is None:
+            start, end = max(0, clean_total - selected[1]), clean_total - 1
+        else:
+            start = selected[0]
+            end = min(selected[1], clean_total - 1) if selected[1] is not None else clean_total - 1
+        if selected is not None and (clean_total == 0 or start >= clean_total):
+            raise CleanStreamError(416, "range not satisfiable", {"Content-Range": f"bytes */{clean_total}"})
+        raw_start = skip + start
+        if actual_start > raw_start or (end is not None and actual_end < skip + end):
+            raise CleanStreamError(502, "upstream returned a different byte range")
+        length = max(0, end - start + 1) if end is not None else None
+        out = {"Accept-Ranges": "bytes", "Content-Type": response.headers.get("Content-Type", "video/x-matroska")}
+        if response.headers.get("Content-Disposition"):
+            out["Content-Disposition"] = response.headers["Content-Disposition"]
+        if length is not None:
+            out["Content-Length"] = str(length)
+        if selected is not None:
+            out["Content-Range"] = f"bytes {start}-{end}/{clean_total}"
+        return CleanStream(response, 206 if selected is not None else 200, out, raw_start - actual_start, length)
+    except Exception:
+        response.close()
+        raise
 
 
 def detect_stream_obfuscation(direct_url, timeout=2.5):
@@ -94,81 +227,35 @@ def clean_url_if_obfuscated(direct_url):
 
 
 def handle_clean_request(handler, q, is_head=False):
-    """8099 /clean 请求处理（零拷贝 Range 字节平移透传）。"""
+    """兼容旧 HTTPServer，复用 FastAPI 相同的区间转换。"""
     raw_url = (q.get("url") or [""])[0]
-    if not raw_url:
-        return handler._json(400, {"error": "missing url"})
-
+    stream = None
+    sent = False
     try:
-        skip = int((q.get("skip") or ["8"])[0])
-    except ValueError:
-        skip = 8
-
-    range_hdr = handler.headers.get("Range", "")
-    req = urllib.request.Request(raw_url)
-
-    # 透传客户端主要标头
-    for h in ("User-Agent", "Accept", "Accept-Encoding"):
-        val = handler.headers.get(h)
-        if val:
-            req.add_header(h, val)
-
-    # 核心算法：对客户端 Range 请求加上 skip 偏移
-    if range_hdr.startswith("bytes="):
-        r_val = range_hdr[6:].strip()
-        parts = r_val.split("-")
-        start = int(parts[0]) if parts[0] else 0
-        end = int(parts[1]) if len(parts) > 1 and parts[1] else ""
-        t_start = start + skip
-        t_end = (end + skip) if end != "" else ""
-        req.add_header("Range", f"bytes={t_start}-{t_end}")
-    else:
-        req.add_header("Range", f"bytes={skip}-")
-
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            code = resp.status
-            if code >= 400:
-                # 2026-10-25：上游返回错误码（OpenList 文件已删等）时，
-                # 旧实现会原样把 500 透传给播放器，strm 永远卡在 clean 死链。
-                # 此处主动触发一次异步自愈回退，让下次播放走 pending 重新转存。
-                _trigger_selfheal_for(raw_url)
-                raise RuntimeError(f"upstream HTTP {code}")
-            cl = resp.headers.get("Content-Length")
-            cr = resp.headers.get("Content-Range")
-            cd = resp.headers.get("Content-Disposition")
-            ct = resp.headers.get("Content-Type", "video/x-matroska")
-
-            handler.send_response(code)
-            handler.send_header("Content-Type", ct)
-            handler.send_header("Accept-Ranges", "bytes")
-            if cd:
-                handler.send_header("Content-Disposition", cd)
-            if cl:
-                handler.send_header("Content-Length", cl)
-            if cr:
-                # bytes 8-1219326423/1219326424 -> bytes 0-1219326415/1219326416
-                m = re.match(r"bytes\s+(\d+)-(\d+)/(\d+)", cr)
-                if m:
-                    s_o, e_o, t_o = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                    handler.send_header("Content-Range", f"bytes {s_o - skip}-{e_o - skip}/{t_o - skip}")
-            handler.end_headers()
-
-            if not is_head:
-                while True:
-                    buf = resp.read(128 * 1024)
-                    if not buf:
-                        break
-                    handler.wfile.write(buf)
-    except (BrokenPipeError, ConnectionResetError):
-        # 客户端暂停或退出播放，正常断开
-        pass
-    except Exception as e:
+        try:
+            skip = int((q.get("skip") or ["8"])[0])
+        except ValueError:
+            return handler._json(400, {"error": "invalid skip"})
+        stream = open_clean_stream(raw_url, skip, handler.headers.get("Range", ""), handler.headers)
+        handler.send_response(stream.status)
+        for key, value in stream.headers.items():
+            handler.send_header(key, value)
+        handler.end_headers()
+        sent = True
         if not is_head:
-            try:
-                handler._json(502, {"error": "clean proxy stream error", "detail": str(e)[:150]})
-            except Exception:
-                pass
+            for chunk in stream.chunks():
+                handler.wfile.write(chunk)
+    except CleanStreamError as exc:
+        if not sent:
+            handler._json(exc.status, {"error": str(exc)}, headers=exc.headers)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    except Exception as exc:
+        if not sent:
+            handler._json(502, {"error": "clean proxy stream error", "type": type(exc).__name__})
+    finally:
+        if stream:
+            stream.close()
 
 
 # ── 上游失效主动自愈（2026-10-25）────────────────────────────

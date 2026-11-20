@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quark VOD · 管理台</title>
+<style>
+:root{color-scheme:dark;font:15px/1.6 system-ui,sans-serif;background:#101726;color:#e8eef8}*{box-sizing:border-box}body{margin:0}main{max-width:1150px;margin:auto;padding:24px}header,.bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}header{justify-content:space-between;margin-bottom:20px}h1{font-size:27px;margin:0}h2{font-size:19px;margin:0 0 14px}p{margin:8px 0;color:#aab8d0}section{background:#182338;border:1px solid #2d3b54;border-radius:12px;padding:20px;margin-bottom:18px}button,input,textarea{font:inherit;border:1px solid #44546f;border-radius:7px;padding:9px 12px}input,textarea{background:#101a2c;color:inherit;min-width:0}input[type=number]{width:84px}button{background:#2867c9;color:white;cursor:pointer}button.secondary{background:#27364d}button:disabled{opacity:.6;cursor:wait}label{display:flex;flex-direction:column;gap:4px;flex:1}textarea{width:100%;min-height:90px}small,.muted{color:#aab8d0}.status{padding:8px 12px;background:#24344e;border-radius:8px;overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.metric{background:#101a2c;padding:14px;border-radius:8px}.metric b{display:block;font-size:24px}.table{overflow:auto}table{width:100%;border-collapse:collapse;text-align:left;font-size:14px}td,th{padding:10px;border-bottom:1px solid #2d3b54;vertical-align:top}td{overflow-wrap:anywhere}td button{padding:5px 8px;margin:2px}.hidden{display:none!important}#notice{position:sticky;top:8px;z-index:1;margin-bottom:12px;white-space:pre-wrap}a{color:#8cbdff}@media(max-width:600px){main{padding:12px}section{padding:15px}.bar>*{max-width:100%}h1{font-size:23px}}
+</style>
+<main>
+<header><div><h1>Quark VOD</h1><p>搜索源热加载 · 单文件转存 · 点播管理</p></div><span id="health" class="status">正在检查服务</span></header>
+<div id="notice" class="status" role="status" aria-live="polite">连接管理台后查看运行状态。</div>
+<section><h2>管理连接</h2><form id="connect" class="bar"><label>管理员令牌<input id="token" type="password" autocomplete="off" required placeholder="输入管理员令牌"></label><button>连接</button><button type="button" id="disconnect" class="secondary">退出</button></form><small>令牌只保存在当前页面内存，刷新页面后需要重新输入。首次部署请配置 VOD_ADMIN_TOKEN 或令牌文件。</small></section>
+<div id="workspace" class="hidden">
+<section><div class="bar"><h2>运行概览</h2><button id="refresh" class="secondary">刷新</button><button id="probe" class="secondary">验证网盘连接</button></div><p id="capability">尚未执行连接验证。</p><div id="metrics" class="grid"></div><small>网盘连接验证会检查账号及转存权限，可能创建并删除一个独立测试文件。</small></section>
+<section><div class="bar"><h2>搜索插件</h2><button id="reload" class="secondary">重新加载配置</button></div><p id="pluginState"></p><div class="table"><table><thead><tr><th>标识</th><th>名称</th><th>解析器</th><th>启用</th><th>超时</th></tr></thead><tbody id="plugins"></tbody></table></div><small>修改挂载的搜索配置后，新请求会自动加载。配置错误时继续使用上一有效版本；此处可立即验证并加载。</small></section>
+<section><h2>资源搜索</h2><form id="search" class="bar"><label>作品标题<input id="title" required></label><label>分类<input id="category" placeholder="如 国产剧集"></label><label>季<input id="season" type="number" min="0" value="0"></label><label>集<input id="episode" type="number" min="0" value="0"></label><button>搜索</button></form><p id="searchState"></p><div class="table"><table><thead><tr><th>名称</th><th>来源</th><th>身份评分</th><th>4K名称提示</th></tr></thead><tbody id="results"></tbody></table></div></section>
+<section><h2>最近转存</h2><div class="table"><table><thead><tr><th>ID</th><th>作品</th><th>季集</th><th>状态</th><th>大小</th><th>操作</th></tr></thead><tbody id="transfers"></tbody></table></div></section>
+<section><h2>账号与维护</h2><form id="cookieForm"><label>新的夸克 Cookie<textarea id="cookie" autocomplete="off" required></textarea></label><button>更新并验证 Cookie</button></form><p>维护操作受服务端开关、媒体库保护和播放状态检查约束。</p><div class="bar"><button id="quota" class="secondary">检查空间</button><button id="heal" class="secondary">执行自愈检查</button></div><p id="maintenance"></p></section>
+</div><p><a href="/docs">API 文档</a> · Quark VOD 3.0.0</p>
+</main>
+<script>
+'use strict';
+let adminToken = '';
+const byId = id => document.getElementById(id);
+const notify = text => { byId('notice').textContent = text; };
+function cell(row,value){const item=document.createElement('td');item.textContent=value==null?'—':String(value);row.append(item);return item;}
+function button(parent,label,fn){const b=document.createElement('button');b.type='button';b.textContent=label;b.addEventListener('click',()=>run(fn));parent.append(b);}
+async function api(path,options={}){
+  const headers=new Headers(options.headers||{});headers.set('Authorization','Bearer '+adminToken);
+  const response=await fetch(path,{...options,headers,cache:'no-store',credentials:'omit'});
+  let data;try{data=await response.json();}catch{data={error:'invalid_response'};}
+  if(!response.ok){if(response.status===401){adminToken='';byId('workspace').classList.add('hidden');}throw new Error(data.error||data.message||'HTTP '+response.status);}
+  return data;
+}
+async function run(fn){try{await fn();}catch(error){notify(error.message);}}
+function renderPlugins(data){
+  byId('pluginState').textContent=`已启用 ${data.enabled_count||0} 个源 · 配置版本 ${data.generation||0}`+(data.error?' · 配置异常，当前有效版本继续使用':'');
+  const rows=byId('plugins');rows.replaceChildren();
+  for(const node of data.nodes||[]){const row=document.createElement('tr');for(const value of[node.id,node.name,node.provider,node.enabled?'是':'否',node.timeout+'s'])cell(row,value);rows.append(row);}
+}
+function renderOverview(data){
+  const cap=data.capability||{};byId('capability').textContent=(cap.cookie_status||'尚未验证账号')+' · '+(cap.openlist_reason||'尚未验证读取与转存服务');
+  const metrics=byId('metrics');metrics.replaceChildren();
+  for(const[label,value]of[['已保存',data.stats?.done||0],['播放请求',data.stats?.plays||0],['失败记录',data.stats?.failed||0],['STRM登记',data.strm_summary?.registered||0]]){const box=document.createElement('div');box.className='metric';const b=document.createElement('b');b.textContent=value;box.append(b,document.createTextNode(label));metrics.append(box);}
+  const rows=byId('transfers');rows.replaceChildren();
+  for(const item of data.recent_transfers||[]){const row=document.createElement('tr');for(const value of[item.id,item.title,'S'+item.season+'E'+item.episode,item.status,item.size_gb?item.size_gb+' GiB':'—'])cell(row,value);const actions=cell(row,'');button(actions,'预热',async()=>{const params=new URLSearchParams({cat:item.cat,t:item.title,s:item.season,e:item.episode});await api('/preheat?'+params);notify('预热任务已提交。');});button(actions,'重置',async()=>{if(!confirm('将这条记录恢复为待处理状态？'))return;await api('/api/admin/transfer/'+encodeURIComponent(item.id),{method:'DELETE'});await refresh();notify('记录已重置。');});rows.append(row);}
+}
+async function refresh(){const[overview,plugins]=await Promise.all([api('/api/admin/overview'),api('/api/admin/plugins')]);renderOverview(overview);renderPlugins(plugins);byId('workspace').classList.remove('hidden');}
+byId('connect').addEventListener('submit',event=>{event.preventDefault();adminToken=byId('token').value.trim();byId('token').value='';run(async()=>{await refresh();notify('管理台已连接。');});});
+byId('disconnect').addEventListener('click',()=>{adminToken='';byId('token').value='';byId('cookie').value='';byId('workspace').classList.add('hidden');for(const id of['transfers','results','plugins','metrics'])byId(id).replaceChildren();notify('已退出当前页面。');});
+byId('refresh').addEventListener('click',()=>run(refresh));
+byId('reload').addEventListener('click',()=>run(async()=>{renderPlugins(await api('/api/admin/plugins/reload',{method:'POST'}));notify('搜索配置已加载。');}));
+byId('probe').addEventListener('click',()=>run(async()=>{await api('/api/admin/capability/probe',{method:'POST'});await refresh();notify('连接验证已完成。');}));
+byId('search').addEventListener('submit',event=>{event.preventDefault();run(async()=>{const params=new URLSearchParams({title:byId('title').value,cat:byId('category').value,season:byId('season').value,episode:byId('episode').value});const data=await api('/api/admin/search-debug?'+params);byId('searchState').textContent=data.configured===false?'尚未配置搜索源。':`${data.total_candidates||0} 个候选`+(data.partial?' · 部分搜索未完成':'');const rows=byId('results');rows.replaceChildren();for(const item of data.candidates||[]){const row=document.createElement('tr');for(const value of[item.name,item.source,item.score,item.is_4k_hint?'有提示，尚待媒体验证':'无'])cell(row,value);rows.append(row);}});});
+byId('cookieForm').addEventListener('submit',event=>{event.preventDefault();const cookie=byId('cookie').value;byId('cookie').value='';run(async()=>{const result=await api('/api/admin/cookie',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie})});notify(result.cookie_status||'Cookie已更新。');await refresh();});});
+byId('quota').addEventListener('click',()=>run(async()=>{const result=await api('/api/admin/quota');byId('maintenance').textContent=`点播占用 ${result.total_gb} GiB，空间统计已完成。`;}));
+byId('heal').addEventListener('click',()=>run(async()=>{await api('/api/admin/selfheal',{method:'POST'});byId('maintenance').textContent='自愈检查已完成。';await refresh();}));
+fetch('/health',{cache:'no-store'}).then(r=>r.json()).then(data=>{byId('health').textContent='服务在线 · '+(data.version||'');}).catch(()=>{byId('health').textContent='服务连接失败';});
+</script>
+</html>

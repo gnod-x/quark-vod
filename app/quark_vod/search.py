@@ -1,32 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-片源搜索模块
-
-两个引擎：
-
-  1. CMS 引擎（默认，已实测稳定）
-     标准苹果 CMS /api.php/provide/vod 接口，返回 m3u8 直链。
-     优点：接口规范、可用性高、返回海报+集数+直链。
-     本质：播放的是【源站 CDN】，不落到自己网盘。
-
-  2. PanShare 引擎（网盘分享搜索，预留）
-     对接快映/木偶/多多等 PanWebShare 站，返回夸克分享链接。
-     启用后配合 transfer.py 可转存到自己网盘。
-     当前状态：这些站多为纯 SPA，接口需逆向，框架期先占位。
-
-重要说明（架构知情权）：
-  两条路线的"播放来源"不同，务必知悉：
-    CMS      -> 播放源站 CDN 的 m3u8（不占网盘空间，稳定性看源站）
-    PanShare -> 转存到你的夸克网盘再播（占空间，但画质/稳定性自己可控）
-  默认走 CMS，配了 QUARK_COOKIE 且 PanShare 就绪后优先走 PanShare。
-"""
+"""Quark candidate search and identity scoring; CMS helpers are legacy only."""
 
 import json
 import os
 import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,14 +18,8 @@ from . import db
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 # ── CMS 源（2026-10-18 最新高可用源池）──────────────────
-CMS_SITES = [
-    {"key": "ikun", "name": "⚡ikun┃官方M3U8", "api": "https://ikunzyapi.com/api.php/provide/vod"},
-    {"key": "guangsu", "name": "⚡光速┃官方M3U8", "api": "https://api.guangsuapi.com/api.php/provide/vod"},
-    {"key": "bfzy", "name": "⚡暴风┃官方M3U8", "api": "https://bfzyapi.com/api.php/provide/vod"},
-    {"key": "lzi",  "name": "⚡量子┃官方M3U8", "api": "https://cj.lziapi.com/api.php/provide/vod"},
-    {"key": "xinlang", "name": "⚡新浪┃官方M3U8", "api": "http://api.xinlangapi.com/xinlangapi.php/provide/vod"},
-    {"key": "feifan", "name": "⚡非凡┃官方M3U8", "api": "http://cj.ffzyapi.com/api.php/provide/vod"},
-]
+# Legacy CMS helpers require an explicit sites argument; no bundled service list.
+CMS_SITES = []
 
 # 单源超时（秒）。CMS 源响应 3~4s，留余量
 SEARCH_TIMEOUT = 20
@@ -54,7 +29,7 @@ class SearchResult:
     """统一的搜索结果。"""
 
     def __init__(self, engine, source, name, year, poster, episodes, play_url=None,
-                 share_url=None, pan_type=None, media_type=""):
+                 share_url=None, pan_type=None, media_type="", names=None, sources=None):
         self.engine = engine          # cms / panshare
         self.source = source          # 源站 key
         self.name = name
@@ -63,6 +38,8 @@ class SearchResult:
         self.episodes = episodes or []  # [(集号, 直链或分享链接)]
         self.play_url = play_url        # 电影直链
         self.share_url = share_url      # 网盘分享链接（panshare）
+        self.names = names or [name]
+        self.sources = sources or [source]
         self.pan_type = pan_type
         self.media_type = media_type or ""   # CMS type_name（国产剧/动作片/日韩动漫…）
 
@@ -254,60 +231,57 @@ def normalize_keyword(kw):
     return res
 
 
-def search(keyword, prefer_panshare=False):
-    """统一搜索入口（2026-10-20 起只返回夸克网盘结果）。
+def query_variants(title, aliases=(), season=0):
+    core = normalize_keyword(sanitize_title(title))
+    variants = [core]
+    if season > 1:
+        variants.append(f"{core} 第{season}季")
+    year = re.search(r"[(（](\d{4})[)）]\s*$", title)
+    if year:
+        variants.append(core + year.group(1))
+    variants.extend(sanitize_title(a) for a in aliases if a)
+    return list(dict.fromkeys(q for q in variants if q))[:4]
 
-    prefer_panshare=True 且 cookie 就绪时检索网盘分享；否则返回空。
-    CMS 降级已彻底移除，多轮递进召回（年份变体/主标题/原始词）仅走网盘。
-    """
-    target_kw = sanitize_title(keyword)
-    if not target_kw:
-        target_kw = keyword.strip()
 
-    norm_kw = normalize_keyword(target_kw)
-    main_kw = re.split(r"[\s~～:：\-—_]+", target_kw)[0].strip()
+def search_report(title, *, aliases=(), season=0, episode=0, use_cache=True):
+    from .panshare_matrix import PanshareMatrix, merge_items, source_snapshot
+    snapshot, configuration_error = source_snapshot()
+    queries = query_variants(title, aliases, season)
+    reports = [PanshareMatrix.search_report(q, use_cache=use_cache, snapshot=snapshot,
+                configuration_error=configuration_error) for q in queries]
+    items = merge_items([row for report in reports for row in report['items']])
+    results = [SearchResult(engine='panshare', source=r['source'], name=r['name'], year='', poster='', episodes=[],
+               share_url=r['share_url'], pan_type='quark', names=r['names'], sources=r['sources']) for r in items]
+    return {'results': results, 'queries': queries, 'nodes': [n for r in reports for n in r['nodes']],
+            'partial': any(r['partial'] for r in reports) or not bool(snapshot.enabled_nodes),
+            'cached': bool(reports) and all(r['cached'] for r in reports),
+            'configured': bool(snapshot.enabled_nodes), 'configuration_error': configuration_error,
+            'config_fingerprint': snapshot.fingerprint}
 
-    # 年份变体召回：网盘站常把年份拼在片名后（《爱你2025》），而纯片名
-    # （《爱你》）会混入大量同名微短剧。2026-10-20 实测：《爱你》纯名搜索
-    # 0 个合格源，而《爱你2025》一次命中 3 个正确 4K 源。
-    year_variants = []
-    m_year_kw = re.search(r"[(（](\d{4})[)）]\s*$", keyword or "")
-    if m_year_kw:
-        year_variants.append(f"{target_kw}{m_year_kw.group(1)}")
 
-    results = []
-    seen_shares = set()
+def search(keyword, prefer_panshare=False, season=0, episode=0, *, aliases=()):
+    # Public share searches don't require a drive cookie; saving does.
+    if not prefer_panshare:
+        return []
+    return search_report(keyword, aliases=aliases, season=season, episode=episode)['results']
 
-    def _append_unique(res_list):
-        for r in res_list:
-            # 2026-10-20 修复：去重键必须纳入 media_type。
-            # 苹果 CMS 同一关键词会返回多条同名但不同类型的条目
-            # （《爱你》同时是「剧情片」和「国产剧」），旧实现用
-            # (source, name) 做 key，导致后被解析的国产剧被同名剧情片挤掉，
-            # 观众点剧集时只能看到电影版（或反之）。
-            key = r.share_url or r.play_url or (r.source, r.name, r.media_type)
-            if key not in seen_shares:
-                seen_shares.add(key)
-                results.append(r)
 
-    if prefer_panshare and config.COOKIE_READY:
-        _append_unique(search_panshare(target_kw))
-        if norm_kw != target_kw:
-            _append_unique(search_panshare(norm_kw))
-        if main_kw and main_kw != target_kw and len(main_kw) >= 2:
-            if not any(score_search_result(r, keyword) >= 30.0 for r in results):
-                _append_unique(search_panshare(main_kw))
-        for yv in year_variants:
-            if not any(score_search_result(r, keyword) >= 30.0 for r in results):
-                _append_unique(search_panshare(yv))
+def matches_kind(result, cat):
+    names = ' '.join(getattr(result, 'names', [result.name]))
+    if ('动漫' in cat or '动画' in cat) and re.search(r'真人|剧版|电视剧', names):
+        return False
+    if ('剧' in cat or '电影' in cat or cat == '欧美大片') and re.search(r'动漫版|动画版|沙雕版', names):
+        return False
+    return True
 
-    # 2026-10-20：CMS 降级已彻底移除。搜索仅返回夸克网盘（panshare）结果，
-    # 不再请求苹果 CMS 采集站。多轮递进召回（年份变体/主标题/原始词）全部只走网盘。
-    if not any(score_search_result(r, keyword) >= 30.0 for r in results):
-        if prefer_panshare and config.COOKIE_READY and target_kw != keyword:
-            _append_unique(search_panshare(keyword))
 
-    return results
+def rank_candidates(results, title, season=0, episode=0, cat='', *, aliases=()):
+    from .quality import quality_hint
+    scored = [(score_search_result(r, title, season=season, episode=episode, aliases=aliases), r) for r in results]
+    scored = [(score, r) for score, r in scored if score >= 30 and r.share_url and matches_kind(r, cat)]
+    scored.sort(key=lambda pair: (-(pair[0] >= 85),
+        -int(quality_hint(pair[1].name)['level'] == '4k'), -pair[0], pair[1].share_url))
+    return [r for score, r in scored]
 
 
 STOP_WORDS = {
@@ -328,7 +302,7 @@ SERIES_MARKERS = [
 ]
 
 TEMPLATE_NOISE_REGEX = re.compile(
-    r"(?:剧情介绍|在线观看|免费观看|高清全集|4K\[臻彩\]|4K|臻彩|超清|高清|1080[pP]|2160[pP]|WEB-DL|HDR|EDR|夸克网盘|迅雷下载|网盘下载|全集|完结|更新至\d+集?|第\d+集|--.*|-.*$)",
+    r"(?:全\s*\d+\s*集|[（(]\s*\d+\s*集\s*[）)]|剧情介绍|在线观看|免费观看|高清全集|4K\[臻彩\]|4K|臻彩|超清|高清|1080[pP]|2160[pP]|WEB-DL|HDR|EDR|夸克网盘|迅雷下载|网盘下载|全集|完结|更新至\d+集?|第\d+集|--.*|-.*$)",
     re.IGNORECASE
 )
 
@@ -419,7 +393,38 @@ def _extract_season_from_name(name):
     return None
 
 
-def score_search_result(r, title, year=None, season=0, episode=0):
+_RELEASE_MARKER = re.compile(r'(?:19\d{2}|20\d{2}|[0-9]{3,4}[pi]|[48]k|uhd|hdr\d*|'
+                             r's\d{1,2}(?:e\d{1,4})?|ep?\d{1,4}|season|'
+                             r'第\d{1,3}[季集]|全\d{1,3}集|remux|bluray|bdrip|webrip|webdl|web)')
+
+
+def _matches_full_alias(name, alias):
+    def words(text):
+        normalized = unicodedata.normalize('NFKC', text).casefold()
+        return ''.join(c if unicodedata.category(c)[0] in 'LMN' else ' ' for c in normalized).split()
+
+    target, actual = words(alias), words(name)
+    if not target or actual[:len(target)] != target:
+        return False
+    tail = actual[len(target):]
+    return not tail or bool(_RELEASE_MARKER.fullmatch(tail[0]))
+
+
+def score_search_result(r, title, year=None, season=0, episode=0, *, aliases=()):
+    import copy
+    from .identity import split_title
+    year = year or split_title(title)[1]
+    scores = []
+    for name in getattr(r, 'names', [r.name]):
+        candidate = copy.copy(r)
+        candidate.name = name
+        scores.append(_score_name(candidate, title, year, season, episode))
+        scores.extend(_score_name(candidate, alias, year, season, episode, full_alias=True)
+                      for alias in aliases if alias)
+    return max(scores, default=-1)
+
+
+def _score_name(r, title, year=None, season=0, episode=0, *, full_alias=False):
     """计算搜索结果与目标标题的相关度得分。完全不相关或弱匹配返回 -1。"""
     core = sanitize_title(title)
     if not core:
@@ -438,18 +443,19 @@ def score_search_result(r, title, year=None, season=0, episode=0):
         m_wy = re.search(r"[(（](\d{4})[)）]\s*$", title or "")
         if m_wy:
             want_year = m_wy.group(1)
-    if want_year and want_year.isdigit():
+    season_year_allowed = season > 1 and _extract_season_from_name(r.name) == season
+    if want_year and want_year.isdigit() and not season_year_allowed:
         # 候选名中显式出现的 4 位年份
-        cand_years = re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", rn)
+        cand_years = re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", r.name or "")
         if cand_years:
             try:
-                if all(abs(int(y) - int(want_year)) > 1 for y in cand_years):
+                if all(int(y) != int(want_year) for y in cand_years):
                     return -1
             except ValueError:
                 pass
         # CMS 侧的结构化年份字段
         ry = str(getattr(r, "year", "") or "").strip()
-        if ry.isdigit() and abs(int(ry) - int(want_year)) > 1:
+        if ry.isdigit() and int(ry) != int(want_year):
             return -1
 
     # ── 影视类型硬隔离（2026-10-20《爱你》事故根治）──
@@ -479,21 +485,20 @@ def score_search_result(r, title, year=None, season=0, episode=0):
         req_season = int(season)
         cand_season = _extract_season_from_name(rn)
         # 未标注季数的资源视为第一季（如「钻石王牌」2013 = 第 1 季）
-        if cand_season is None:
-            cand_season = 1
-        if cand_season != req_season:
+        if cand_season is not None and cand_season != req_season:
             return -1
         # 季数已匹配 → 剥离季数标记后再做片名比对，
         # 避免「钻石王牌 第二季」被当成「钻石王牌」+ 额外汉字后缀而降分。
-        if cand_season > 1:
+        if cand_season is not None:
             rn = re.sub(r"第\s*[0-9一二两三四五六七八九十]+\s*季", "", rn)
             rn = re.sub(r"[Ss]eason\s*[0-9]{1,2}", "", rn)
             rn = re.sub(r"[0-9]{1,2}(?:st|nd|rd|th)\s*Season", "", rn, flags=re.IGNORECASE)
+            rn = re.sub(r"(?i)(?:^|[ ._-])S0*\d{1,2}(?=[ ._-]|$)", " ", rn)
             rn = re.sub(r"\s+", " ", rn).strip()
 
     # 全时段短剧拦截（杜绝竖屏短剧冒充正规电视剧）：
     # 若候选名包含“（80集）”、“83集”、“短剧”、“微短剧”，而目标片名本身不含该词：
-    if re.search(r"[（\(]?\s*\d{2,3}\s*集\s*[）\)]?", rn) or "短剧" in rn or "微短剧" in rn:
+    if "短剧" in rn or "微短剧" in rn:
         if "短剧" not in core and not re.search(r"\d{2,3}\s*集", core):
             return -1
 
@@ -512,6 +517,9 @@ def score_search_result(r, title, year=None, season=0, episode=0):
         for sm in SERIES_MARKERS:
             if re.search(sm, rn, re.IGNORECASE) and not re.search(sm, core, re.IGNORECASE):
                 return -1  # 坚决杜绝短剧/多集剧集冒充单部电影
+
+    if full_alias:
+        return 100.0 if _matches_full_alias(r.name, core) else -1
 
     # 剥离网页抓取模板噪音（如 "剧情介绍-"、"4K[臻彩]" 等）
     clean_core = _strip_template_noise(core)
@@ -533,6 +541,16 @@ def score_search_result(r, title, year=None, season=0, episode=0):
         if zh_in_core != zh_in_rn and zh_in_core in zh_in_rn and not zh_in_rn.startswith(zh_in_core):
             return -1
         if zh_in_core != zh_in_rn and zh_in_rn in zh_in_core and not zh_in_core.startswith(zh_in_rn):
+            return -1
+
+    # Chinese character equality must not collapse numbered sequels (沙丘/沙丘2).
+    if zh_in_core and zh_in_core == zh_in_rn:
+        def sequel(text):
+            text = re.sub(r"(?<!\d)(?:19|20)\d{2}(?!\d)", "", text)
+            text = re.sub(r"(?i)2160p?|1080p?|720p?|4k|s\d+e?\d*|第\s*\d+\s*[季集]|全\s*\d+\s*集", "", text)
+            match = re.search(r"[一-龥]\s*([1-9]\d?)(?!\d)", text)
+            return int(match.group(1)) if match else None
+        if sequel(clean_core) != sequel(clean_rn):
             return -1
 
     # 1. 严格相等或纯中文核心完全一致

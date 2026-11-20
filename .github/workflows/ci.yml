@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e '.[test]'
+      - run: make test
+      - run: python -m build
+      - name: Validate installed wheel outside the source tree
+        run: |
+          python -m venv /tmp/quark-vod-wheel
+          /tmp/quark-vod-wheel/bin/python -m pip install dist/*.whl
+          cd /tmp
+          /tmp/quark-vod-wheel/bin/quark-vod --help
+          /tmp/quark-vod-wheel/bin/python -I - <<'PY'
+          from importlib.resources import files
+          import quark_vod
+          from quark_vod.api import create_app
+          assert str(quark_vod.__file__).startswith("/tmp/quark-vod-wheel/")
+          assert files("quark_vod").joinpath("static/admin.html").is_file()
+          assert create_app() is not None
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ matrix.python-version }}
+          path: dist/*
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t quark-vod:ci .
+      - name: Empty non-root/read-only startup
+        run: |
+          docker run -d --name quark-vod-ci --read-only --memory 256m \
+            --tmpfs /tmp:rw,size=32m --tmpfs /data:rw,size=16m,uid=10001,gid=10001 \
+            -p 127.0.0.1:18099:8099 quark-vod:ci
+          python3 - <<'PY'
+          import json, time, urllib.request
+          for attempt in range(30):
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:18099/health", timeout=2) as r:
+                      result = json.load(r)
+                      assert r.status == 200 and result["status"] == "ok"
+                      break
+              except OSError:
+                  time.sleep(1)
+          else:
+              raise SystemExit("container did not become healthy")
+          PY
+      - name: Cleanup
+        if: always()
+        run: docker rm -f quark-vod-ci

@@ -23,6 +23,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from quark_vod import config
 from quark_vod.openlist_client import OpenListClient
 
+def jellyfin_library_path(path):
+    """Map a local library member to the explicitly configured Jellyfin root."""
+    root = os.path.abspath(config.CINEMA2_DIR)
+    candidate = os.path.abspath(path)
+    relative = os.path.relpath(candidate, root)
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        raise ValueError("STRM path is outside the configured library")
+    return config.JELLYFIN_LIBRARY_ROOT.rstrip("/") + "/" + relative.replace(os.sep, "/")
+
+
 def main():
     print(f"[{config.SERVICE_NAME}] 开始全面扫描 cinema2 媒体库进行流元数据与缓存对齐自愈...")
     ol = None
@@ -47,7 +57,7 @@ def main():
     print(f"发现已激活（Live 直链）的 .strm 文件共: {len(live_strms)} 部")
 
     from contextlib import closing
-    with closing(sqlite3.connect(f"file:{config.JELLYFIN2_DB}?mode=ro&immutable=1", uri=True)) as con:
+    with closing(sqlite3.connect(f"file:{config.JELLYFIN2_DB}?mode=ro", uri=True, timeout=2)) as con:
         cur = con.cursor()
 
         refreshed_dirs = set()
@@ -68,7 +78,7 @@ def main():
                 pass
 
             # 2. 检查 Jellyfin2 媒体流
-            container_path = strm_path.replace(config.CINEMA2_DIR, "/cinema2")
+            container_path = jellyfin_library_path(strm_path)
             item = cur.execute("SELECT Id, Name FROM BaseItems WHERE Path = ? LIMIT 1", (container_path,)).fetchone()
             if not item:
                 continue

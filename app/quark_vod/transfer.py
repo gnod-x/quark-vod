@@ -100,8 +100,15 @@ def detect_video_magic(header_bytes):
 _transfer_semaphore = threading.Semaphore(config.TRANSFER_CONCURRENCY)
 
 
+_request_context = threading.local()
+
+
 class TransferNotReady(Exception):
     """Cookie 未配置或写能力未就绪。"""
+
+
+class TransferTaskFailed(Exception):
+    """The official task explicitly reported a terminal failure."""
 
 
 class TransferFailed(Exception):
@@ -109,6 +116,17 @@ class TransferFailed(Exception):
 
 
 class QuarkTransfer:
+    def inspect_share_video(self, share_url, title, season=0, episode=0, timeout=60, *, aliases=()):
+        """Read-only bounded share inspection; reuse the real transfer selector."""
+        previous = getattr(_request_context, 'deadline', None)
+        _request_context.deadline = min(previous, time.monotonic()+timeout) if previous else time.monotonic()+timeout
+        try:
+            token, pwd_id, roots = self.resolve_share(share_url)
+            files = self.share_files(token, pwd_id, roots)
+            return self.select_share_video(files, title, season, episode, aliases=aliases)
+        finally:
+            _request_context.deadline = previous
+
     def __init__(self, openlist_client=None):
         self.ol = openlist_client
         self._vod_fid = None
@@ -129,13 +147,21 @@ class QuarkTransfer:
         if not self.get_cookie():
             return False, "QUARK_COOKIE is empty"
         try:
-            self._quark_list_fid("0", size=1)
+            response = self._request(self.QUARK_FILE_SORT + "&pdir_fid=0&_page=1&_size=1", method="GET", timeout=10)
+            if response.get("code") != 0:
+                raise TransferFailed("Cookie authentication failed")
             return True, "Cookie is valid"
         except Exception as e:
-            return False, f"Cookie expired or invalid: {e}" 
+            return False, f"Cookie expired or invalid: {e}"
 
     # ── HTTP 基础调用 ─────────────────────────────────
     def _request(self, url, payload=None, method="GET", timeout=60):
+        deadline = getattr(_request_context, 'deadline', None)
+        if deadline is not None:
+            remaining = deadline-time.monotonic()
+            if remaining <= 0:
+                raise TransferFailed('本轮转存检查超时')
+            timeout = min(timeout, remaining)
         cookie = self.get_cookie()
         body = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(url, data=body, method=method)
@@ -148,12 +174,15 @@ class QuarkTransfer:
             req.add_header("Cookie", cookie)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
+                body = r.read(8 * 1024**2 + 1)
+                if len(body) > 8 * 1024**2:
+                    raise TransferFailed('上游响应超过大小限制')
+                return json.loads(body.decode('utf-8'))
         except urllib.error.HTTPError as e:
-            raw = e.read().decode("utf-8", "ignore")
-            raise TransferFailed(f"HTTP {e.code}: {raw[:200]}")
+            e.close()
+            raise TransferFailed(f'upstream HTTP {e.code}') from None
         except Exception as e:
-            raise TransferFailed(f"{type(e).__name__}: {e}")
+            raise TransferFailed(type(e).__name__) from None
 
     # ── 分享链接解析 ──────────────────────────────────
     @staticmethod
@@ -162,12 +191,10 @@ class QuarkTransfer:
         if not share_url:
             raise TransferFailed("分享链接为空")
         u = share_url.strip()
-        pwd = ""
-        if "#" in u:
-            u, frag = u.split("#", 1)
-            q = urllib.parse.parse_qs(urllib.parse.urlparse(frag).query)
-            if q.get("pwd"):
-                pwd = q["pwd"][0]
+        parsed = urllib.parse.urlparse(u)
+        values = urllib.parse.parse_qs(parsed.query)
+        values.update(urllib.parse.parse_qs(parsed.fragment.lstrip('?')))
+        pwd = (values.get('pwd') or values.get('passcode') or [''])[0]
         m = re.search(r"/s/([A-Za-z0-9]+)", u)
         if not m:
             raise TransferFailed(f"无法解析分享链接: {share_url[:80]}")
@@ -191,15 +218,9 @@ class QuarkTransfer:
         if not stoken:
             raise TransferFailed("分享解析未返回 stoken")
 
-        # 2. 取文件列表与 fid_token
-        det_url = (f"{QUARK_SHARE_DETAIL}&pwd_id={pwd_id}"
-                   f"&stoken={urllib.parse.quote(stoken)}&pdir_fid=0&_page=1&_size=100")
-        det_resp = self._request(det_url, method="GET", timeout=20)
-        if det_resp.get("code") != 0:
-            raise TransferFailed(f"获取分享详情失败: {det_resp.get('message')}")
-        items = (det_resp.get("data") or {}).get("list", [])
+        items = self._share_page_all(stoken, pwd_id, '0')
         if not items:
-            raise TransferFailed("分享链接内没有文件")
+            raise TransferFailed('分享链接内没有文件')
 
         return stoken, pwd_id, items
 
@@ -249,6 +270,8 @@ class QuarkTransfer:
                 break
             elif st == 3:
                 raise TransferFailed(f"网盘转存后台任务失败: {t_data}")
+        else:
+            raise TransferFailed("网盘转存任务未在超时内完成")
 
         # 2026-10-15 重构：不再验证根目录出现（已改为直接转存到 /点播）
         # 转存到子目录的延迟更短，由 transfer() 负责验证目标路径
@@ -278,23 +301,13 @@ class QuarkTransfer:
         # 夸克网盘是挂载名，实际从根目录开始查
         current_fid = "0"
         for part in parts[1:]:  # 跳过挂载名
-            url = (f"https://drive.quark.cn/1/clouddrive/file/sort"
-                   f"?pr=ucpro&fr=pc&pdir_fid={current_fid}"
-                   f"&_page=1&_size=100&_fetch_total=1&_fetch_sub_dirs=0"
-                   f"&_sort=file_type:asc,updated_at:desc")
-            try:
-                resp = self._request(url, method="GET", timeout=20)
-                files = resp.get("data", {}).get("list", [])
-                found = None
-                for f in files:
-                    if f.get("file_name") == part:
-                        found = f.get("fid")
-                        break
-                if not found:
-                    return None
-                current_fid = found
-            except Exception:
+            # Exhaust pages before declaring absence. Network/authentication
+            # failures must propagate; treating them as missing deletes state.
+            found = next((f.get("fid") for f in self._quark_list_fid(current_fid)
+                          if f.get("name") == part), None)
+            if not found:
                 return None
+            current_fid = found
         return current_fid
 
     # ── 夸克侧权威列表（绕过 OpenList 目录缓存）────────
@@ -337,10 +350,13 @@ class QuarkTransfer:
                     "size": f.get("size", 0) or 0,
                     "fid": f.get("fid", ""),
                 })
-            total = data.get("_total") or 0
-            # 翻页终止：本页为空 / 已取满 / 安全上限（防异常时死循环）
-            if not lst or len(out) >= total or page >= 50:
+            total = data.get('_total', data.get('total'))
+            if total is not None and len(out) >= int(total):
                 break
+            if total is None and len(lst) < size:
+                break
+            if not lst or page >= 50:
+                raise TransferFailed('夸克目录分页未完整返回，无法判定文件缺失')
             page += 1
         return out
 
@@ -398,9 +414,6 @@ class QuarkTransfer:
                 correct_ext = ".mkv"
             elif ext in {".mp41"}:
                 correct_ext = ".mp4"
-            elif ext in DISGUISE_EXTS and size > DISGUISE_MIN_SIZE:
-                # 常见规避和谐伪装，默认为 .mkv
-                correct_ext = ".mkv"
 
         if correct_ext:
             if ext:
@@ -576,6 +589,7 @@ class QuarkTransfer:
     @classmethod
     def match_episode_video(cls, vids, season=0, episode=0):
         """从视频列表中精确挑选目标剧集/电影（杜绝张冠李戴）。"""
+        from .quality import video_rank
         if not vids:
             return None
         # 电影：选体积最大的最高画质正片
@@ -594,7 +608,7 @@ class QuarkTransfer:
                             if (v.get("size") or 0) >= 500 * 1024 * 1024
                             and cls._lookup_ep(v["path"], 1, ep1) is None]
             if big_unmarked:
-                return max(big_unmarked, key=lambda x: x["size"])
+                return max(big_unmarked, key=video_rank)
             if len(vids) > 1:
                 ep_counts = 0
                 for v in vids:
@@ -604,18 +618,19 @@ class QuarkTransfer:
                 if ep_counts >= 2 or (len(vids) >= 3 and ep_counts >= 1):
                     # 检测到明显的剧集/短剧大包特征，拒绝冒充单部电影
                     return None
-            return max(vids, key=lambda x: x["size"])
+            return max(vids, key=video_rank)
 
         # 剧集：必须精确匹配集数，同集多版本优先选体积最大的（如 4K HDR > 4K SDR）
-        ep_s = cls.prefetch_episodes([v["path"] for v in vids], season=season)
+        ep_s = cls.prefetch_episodes([v["path"] for v in vids if '_confirmed_episode' not in v], season=season)
         matched = []
         for v in vids:
-            ep = cls._lookup_ep(v["path"], season, ep_s)
+            ep = (v['_confirmed_episode'] if '_confirmed_episode' in v
+                  else cls._lookup_ep(v["path"], season, ep_s))
             if ep == episode:
                 matched.append(v)
 
         if matched:
-            best_match = max(matched, key=lambda x: x["size"])
+            best_match = max(matched, key=video_rank)
             # 电视剧防微短剧冒充底线校验：正规电视剧单集时长约 45 分钟，单集正常至少 80MB 以上
             # 若单集小于 80MB，通常为竖屏微短剧（单集 1 分钟 ~25MB），拒绝将其作为正统电视剧正片！
             if season > 0 and best_match["size"] < 80 * 1024 * 1024:
@@ -646,8 +661,17 @@ class QuarkTransfer:
 
         返回 (transfer_id, video_remote_path)。
         """
-        with _transfer_semaphore:
-            return self._do_transfer(cat, title, season, episode, share_url, share_pwd)
+        from .coordination import playback_lease, file_lock
+        from .identity import Work
+        work = Work(cat, title, season, episode)
+        name = 'work:' + repr((work.cat, work.title.casefold(), work.season))
+        with playback_lease(), file_lock(name, timeout=config.TRANSFER_TIMEOUT), _transfer_semaphore:
+            prior_deadline = getattr(_request_context, 'deadline', None)
+            _request_context.deadline = time.monotonic() + config.TRANSFER_TIMEOUT
+            try:
+                return self._do_transfer(*work.args, share_url, share_pwd)
+            finally:
+                _request_context.deadline = prior_deadline
 
     def _check_capacity(self, need_bytes=0):
         """容量预检：返回 (是否可转存, 剩余字节数)。
@@ -668,290 +692,328 @@ class QuarkTransfer:
             # 查询失败不阻断，交给后续真实转存流程处理
             return True, 0
 
-    def _do_transfer(self, cat, title, season, episode, share_url, share_pwd=""):
-        tid = db.upsert_transfer(cat, title, season, episode,
-                                 status="searching", share_url=share_url,
-                                 share_pwd=share_pwd, pan_type="quark",
-                                 error=None)
+    def share_files(self, stoken, pwd_id, items, max_entries=1200, max_depth=6):
+        """Enumerate share pages with parent IDs. Never mistake truncation for absence."""
+        output = []
+        seen = set()
+        visited = 0
+
+        def walk(entries, parent, path, depth):
+            nonlocal visited
+            for item in entries:
+                visited += 1
+                if visited > max_entries:
+                    raise TransferFailed('分享内容超过检查上限')
+                name = item.get('file_name', '')
+                if not name or '/' in name or name in ('.', '..'):
+                    continue
+                if item.get('dir'):
+                    if depth >= max_depth:
+                        raise TransferFailed('分享目录超过检查深度')
+                    fid = item.get('fid')
+                    if not fid or fid in seen:
+                        continue
+                    seen.add(fid)
+                    walk(self._share_page_all(stoken, pwd_id, fid), fid, path + [name], depth+1)
+                elif is_candidate_video(name, item.get('size') or 0):
+                    output.append(dict(item, parent_fid=parent, relative_path='/'.join(path+[name])))
+        walk(items, '0', [], 0)
+        return output
+
+    def _share_page_all(self, stoken, pwd_id, parent):
+        items = []
+        for page in range(1, 51):
+            query = urllib.parse.urlencode({'pwd_id':pwd_id,'stoken':stoken,'pdir_fid':parent,
+                                           '_page':page,'_size':100,'_fetch_total':1})
+            response = self._request(QUARK_SHARE_DETAIL + '&' + query, timeout=20)
+            if response.get('code') != 0:
+                raise TransferFailed('分享目录读取失败: ' + str(response.get('code')))
+            data = response.get('data') or {}
+            part = data.get('list') or []
+            items.extend(part)
+            total = data.get('_total', data.get('total'))
+            if (total is not None and len(items) >= int(total)) or (total is None and len(part) < 100):
+                return items
+            if not part:
+                break
+        raise TransferFailed('分享目录分页不完整')
+
+    def _wait_saved_task(self, task_id):
+        deadline = time.monotonic() + config.TRANSFER_TIMEOUT
+        while time.monotonic() < deadline:
+            response = self._request(QUARK_TASK + '&task_id=' + urllib.parse.quote(task_id), timeout=15)
+            if response.get('code') != 0:
+                raise TransferFailed('转存任务查询失败')
+            status = (response.get('data') or {}).get('status')
+            if status == 2:
+                return
+            if status == 3:
+                raise TransferTaskFailed('网盘转存任务失败')
+            time.sleep(1)
+        raise TransferNotReady('网盘转存仍未完成；重试时先核对原任务，不重复提交')
+
+    def _resume_save(self, work, previous):
+        """Resolve persisted save intent even if the public share later disappears."""
+        target = previous['save_target']
+        if not target or not target.startswith(config.QUARK_VOD_ROOT + '/') or '..' in target.split('/'):
+            raise TransferNotReady('转存目标记录无效，停止自动重试')
+        parent, name = target.rsplit('/',1)
+        fid = self._get_quark_fid(parent)
+        if not fid:
+            raise TransferNotReady('原转存目录缺失，需核对原任务状态')
+        def lookup():
+            return next((f for f in self._quark_list_fid(fid) if not f['is_dir'] and f['name']==name),None)
+        item = lookup()
+        if item is None and previous.get('save_task_id'):
+            try:
+                self._wait_saved_task(previous['save_task_id'])
+            except TransferTaskFailed:
+                db.upsert_transfer(*work.args,status='failed',save_target=None,save_task_id=None,save_started_at=None)
+                raise
+            deadline = time.monotonic()+min(30,config.PROBE_VERIFY_TIMEOUT)
+            while item is None and time.monotonic()<deadline:
+                item=lookup()
+                if item is None:
+                    time.sleep(1)
+        if item is None:
+            raise TransferNotReady('上次提交尚未确认，未重复转存；请稍后重试')
+        expected = previous.get('file_size') or 0
+        if expected and item['size'] != expected:
+            raise TransferNotReady('原任务文件大小不符，停止自动覆盖')
+        tid = db.upsert_transfer(*work.args,status='done',remote_path=target,file_size=item['size'],error=None,
+                                 save_target=None,save_task_id=None,save_started_at=None)
+        db.enqueue_cleanup(tid,target,db.now()+config.KEEP_DAYS*86400)
         try:
-            self.ensure_ready()
-            vod_fid = self.ensure_vod_dir()
+            self.ol.refresh_path_tree(config.play_path(target))
+        except Exception:
+            pass
+        return tid,target
 
-            # ── 容量预检（2026-10-20）：爆满时立即失败，不走 save+task 轮询 ──
-            ok_cap, free_b = self._check_capacity()
-            if not ok_cap:
-                raise TransferFailed(
-                    f"夸克网盘空间不足（剩余 {free_b/1024**3:.2f}GB），"
-                    f"请先清理 /点播 目录或扩容")
-
-            # ── 铁闸 1: 网盘已落盘资源复用与防重检查（彻底消灭重复转存与 (1)(2) 垃圾副本！）──
-            from .search import sanitize_title
-            clean_t = sanitize_title(title).lower()
-            try:
-                cur_entries = self._quark_list(config.QUARK_VOD_ROOT)
-            except Exception:
-                cur_entries = []
-
-            for cur_e in cur_entries:
-                en_name = cur_e.get("name", "")
-                en_path = f"{config.QUARK_VOD_ROOT}/{en_name}"
-                # 检查网盘中是否已有该片相关的已落盘目录
-                if clean_t and clean_t in en_name.lower():
-                    existing_vids = self.scan_videos(en_path)
-                    best_existing = self.match_episode_video(existing_vids, season, episode)
-                    if best_existing and best_existing.get("path"):
-                        # 网盘已存活有效正片！直接复用已有文件，0 耗费空间，绝不调用 save_share！
-                        print(f"[{config.SERVICE_NAME}] [防重生效] 网盘已存在 {title} 正片: {best_existing['path']}，直接复用，0 重复转存！", flush=True)
-                        # 2026-10-21 修复（复用路径不落 DB）：原实现此处直接 return，
-                        # 跳过了 _do_transfer 末尾的 upsert_transfer(status='done')。
-                        # 若该片历史记录是 failed/cleaned（如早前网盘爆满转存失败），
-                        # 记录会永久停在失败态，find_done_transfer 查不到 →
-                        # 下次点播重复跑 8~12s 搜索（实测《万米危机 (2026)》）。
-                        # 复用同样是"文件确已落盘"，必须把记录同步为 done。
-                        try:
-                            db.upsert_transfer(cat, title, season, episode,
-                                               status="done",
-                                               remote_path=best_existing["path"],
-                                               file_size=best_existing.get("size") or 0,
-                                               error=None)
-                        except Exception as ex:
-                            print(f"[{config.SERVICE_NAME}] [防重生效][DB同步异常] "
-                                  f"{title} S{season}E{episode}: {ex}", flush=True)
-                        return tid, best_existing["path"]
-
-            # ── 铁闸 2: 转存前强制只读轻量验票（0 空间消耗，杜绝短剧冒充与牛头不对马嘴！）──
-            stoken, pwd_id, share_items = self.resolve_share(share_url)
-            # 2026-10-20 修复：原实现只展开一层子目录，遇到「分享根 → 片名目录 →
-            # 集数区间目录 → 视频文件」这类三层结构时，视频文件全在第二层，
-            # 验票看到 0 个视频文件，把活着的 4K 大包误判为
-            # 「分享包内未包含任何标准视频文件」而拒绝转存。
-            # 实测《凡人修仙传》分享 1fd0ea7e2bb3 根目录仅 1 个 dir，
-            # 其下还有 177-193 / 194- 两个子目录才到 mkv 文件。
-            # 现改为递归展开（限深 4 层、限 400 项，兼顾性能与风控）。
-            inspect_items = []
-            seen_fids = set()
-
-            def _collect(fid_list, depth):
-                if depth > 4 or len(inspect_items) >= 400:
-                    return
-                for fid in fid_list:
-                    if not fid or fid in seen_fids:
+    def select_share_video(self, files, title, season, episode, *, aliases=()):
+        from .search import SearchResult, score_search_result, _extract_season_from_name
+        from .identity import split_title
+        def trusted_parent(parent):
+            # Only a complete work label from this enumerated path supplies
+            # missing basename identity; arbitrary substring matches do not.
+            core, year = split_title(title)
+            label = re.sub(r'^[A-Za-z]\s+', '', parent).strip()
+            if not label.startswith(core):
+                return False
+            rest = label[len(core):]
+            if rest and rest[0] not in ' ._-([（【':
+                return False
+            years = re.findall(r'(?<!\d)((?:19|20)\d{2})(?!\d)', rest)
+            if year and any(value != year for value in years):
+                return False
+            # Do not erase arbitrary descriptions: another work, sequel,
+            # adaptation or special edition must keep this context untrusted.
+            rest = re.sub(r'(?<!\d)(?:19|20)\d{2}(?!\d)', '', rest)
+            rest = re.sub(r'(?i)4k|2160p?|1080p?|720p?|HDR\d*|WEB[- ]?DL|HEVC|AAC|国语中字|国语|中字|高码率|单集\s*\d+(?:\.\d+)?\s*[GM]B?|全\s*\d+\s*集|德剧|美剧|英剧|韩剧|日剧|国产剧', '', rest)
+            return not rest.strip(' ._-()[]（）【】')
+        videos=[]
+        for item in files:
+            confirmed_episode = None
+            path=item.get('relative_path') or item['file_name']
+            file_title = item['file_name']
+            wanted_year=split_title(title)[1]
+            named_years=re.findall(r'(?<!\d)((?:19|20)\d{2})(?!\d)',item['file_name'])
+            # Later seasons may carry their own release year, distinct from series premiere.
+            parents=path.split('/')[:-1]
+            indicated=[_extract_season_from_name(parent) for parent in parents]
+            explicit_season = _extract_season_from_name(item['file_name'])
+            season_year_allowed = season > 1 and (explicit_season == season or season in indicated)
+            if wanted_year and named_years and wanted_year not in named_years and not season_year_allowed:
+                continue
+            if wanted_year and named_years and wanted_year not in named_years and season_year_allowed:
+                file_years = {int(value) for value in named_years}
+                if max(file_years) < 2010 or abs(max(file_years) - int(wanted_year)) > 10:
+                    continue
+            if season and any(value and value!=season for value in indicated):
+                continue
+            if season and explicit_season is not None and explicit_season != season:
+                continue
+            if season and episode:
+                # Variant subdirectories belong to the same file's identity;
+                # an exact ancestor must not hide a conflicting descendant.
+                variant_parent = False
+                for parent in parents:
+                    if re.search(r'(?i)(?<![A-Za-z])(?:Anime|Movie|OVA|OAD|Special|Live[ ._-]*Action|Part\s*\d+)(?![A-Za-z])', parent):
+                        variant_parent = True
+                    sequel_parent = re.sub(r'(?i)(?<!\d)(?:19|20)\d{2}(?!\d)|\b(?:Season\s*\d+|S\d+|2160p?|1080p?|720p?|4k)\b', '', parent)
+                    if re.search(r'(?i)[A-Za-z][ ._-]+[1-9]\d?\s*$', sequel_parent):
+                        variant_parent = True
+                if variant_parent:
+                    continue
+                file_title = os.path.splitext(file_title)[0]
+                # Reject combined episodes before trimming any identity text.
+                episode_tokens = re.findall(r'(?i)(?<![A-Za-z])EP?0*\d{1,4}\b|(?<=\d)EP?0*\d{1,4}\b', file_title)
+                if len(episode_tokens) > 1:
+                    continue
+                release_suffix = ''
+                token = re.search(r'(?i)S0*(\d{1,2})[ ._-]*EP?0*(\d{1,4})\b', file_title)
+                if token:
+                    if (int(token.group(1)), int(token.group(2))) != (season, episode):
                         continue
-                    seen_fids.add(fid)
-                    try:
-                        det_url = (f"{QUARK_SHARE_DETAIL}&pwd_id={pwd_id}"
-                                   f"&stoken={urllib.parse.quote(stoken)}&pdir_fid={fid}&_page=1&_size=100")
-                        sub_resp = self._request(det_url, method="GET", timeout=10)
-                        sub_list = (sub_resp.get("data") or {}).get("list", [])
-                    except Exception:
+                    if re.match(r'(?i)[ ._-]*EP?0*\d{1,4}\b', file_title[token.end():]):
                         continue
-                    inspect_items.extend(sub_list)
-                    sub_dirs = [x.get("fid") for x in sub_list if x.get("dir") and x.get("fid")]
-                    if sub_dirs:
-                        _collect(sub_dirs, depth + 1)
-
-            # 根级 fid=0 一次拿全，再逐层递归
-            try:
-                root_url = (f"{QUARK_SHARE_DETAIL}&pwd_id={pwd_id}"
-                            f"&stoken={urllib.parse.quote(stoken)}&pdir_fid=0&_page=1&_size=100")
-                root_resp = self._request(root_url, method="GET", timeout=10)
-                root_list = (root_resp.get("data") or {}).get("list", [])
-            except Exception:
-                root_list = share_items
-            inspect_items.extend(root_list)
-            _collect([x.get("fid") for x in root_list if x.get("dir") and x.get("fid")], 1)
-
-            valid_vids = [
-                fit for fit in inspect_items
-                if not fit.get("dir") and is_candidate_video(fit.get("file_name", ""), fit.get("size"))
-            ]
-            if not valid_vids:
-                raise TransferFailed("分享包内未包含任何标准视频文件，拒绝转存")
-
-            if not season or not episode:
-                # 电影验票门槛：
-                # A. 必须包含单个体积 >= 350MB 的正片大文件（排除短剧、广告碎片）
-                large_vids = [v for v in valid_vids if (v.get("size") or 0) >= 350 * 1024 * 1024]
-                if not large_vids:
-                    max_mb = (max(v.get('size', 0) for v in valid_vids) / 1024 / 1024) if valid_vids else 0
-                    raise TransferFailed(f"分享包内无电影正片大文件(最大仅 {max_mb:.1f}MB)，疑似短剧或广告碎片，拒绝转存")
-                # B. 若包含多个带集数标记的文件，判定为剧集大包，拒绝冒充单片电影
-                #
-                # 2026-11-08（7 部电影被误杀根治）：改为「强证据优先」。
-                #   旧实现只要 3 个以上文件命中任一弱集数信号即整包拒绝，而
-                #   extract_episode_num 在宽松模式(season=1)下会把规格残片读成集数：
-                #     "4K_HDR_60" → 60、"d3 1"(分卷碟号) → 1、"…H 264-…" → 264。
-                #   结果：含 50GB 完整正片的单部电影源被判为剧集包（宗师叶问2 /
-                #   惊蛰无声 / 给阿嬷的情书 / 罗小黑战记 / 后室 / 死侍与金刚狼 / 痴迷）。
-                #   现在先看强证据：存在「非集数标记且 >= 350MB」的单片即放行；
-                #   只有全部视频都带集数标记时，才按剧集包拒绝（真短剧源如此）。
-                # 2026-11-13：整包一次性 AI 复核，后续 3 处判定复用同一份结果
-                _ep_movie = self.prefetch_episodes(
-                    [v.get("file_name", "") for v in valid_vids], season=1)
-                _unmarked = [v for v in large_vids
-                             if self._lookup_ep(v.get("file_name", ""), 1, _ep_movie) is None]
-                if _unmarked:
-                    pass  # 强证据：包内存在明确单片正片，允许作为电影转存
-                elif len(valid_vids) >= 3 and any(
-                        self._lookup_ep(v.get("file_name", ""), 1, _ep_movie) for v in valid_vids):
-                    raise TransferFailed("该分享包包含多集剧集特征，拒绝作为电影转存")
-            else:
-                # 剧集验票门槛：必须包含目标集数！
-                _ep_tv = self.prefetch_episodes(
-                    [v.get("file_name", "") for v in valid_vids], season=season)
-                has_target_ep = any(self._lookup_ep(v.get("file_name", ""), season, _ep_tv) == episode for v in valid_vids)
-                if not has_target_ep:
-                    raise TransferFailed(f"分享包内未找到 S{season:02d}E{episode:02d} 对应文件，拒绝转存")
-
-            # ── 验票通过，开始安全转存 ──
-            db.upsert_transfer(cat, title, season, episode, status="saving")
-            saved_items = self.save_share(share_url, to_pdir_fid=vod_fid)
-
-            # 2. 回读确认转存结果 —— 必须查【夸克官方 API】，不能用 OpenList 列表
-            #
-            #    2026-10-16 重构（狼犬丹尼故障根因）：
-            #    原实现用 self.ol.list(QUARK_VOD_ROOT) 判定，而 OpenList 对该目录
-            #    带缓存且长期不刷新。实测：文件已真实落盘 /点播/狼犬丹尼 1080p remux (2005)，
-            #    OpenList 不带 refresh 的列表恒为 18 项（无此目录），
-            #    加 refresh 才变 19 项（有）——证明是缓存问题，不是转存失败。
-            #    后果：误判 failed → 反复重试 → 网盘堆 (1)(2) 副本 → 播放永远走不到直链。
-            #    现在改查夸克官方 file/sort：实时、无缓存、不依赖 OpenList refresh 权限。
-            #
-            #    注：仍保留长窗口轮询，因为夸克侧自身也可能有短暂可见性延迟。
-            moved_paths = []
-            for item in saved_items:
-                fname = item["file_name"]
-
-                def _scan():
-                    """列 /点播 现有条目，按文件名匹配（含 (n) 变体）。
-
-                    返回匹配到的实际路径，未匹配返回 None。
-                    """
-                    try:
-                        entries = self._quark_list(config.QUARK_VOD_ROOT)
-                    except Exception:
-                        return None
-                    for it in entries:
-                        n = it.get("name", "")
-                        if not n:
+                    release_suffix = file_title[token.end():]
+                    file_title = file_title[:token.start()]
+                else:
+                    episode_match = re.search(r'(?i)\bEP?0*(\d{1,4})\b', file_title)
+                    if episode_match and int(episode_match.group(1)) != episode:
+                        continue
+                    if episode_match:
+                        release_suffix = file_title[episode_match.end():]
+                        file_title = file_title[:episode_match.start()]
+                if re.match(r'\s*[-~～+]\s*\d{1,4}\b', release_suffix):
+                    continue
+                suffix_identity = re.sub(r'国语中字|简体中字|繁体中字|中文字幕|国语|中字', '', release_suffix)
+                if (re.search(r'(?i)(?<![A-Za-z])(?:Anime|Movie|OVA|OAD|Special|Live[ ._-]*Action|Part\s*\d+)(?![A-Za-z])', suffix_identity)
+                        or re.search(r'[一-龥\uac00-\ud7af\u3040-\u30ff]', suffix_identity)):
+                    continue
+                season_match = re.search(r'(?i)(?:第\s*\d+\s*季|Season\s*\d{1,2}|\bS0*\d{1,2}\b)', file_title)
+                if season_match:
+                    file_title = file_title[:season_match.start()] + file_title[season_match.end():]
+                file_title = re.sub(r'(?i)(?:^|[ ._-])(?:20\d{2}|19\d{2})(?=$|[ ._-])', ' ', file_title)
+                file_title = re.sub(r'(?i)(?:\b4k\b|\b2160p?\b|\b1080p?\b|\b720p?\b|\bhdr\d*\b|\bweb[- ]?dl\b|\bbluray\b|\bremux\b)', '', file_title)
+                file_title = file_title.strip(' ._-()[]')
+                if file_title:
+                    score = SearchResult(engine='panshare', source='filename', name=file_title,
+                                         year='', poster='', episodes=[])
+                    if score_search_result(score, title, year=wanted_year, season=season,
+                                           episode=episode, aliases=aliases) < 30:
+                        # Unknown Latin translation or numeric episode labels
+                        # may inherit an exact directory's identity. Known
+                        # conflicting Chinese names/versions never do.
+                        unknown_name = not re.search(r'[一-龥\uac00-\ud7af\u3040-\u30ff]', file_title)
+                        explicit_variant = re.search(r'(?i)\b(?:OVA|OAD|SP|Special|Movie|Anime|Live[ ._-]*Action)\b|\d', file_title)
+                        numeric_episode = re.fullmatch(r'0*\d{1,4}', file_title)
+                        if numeric_episode:
+                            unknown_name = int(file_title) == episode
+                            explicit_variant = False
+                        parent_identity = any(trusted_parent(p) for p in parents)
+                        conflicting_parent = any(re.search(r'[一-龥]', p) and not trusted_parent(p)
+                                                 and not re.fullmatch(r'第\s*\d+\s*季', p) for p in parents)
+                        # A translated basename loses its title at the episode
+                        # token, but its tail must still be technical metadata.
+                        # Do not silently discard another work/adaptation/part.
+                        safe_suffix = re.sub(r'(?i)-(?:LeagueWEB)$', '', release_suffix)
+                        safe_suffix = re.sub(r'(?i)(?<![A-Za-z0-9])(?:WEB[- ]?DL|WEBRIP|BLURAY|REMUX|2160p?|1080p?|720p?|4k|HDR\d*|HEVC|AVC|AAC|H\.?26[45]|X26[45]|DDP?\d?(?:\.\d)?)(?![A-Za-z0-9])', '', safe_suffix)
+                        suffix_is_metadata = not safe_suffix.strip(' ._-()[]')
+                        if not (unknown_name and not explicit_variant and parent_identity and not conflicting_parent and suffix_is_metadata):
                             continue
-                        # 精确 / 带 (n) 后缀 / 以 fname 为前缀的扩展名
-                        if (n == fname or n.startswith(fname + "(")
-                                or n.startswith(fname + ".")):
-                            return f"{config.QUARK_VOD_ROOT}/{n}"
-                    return None
+                        if numeric_episode:
+                            # The exact parent and numeric leaf already prove
+                            # this episode. Do not let the weak-name AI stage
+                            # overwrite that deterministic context later.
+                            confirmed_episode = episode
+            video={'path':path,'name':item['file_name'],'size':item.get('size') or 0,'share':item}
+            if confirmed_episode is not None:
+                video['_confirmed_episode'] = confirmed_episode
+            videos.append(video)
+        if not season:
+            features=[v for v in videos if v['size']>=350*1024**2]
+            matched=[]
+            for video in features:
+                candidate=SearchResult(engine='panshare',source='filename',name=video['name'],year='',poster='',episodes=[])
+                if score_search_result(candidate, title, season=0, episode=0, aliases=aliases) >= 30:
+                    matched.append(video)
+            if matched:
+                videos=matched
+            elif len(features)>1:
+                raise TransferFailed('电影分享含多个无法确认身份的正片，拒绝按体积猜选')
+        return self.match_episode_video(videos,season,episode)
 
-                matched = None
-                deadline = time.time() + config.PROBE_VERIFY_TIMEOUT
-                first_scan = True
-                while time.time() < deadline:
-                    if not first_scan:
-                        time.sleep(1)
-                    first_scan = False
-                    hit = _scan()
-                    if hit:
-                        matched = hit
+    def _do_transfer(self, cat, title, season, episode, share_url, share_pwd=''):
+        """Save one selected video into a deterministic work/source directory.
+
+        A durable save intent plus task ID prevents blind duplicate saves after a
+        timeout/restart. Readback uses exact names inside this work's directory.
+        No whole-package copying, filename prefix guesses or speculative sibling
+        activation. Repeated requests reuse the saved leaf before any write.
+        """
+        import hashlib
+        from .identity import Work
+        work = Work(cat, title, season, episode)
+        self.ensure_ready()
+        previous = db.get_transfer(*work.args)
+        previous = dict(previous) if previous else {}
+        if previous.get('save_started_at'):
+            return self._resume_save(work, previous)
+        tid = db.upsert_transfer(*work.args, status='searching', share_url=share_url, share_pwd=share_pwd,
+                                 pan_type='quark', error=None)
+        try:
+            stoken, pwd_id, root_items = self.resolve_share(share_url)
+            files = self.share_files(stoken, pwd_id, root_items)
+            search_title, aliases = strm_manager.library_search_identity(work.cat, work.title, work.season)
+            best = self.select_share_video(files, search_title, season, episode, aliases=aliases)
+            if not best or (not season and best['size'] < 350 * 1024**2):
+                raise TransferFailed('分享内没有匹配的正片或目标集')
+            selected = best['share']
+            identity = repr((work.cat, work.title, season, pwd_id, selected.get('fid'))).encode()
+            slot = config.QUARK_VOD_ROOT + '/vod_' + hashlib.sha256(identity).hexdigest()[:24]
+            self.ensure_vod_dir()
+            self.ol.mkdir(slot)
+            fid = self._get_quark_fid(slot)
+            if not fid:
+                raise TransferFailed('无法确认转存目标目录')
+            target = slot + '/' + selected['file_name']
+
+            def existing():
+                found = [f for f in self._quark_list_fid(fid) if not f['is_dir'] and f['name'] == selected['file_name']]
+                if len(found) > 1:
+                    raise TransferFailed('转存目录同名文件不唯一')
+                if found and int(found[0].get('size') or 0) == int(selected.get('size') or 0):
+                    return found[0]
+                if found:
+                    raise TransferFailed('已有同名文件大小不符，保留并停止自动覆盖')
+                return None
+
+            saved = existing()
+            if not saved:
+                ok, _ = self._check_capacity(best['size'])
+                if not ok:
+                    raise TransferFailed('网盘剩余空间不足以保存所选视频')
+                db.upsert_transfer(*work.args,status='saving',save_target=target,save_started_at=db.now(),save_task_id=None,file_size=best['size'])
+                payload = {'pwd_id':pwd_id,'stoken':stoken,'to_pdir_fid':str(fid),
+                           'fid_list':[selected['fid']], 'fid_token_list':[selected.get('share_fid_token','')],
+                           'pdir_fid':str(selected.get('parent_fid','0')), 'scene':'link'}
+                response = self._request(QUARK_SHARE_SAVE,payload=payload,method='POST',timeout=30)
+                if response.get('code') != 0:
+                    db.upsert_transfer(*work.args,save_started_at=None,save_target=None,save_task_id=None)
+                    raise TransferFailed('转存请求被拒绝: ' + str(response.get('code')))
+                task_id = (response.get('data') or {}).get('task_id')
+                if task_id:
+                    db.upsert_transfer(*work.args,save_task_id=str(task_id))
+                if task_id:
+                    self._wait_saved_task(str(task_id))
+                deadline = time.monotonic() + min(30, config.PROBE_VERIFY_TIMEOUT)
+                while time.monotonic() < deadline:
+                    saved = existing()
+                    if saved:
                         break
-
-                if not matched:
-                    raise TransferFailed(
-                        f"转存后未在 {config.QUARK_VOD_ROOT} 找到 {fname}"
-                        f"（已等待 {config.PROBE_VERIFY_TIMEOUT}s，"
-                        f"文件实际应已由夸克侧转存，请手动核实目录内容）")
-                moved_paths.append(matched)
-
-            # 3. 扫描并选出对应集数的视频文件
-            all_vids = []
-            for mp in moved_paths:
-                all_vids.extend(self.scan_videos(mp))
-
-            if not all_vids:
-                raise TransferFailed(f"转存成功但未在目录下找到任何视频文件 ({moved_paths})")
-
-            best_vid = self.match_episode_video(all_vids, season, episode)
-            if not best_vid:
-                raise TransferFailed(f"未能匹配到 S{season:02d}E{episode:02d} 对应的视频文件")
-
-            video_remote_path = best_vid["path"]
-            video_size = best_vid.get("size") or 0
-
-            # 3.2 伪装头前置嗅探感知：若存在假 PNG 头，由零拷贝平移流清洗代理透明平移播放，严禁误杀好源
-            if self.ol:
-                try:
-                    probe_url = self.ol.direct_url(video_remote_path)
-                    req_h = urllib.request.Request(probe_url, headers={"Range": "bytes=0-31"})
-                    with urllib.request.urlopen(req_h, timeout=3) as resp_h:
-                        head_b = resp_h.read()
-                        if is_poisoned_fake_header(head_b):
-                            print(f"[{config.SERVICE_NAME}] [伪装头感知] 检测到 8 字节混淆头，将由零拷贝清洗代理透明平移播放: {video_remote_path}", flush=True)
-                except Exception:
-                    pass
-
-            # 3.5 主动同步 OpenList QuarkTV 驱动目录树缓存（彻底根治转存后直链 500 秒退）
-            if self.ol:
-                try:
-                    for mp in moved_paths:
-                        self.ol.refresh_path_tree(config.play_path(mp))
-                    self.ol.refresh_path_tree(config.play_path(video_remote_path))
-                    print(f"[{config.SERVICE_NAME}] [缓存同步] OpenList 播放目录树已逐级刷新: {config.play_path(video_remote_path)}", flush=True)
-                except Exception as ex:
-                    print(f"[{config.SERVICE_NAME}] [缓存同步告警] OpenList 目录树刷新失败: {ex}", flush=True)
-
-            # 4. 登记完成与过期清理任务
-            db.upsert_transfer(cat, title, season, episode,
-                               status="done", remote_path=video_remote_path,
-                               file_size=video_size, error=None)
-
-            due = db.now() + config.KEEP_DAYS * 86400
-            for mp in moved_paths:
-                db.enqueue_cleanup(tid, mp, due)
-
-            # 5. 剧集整包协同激活：若该分享包包含同季多集视频，顺带批量激活整包集数
-            if season > 0:
-                try:
-                    ep_map = self.match_all_episodes(all_vids, season=season)
-                    for other_ep, other_vid in ep_map.items():
-                        if other_ep != episode:
-                            try:
-                                other_rpath = other_vid["path"]
-                                db.upsert_transfer(cat, title, season, other_ep,
-                                                   status="done", remote_path=other_rpath,
-                                                   file_size=other_vid.get("size") or 0, error=None)
-                                # 拼接播放直链并原子激活对应集数的 strm（后台限流刷新，不抢首播带宽）
-                                enc = urllib.parse.quote(config.play_path(other_rpath))
-                                d_url = f"{config.OPENLIST_PUBLIC}/d{enc}"
-                                strm_manager.activate(cat, title, season, other_ep, d_url, background_batch=True)
-                                print(f"[{config.SERVICE_NAME}] [整季连带激活] {title} S{season}E{other_ep} -> {d_url}", flush=True)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-            return tid, video_remote_path
-
-        except TransferNotReady as e:
-            db.upsert_transfer(cat, title, season, episode,
-                               status="failed", error=f"NOT_READY: {e}")
-            raise
-        except Exception as e:
-            db.upsert_transfer(cat, title, season, episode,
-                               status="failed", error=str(e)[:300])
-            raise
-        finally:
-            # 2026-10-20：任何异常路径都不得把记录留在 searching（半途状态），
-            # 否则 find_done_transfer 查不到、selfheal 也无法识别，形成僵尸记录。
-            # 2026-10-25 修复：原判定只覆盖 searching，漏了验票通过后写入的
-            # saving —— 一旦 save_share / 目录轮询在 saving 之后异常，
-            # 记录会永久滞留（实测 ID 3285/3287 滞留 116 小时）。
+                    time.sleep(1)
+                if not saved:
+                    raise TransferNotReady('任务已提交，目标视频尚未可见；稍后重试将只核对原任务')
+            # A disguised filename may be corrected only after inspecting it.
+            ext = os.path.splitext(saved['name'])[1].lower()
+            if ext not in VIDEO_EXTS:
+                fixed = self.sniff_and_fix_file(saved, slot)
+                if fixed:
+                    target = fixed['path']
+            db.upsert_transfer(*work.args,status='done',remote_path=target,file_size=best['size'],error=None,
+                               save_target=None,save_task_id=None,save_started_at=None)
+            db.enqueue_cleanup(tid,target,db.now()+config.KEEP_DAYS*86400)
             try:
-                row = db._conn().execute(
-                    "SELECT status FROM transfers WHERE cat=? AND title=? AND season=? AND episode=?",
-                    (cat, title, season, episode)).fetchone()
-                if row and row["status"] in ("searching", "saving"):
-                    db.upsert_transfer(cat, title, season, episode,
-                                       status="failed", error="[状态自愈] 转存中断，未完成")
+                self.ol.refresh_path_tree(config.play_path(target))
             except Exception:
                 pass
+            return tid,target
+        except Exception as exc:
+            if isinstance(exc, TransferTaskFailed):
+                db.upsert_transfer(*work.args,save_started_at=None,save_target=None,save_task_id=None)
+            db.upsert_transfer(*work.args,status='failed',error=type(exc).__name__ + ': ' + str(exc)[:180])
+            raise
 
     # ── 删除 ──────────────────────────────────────────
     def delete_remote(self, remote_path):

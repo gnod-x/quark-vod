@@ -233,30 +233,8 @@ _USER_TMPL = (
 )
 
 
-_TOKEN_PATHS = (
-    os.environ.get("AI_PARSE_TOKEN_FILE", ""),
-    # 容器内 HOME=/root，expanduser("~") 会指向 /root 而非挂载点，
-    # 故宿主机绝对路径必须列在最前（docker-compose 只读挂载此单文件）。
-    "/home/dong/.config/cliproxy/token",
-    os.path.expanduser("~/.config/cliproxy/token"),
-)
-
-
 def _load_token():
-    v = (os.environ.get("OPENAI_API_KEY") or "").strip()
-    if v:
-        return v
-    for p in _TOKEN_PATHS:
-        if not p:
-            continue
-        try:
-            with open(p) as f:
-                tok = f.read().strip()
-            if tok:
-                return tok
-        except Exception:
-            continue
-    return ""
+    return config.load_cliproxy_token()
 
 
 def _strip_fence(raw):
@@ -277,8 +255,9 @@ def _ask_model(names, season):
             {"role": "user", "content": _USER_TMPL.format(
                 season=season, names=json.dumps(names, ensure_ascii=False))},
         ],
-        "max_tokens": 64 * len(names) + 128,
+        "max_tokens": config.AI_PARSE_MAX_TOKENS,
         "temperature": 0,
+        "reasoning_effort": config.AI_PARSE_REASONING_EFFORT,
     }
     req = urllib.request.Request(
         f"{config.AI_PARSE_BASE_URL.rstrip('/')}/chat/completions",
@@ -290,7 +269,7 @@ def _ask_model(names, season):
     with urllib.request.urlopen(req, timeout=config.AI_PARSE_TIMEOUT) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     msg = data.get("choices", [{}])[0].get("message", {})
-    content = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+    content = (msg.get("content") or "").strip()
     if not content:
         raise ValueError("模型返回空内容")
     arr = json.loads(_strip_fence(content))

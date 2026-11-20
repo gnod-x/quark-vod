@@ -1,38 +1,60 @@
-.PHONY: up down restart build logs status test sync
+PYTHON ?= python3
+HOMETHEATER_DIR ?= ../hometheater
 
-sync:
-	@cp -f /home/dong/projects/quark-vod/app/quark_vod/*.py /home/dong/projects/hometheater/scripts/quark_vod/
-	@echo "[OK] Synced quark_vod modules to hometheater/scripts/quark_vod"
+.PHONY: install test test-offline test-homelab test-ui package build up down restart logs status sync sync-jobs check-sync verify-runtime
+
+install:
+	$(PYTHON) -m pip install -e '.[test]'
+
+test: test-offline
+
+test-offline:
+	@set -e; for file in tests/test_*.py; do \
+	  case "$$file" in tests/test_portal_vod.py|tests/test_probe_wrapper.py) continue ;; esac; \
+	  PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -I "$$file"; \
+	done
+
+test-homelab: test-offline
+	@set -e; test -d "$(HOMETHEATER_DIR)/scripts/tests"; \
+	for file in tests/test_portal_vod.py tests/test_probe_wrapper.py; do PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -I "$$file"; done; \
+	for file in "$(HOMETHEATER_DIR)"/scripts/tests/test_*.py; do PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -I "$$file"; done
+	$(PYTHON) -I tests/verify_tmdb_populate.py --offline-fixture
+	$(MAKE) check-sync
+
+test-ui:
+	node tests/test_portal_ui.js
+
+package:
+	$(PYTHON) -m build
+
+build:
+	docker compose build quark-vod
 
 up:
 	docker compose up -d
 
-build:
-	docker compose build quark-vod && docker compose up -d
-
-restart: sync
-	docker compose restart quark-vod
-
 down:
 	docker compose down
 
+restart:
+	docker compose restart quark-vod
+
 logs:
-	docker logs -f --tail 100 quark-vod
+	docker compose logs --tail 100 -f quark-vod
 
 status:
-	@docker ps --filter "name=quark-vod" --filter "name=jellyfin2" --filter "name=openlist"
-	@echo "\n--- 8099 Capability ---"
-	@curl -s http://127.0.0.1:8099/capability | python3 -m json.tool
+	docker compose ps
 
-test:
-	@echo "=== Running Quark-VOD Engine Verification Suite ==="
-	@docker compose config >/dev/null && echo "[PASS] 1. quark-vod compose syntax valid"
-	@[ "$$(cat /sys/bus/pci/devices/0000:01:00.0/power_state)" = "D3cold" ] && echo "[PASS] 2. dGPU is D3cold" || (echo "[FAIL] 2. dGPU woken up!" && exit 1)
-	@curl -sf http://127.0.0.1:8099/health >/dev/null && echo "[PASS] 3. 8099 /health is online"
-	@curl -sf http://127.0.0.1:8099/admin >/dev/null && echo "[PASS] 4. 8099 /admin Whitebox Console reachable"
-	@curl -sf http://127.0.0.1:8099/docs >/dev/null && echo "[PASS] 5. 8099 /docs Swagger UI reachable"
-	@python3 -c "import urllib.request, json, sys; d=json.loads(urllib.request.urlopen('http://127.0.0.1:8099/capability').read()); print('[PASS] 6. Capability ready:', d) if d.get('ready') else sys.exit(1)"
-	@python3 -m py_compile app/main.py app/quark_vod/*.py app/jobs/*.py && echo "[PASS] 7. All Python modules compile cleanly"
-	@diff -q /home/dong/projects/quark-vod/app/quark_vod/strm_manager.py /home/dong/projects/hometheater/scripts/quark_vod/strm_manager.py >/dev/null && echo "[PASS] 8. quark_vod dual-directory in sync" || (echo "[FAIL] 8. quark_vod drift detected!" && exit 1)
-	@python3 -I tests/test_name_parser.py >/tmp/name_parser_test.log 2>&1 && echo "[PASS] 9. name_parser offline regression (red-line 7/8 golden samples)" || (echo "[FAIL] 9. name_parser regression!" && tail -20 /tmp/name_parser_test.log && exit 1)
-	@for f in $$(ls app/quark_vod/*.py); do diff -q $$f /home/dong/projects/hometheater/scripts/quark_vod/$$(basename $$f) >/dev/null || (echo "[FAIL] 10. drift: $$f" && exit 1); done; echo "[PASS] 10. all quark_vod modules zero drift"
+sync:
+	@test -d "$(HOMETHEATER_DIR)/scripts/quark_vod"
+	cp -f app/quark_vod/*.py "$(HOMETHEATER_DIR)/scripts/quark_vod/"
+
+sync-jobs:
+	@set -e; for name in ai_night_worker category_governor daily_update_and_prune people_manager purge_orphan_metadata tmdb_populate vod_search_and_add; do cp "$(HOMETHEATER_DIR)/scripts/$$name.py" "app/jobs/$$name.py"; done
+
+check-sync:
+	$(PYTHON) -I tests/check_sync.py --destination "$(HOMETHEATER_DIR)/scripts/quark_vod"
+
+verify-runtime:
+	@test -n "$(OUTPUT)" || (echo "Set OUTPUT=/path/to/report.json"; exit 2)
+	$(PYTHON) -I tests/verify_runtime.py --output "$(OUTPUT)"
