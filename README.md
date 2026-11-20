@@ -99,9 +99,10 @@ python -m build
 docker build -t quark-vod:3.0.0 .
 ```
 
-`make test` runs isolated core and plugin/configuration/API regressions without a
-sibling home-server repository or real cloud credentials. Optional legacy
-home-server compatibility checks are separate: `make test-homelab`.
+`make test` runs the public core, plugin, configuration and API regressions with
+synthetic data. It does not require a sibling home-server repository or real
+cloud credentials. Deployment-specific compatibility checks belong to the
+deployment adapter and are not part of this standalone release.
 
 Read [architecture](docs/architecture.md), [contributing](CONTRIBUTING.md) and
 [security boundaries](SECURITY.md). The package, source distribution and image

@@ -12,15 +12,16 @@ make test
 python -m build
 ```
 
-`make test` runs the standalone Python regression suite with synthetic data and local fixtures. It intentionally skips the two legacy host integration tests. The CI workflow also builds the wheel and source distribution, installs the wheel outside the source tree, checks the packaged admin page and CLI, and starts the container as a non-root user with a read-only root filesystem and resource limits.
+`make test` runs the standalone Python regression suite with synthetic data and
+local fixtures. It does not require a sibling home-server repository or real
+service credentials. The CI workflow also builds the wheel and source
+distribution, installs the wheel outside the source tree, checks the packaged
+admin page and CLI, and starts the container as a non-root user with a
+read-only root filesystem and resource limits.
 
-Run the separate portal UI fixture when changing its JavaScript. It requires Node.js and a sibling `../hometheater/web/js` checkout:
-
-```sh
-make test-ui
-```
-
-`make test-homelab` runs the optional home-server compatibility tests and synchronization checks. It requires the sibling `../hometheater` repository and its integration dependencies; it is not required for changes confined to the standalone package.
+Deployment-specific portal, host-job and playback-wrapper tests are maintained
+with the deployment adapter. They are outside this standalone release's source
+tree and test targets.
 
 ## Change and test expectations
 
