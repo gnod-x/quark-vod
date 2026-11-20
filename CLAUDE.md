@@ -1,6 +1,6 @@
 # Quark-VOD 协作契约
 
-Quark-VOD 是可独立安装的夸克点播内核。本机另外通过家庭影院适配启用 Jellyfin2、宿主作业和现有状态库。本文依据 3.0.0 源码及本轮隔离验证重写；最终部署、哈希、真实播放与未覆盖范围以[验收报告](/home/dong/.agent-context/verification/quark-vod-open-20261120/REPORT.md)为准。
+Quark-VOD 是可独立安装的夸克点播内核。本机另外通过家庭影院适配启用 Jellyfin2、宿主作业和现有状态库。本文依据 3.0.0 源码及隔离验证重写；开源化总体边界见[验收报告](/home/dong/.agent-context/verification/quark-vod-open-20261120/REPORT.md)，当前 RemoteStore 契约、失败语义、发布制品和本机回归/播放证据见[storage-contract 批次报告](/home/dong/.agent-context/verification/quark-vod-storage-contract-87d2228/REPORT.md)。
 
 ## 事实来源与交付
 
