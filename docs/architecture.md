@@ -207,3 +207,26 @@ Jellyfin image paths). No host layout is assumed. The full image-reference table
 is read; remote HTTP(S) images are unrelated to local files, while an unmapped
 local path stops the operation. The existing complete-tree, reference-count,
 permission and changed-file checks still apply.
+
+
+### Explicit image reference namespaces
+
+Destructive metadata maintenance requires JELLYFIN_METADATA_LIBRARY_DIR and
+JELLYFIN_METADATA_LIBRARY_PREFIX. Both default to empty. Additional local image
+namespaces have no implicit host mapping. Operators may explicitly set
+JELLYFIN_METADATA_EXTERNAL_ROOTS to a JSON array such as:
+
+    [{"prefix":"/metadata/actors","root":"/srv/images/actors"}]
+
+The default is [] (no exclusions). Each prefix and root must be an absolute,
+normalized non-root path. Database prefixes and resolved local roots must be
+pairwise disjoint, including the configured library mapping. Unknown fields,
+duplicate or overlapping mappings, missing roots, permission/resolve errors and
+parent traversal stop cleanup. Every excluded local reference must resolve
+strictly inside its declared external root and outside the library. Existing
+objects must be regular files; missing external images are allowed only after
+that boundary is proven, including resolution of existing symlinks and parents. Symlinks escaping that root are rejected. Configuration does not
+grant filesystem permissions or mount directories; operators must verify the
+database paths, actual mounts and file visibility for the executing process.
+Unknown namespaces remain fail-closed. No provider-specific People/Studio paths
+are built in. Remote HTTP(S) image references retain their existing handling.

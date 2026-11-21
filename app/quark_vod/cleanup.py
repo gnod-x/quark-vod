@@ -759,12 +759,66 @@ def _plan_orphan_metadata(lib_dir):
     return candidates
 
 
+
+def _metadata_external_roots(lib_dir, library_prefix):
+    """Validate explicit mappings before excluding any non-library reference."""
+    import json
+    from pathlib import Path
+
+    def canonical(value):
+        if (not isinstance(value, str) or not value.startswith("/")
+                or chr(0) in value or ".." in value.split("/")
+                or os.path.normpath(value) != value or value == "/"):
+            raise ValueError("invalid root")
+        return value
+
+    def overlaps(a, b):
+        return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+    try:
+        raw = config.JELLYFIN_METADATA_EXTERNAL_ROOTS
+        if len(raw) > 32768:
+            raise ValueError("oversized roots")
+        def unique_fields(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate mapping field")
+                result[key] = value
+            return result
+
+        entries = json.loads(raw, object_pairs_hook=unique_fields)
+        if not isinstance(entries, list) or len(entries) > 32:
+            raise ValueError("invalid roots")
+        mappings = []
+        prefixes = [canonical(library_prefix.rstrip("/"))]
+        roots = [str(Path(lib_dir).resolve(strict=True))]
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"prefix", "root"}:
+                raise ValueError("invalid mapping")
+            prefix = canonical(entry["prefix"])
+            root = canonical(entry["root"])
+            resolved = str(Path(root).resolve(strict=True))
+            if not Path(resolved).is_dir():
+                raise ValueError("not a directory")
+            if any(overlaps(prefix, old) for old in prefixes):
+                raise ValueError("overlapping prefixes")
+            if any(overlaps(resolved, old) for old in roots):
+                raise ValueError("overlapping roots")
+            prefixes.append(prefix)
+            roots.append(resolved)
+            mappings.append((prefix + "/", root, resolved))
+        return mappings
+    except (ValueError, TypeError, OSError, RuntimeError) as exc:
+        raise MetadataCleanupError("invalid_external_reference_mapping") from exc
+
 def _metadata_references(connection, lib_dir):
     from urllib.parse import urlsplit
     referenced = set()
     prefix = config.JELLYFIN_METADATA_LIBRARY_PREFIX.rstrip("/") + "/"
     if prefix == "/" or not prefix.startswith("/") or ".." in prefix.split("/"):
         raise MetadataCleanupError("reference_mapping_unconfigured")
+    external = _metadata_external_roots(lib_dir, prefix)
     for (path,) in connection.execute("SELECT Path FROM BaseItemImageInfos"):
         if not isinstance(path, str) or not path or chr(0) in path:
             raise MetadataCleanupError("invalid_reference_path")
@@ -776,6 +830,37 @@ def _metadata_references(connection, lib_dir):
         if path.startswith(prefix):
             path = os.path.join(lib_dir, path[len(prefix):])
         elif not path.startswith(lib_dir + os.sep):
+            from pathlib import Path
+            matched = False
+            for external_prefix, root, resolved_root in external:
+                if not path.startswith(external_prefix):
+                    continue
+                relative = path[len(external_prefix):]
+                if ".." in relative.split("/") or not relative or chr(0) in relative:
+                    raise MetadataCleanupError("invalid_reference_path")
+                try:
+                    resolved = str((Path(root) / relative).resolve(strict=False))
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise MetadataCleanupError("external_reference_unresolved") from exc
+                if not resolved.startswith(resolved_root + os.sep):
+                    raise MetadataCleanupError("external_reference_escape")
+                if (resolved == os.path.realpath(lib_dir)
+                        or resolved.startswith(os.path.realpath(lib_dir) + os.sep)):
+                    raise MetadataCleanupError("external_reference_escape")
+                try:
+                    info = os.stat(resolved)
+                except FileNotFoundError:
+                    # A proven external namespace may contain stale image rows.
+                    # Missing external files cannot reference this library.
+                    info = None
+                except OSError as exc:
+                    raise MetadataCleanupError("external_reference_unresolved") from exc
+                if info is not None and not stat.S_ISREG(info.st_mode):
+                    raise MetadataCleanupError("external_reference_unresolved")
+                matched = True
+                break
+            if matched:
+                continue
             raise MetadataCleanupError("unmapped_reference_path")
         path = os.path.normpath(path)
         if not path.startswith(lib_dir + os.sep):

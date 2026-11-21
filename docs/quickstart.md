@@ -322,3 +322,34 @@ docker image load -i "$backup_dir/image.tar" &&
 4. 使用允许的单个作品验证搜索、保存、OpenList 读取及播放器实际起播与 seek。保存完成、字节读取成功和终端播放是不同验收结果。
 
 搜索节点配置和热重载语义见[搜索插件文档](plugins.md)。安全边界见[安全说明](../SECURITY.md)。
+
+
+### Explicit metadata image mappings
+
+Image deletion is opt-in. Set JELLYFIN_METADATA_LIBRARY_DIR to the local library
+image directory visible to the executing process, and
+JELLYFIN_METADATA_LIBRARY_PREFIX to its database Path prefix. Both default empty.
+Do not enable these settings until current database paths, mounts, permissions
+and scan completion have been checked. They do not grant filesystem access.
+
+Other local image namespaces must be declared explicitly with
+JELLYFIN_METADATA_EXTERNAL_ROOTS (default []), for example:
+
+    JELLYFIN_METADATA_EXTERNAL_ROOTS=[{"prefix":"/metadata/actors","root":"/srv/images/actors"}]
+
+This JSON array accepts only prefix and root fields; at most 32 mappings and
+32 KiB of JSON are allowed. Use absolute normalized paths without parent
+traversal. Roots must resolve to existing directories. Prefixes and resolved
+roots must be pairwise disjoint, including the library mapping; duplicate
+fields, duplicate/overlapping mappings and unknown namespaces are rejected.
+No deployment-specific People, Studio or media roots are inferred.
+
+External references are excluded only after resolving existing parents and
+symlinks proves the target remains strictly inside its declared external root
+and outside the library. An existing object must be a regular file. A missing
+external image is safe to exclude within that proven boundary: it cannot affect
+library reference completeness. Permission failures and unknown resolution
+remain errors. Dangling symlinks escaping the external root, including links
+toward missing library images, are rejected. Library references retain their
+strict completeness checks. Configure paths for each executing process; host
+filesystem visibility does not imply that a container has the same mounts.

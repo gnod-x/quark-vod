@@ -25,6 +25,18 @@ with the deployment adapter. Its optional Makefile targets and fixtures are not
 shipped in this standalone source tree or source distribution. Run those checks
 from the deployment checkout when changing an integration.
 
+## Publishing a release
+
+1. Update the package version and matching Dockerfile/Compose defaults. Add public release notes at `docs/releases/<version>.md`; include migration and rollback requirements.
+2. Merge the final commit to `main`. Wait for that exact commit's CI to succeed on Python 3.11, 3.12 and 3.13 and for the container job to pass. Do not tag an unverified or different commit.
+3. Create and push an annotated `v<version>` tag pointing to that verified commit. The tag must match `app/quark_vod/__init__.py`; for example, package version `3.0.1` requires `v3.0.1`.
+4. Watch the Release workflow. It checks out the pushed tag, builds the wheel and source distribution with Python 3.12, tests the shipped source tree, and verifies both installed distributions outside the checkout. Only then does its release job use GitHub's temporary token to create a GitHub Release.
+5. Confirm the release points to the intended tag and contains exactly the wheel, source distribution, and `SHA256SUMS`. Download the assets and verify checksums before deployment.
+
+The workflow grants `contents: write` only to its release job and makes credentials available only to the publication step. It never uploads operator delivery archives, host patches, credentials, or private logs. There is no PyPI or container-registry publication in this workflow.
+
+Release creation fails if a release with that tag already exists. Investigate a failed publication before retrying; do not move a published tag or overwrite assets silently. GitHub Release success does not imply that a deployment was upgraded or that real playback was verified.
+
 ## Change and test expectations
 
 - Preserve identity checks before quality ranking, durable recovery of uncertain transfers, bounded streaming resources and failure-aware storage lifecycle updates.

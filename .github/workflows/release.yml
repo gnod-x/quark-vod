@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify release tag and notes
+        run: |
+          version="$(python -c 'import ast; from pathlib import Path; tree=ast.parse(Path("app/quark_vod/__init__.py").read_text()); print(next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "__version__" for t in n.targets)))')"
+          test "$GITHUB_REF_NAME" = "v$version"
+          test -f "docs/releases/$version.md"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Build public distributions
+        run: |
+          python -m pip install --upgrade build
+          python -m build --sdist --wheel
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+          test -f "dist/quark_vod-$VERSION-py3-none-any.whl"
+          test -f "dist/quark_vod-$VERSION.tar.gz"
+      - name: Test the shipped source distribution
+        run: |
+          scratch="$(mktemp -d)"
+          trap 'rm -rf -- "$scratch"' EXIT
+          tar -xzf "dist/quark_vod-$VERSION.tar.gz" -C "$scratch"
+          cd "$scratch/quark_vod-$VERSION"
+          test ! -e Makefile.homelab
+          python -m pip install '.[test]'
+          make test
+      - name: Verify both installed distributions outside the source tree
+        run: |
+          artifacts=("$PWD/dist/quark_vod-$VERSION-py3-none-any.whl" "$PWD/dist/quark_vod-$VERSION.tar.gz")
+          scratch="$(mktemp -d)"
+          trap 'rm -rf -- "$scratch"' EXIT
+          cd "$scratch"
+          for artifact in "${artifacts[@]}"; do
+            venv="$scratch/$(basename "$artifact").venv"
+            python -m venv "$venv"
+            "$venv/bin/python" -m pip install --no-cache-dir "$artifact"
+            "$venv/bin/quark-vod" --help
+            test "$("$venv/bin/quark-vod" --version)" = "Quark VOD $VERSION"
+            "$venv/bin/python" -BI - <<'PY'
+          import asyncio
+          from importlib.metadata import version
+          from importlib.resources import files
+          import os
+          from pathlib import Path
+          import sys
+          import tempfile
+          import quark_vod
+          from quark_vod.api import create_app
+
+          assert Path(quark_vod.__file__).is_relative_to(sys.prefix)
+          assert quark_vod.__version__ == version("quark-vod") == os.environ["VERSION"]
+          assert files("quark_vod").joinpath("static/admin.html").is_file()
+
+          async def check():
+              app = create_app()
+              from quark_vod import db
+              assert app.version == quark_vod.__version__
+              async with app.router.lifespan_context(app):
+                  assert db._conn().execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+              db.close()
+
+          with tempfile.TemporaryDirectory() as state:
+              os.environ["VOD_BASE_DIR"] = state
+              asyncio.run(check())
+          PY
+          done
+      - name: Publish only the public distributions and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          sha256sum "quark_vod-$VERSION-py3-none-any.whl" "quark_vod-$VERSION.tar.gz" > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" \
+            "quark_vod-$VERSION-py3-none-any.whl" "quark_vod-$VERSION.tar.gz" SHA256SUMS \
+            --verify-tag --title "Quark-VOD $VERSION" \
+            --notes-file "../docs/releases/$VERSION.md"
