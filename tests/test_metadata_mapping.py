@@ -12,17 +12,24 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'app'))
 from quark_vod import cleanup,config,coordination,db
 
 class MetadataMappingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="metadata-library-fixture-")
+        self.addCleanup(self.temp.cleanup)
+        self.library = Path(self.temp.name) / "library"
+        (self.library / "aa").mkdir(parents=True)
+        (self.library / "aa/poster.jpg").write_bytes(b"synthetic image")
+
     def references(self,paths):
         con=sqlite3.connect(':memory:')
         con.execute('CREATE TABLE BaseItemImageInfos(Path TEXT)')
         con.executemany('INSERT INTO BaseItemImageInfos VALUES (?)',[(p,) for p in paths])
         try:
             with patch.object(config,'JELLYFIN_METADATA_LIBRARY_PREFIX','/custom/jf/library'):
-                return cleanup._metadata_references(con,'/mounted/library')
+                return cleanup._metadata_references(con,str(self.library))
         finally:con.close()
 
     def test_explicit_custom_mapping_and_unrelated_remote_url(self):
-        self.assertEqual(self.references(['/custom/jf/library/aa/poster.jpg','https://images.example/a.jpg']),{'/mounted/library/aa/poster.jpg'})
+        self.assertEqual(self.references(['/custom/jf/library/aa/poster.jpg','https://images.example/a.jpg']),{str(self.library / 'aa/poster.jpg')})
 
     def test_unknown_local_prefix_is_not_silently_filtered(self):
         with self.assertRaises(cleanup.MetadataCleanupError):
