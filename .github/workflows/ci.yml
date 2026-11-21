@@ -20,22 +20,59 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e '.[test]'
-      - run: make test
-      - run: python -m build
-      - name: Validate installed wheel outside the source tree
+      - name: Validate Compose configuration
         run: |
-          python -m venv /tmp/quark-vod-wheel
-          /tmp/quark-vod-wheel/bin/python -m pip install dist/*.whl
-          cd /tmp
-          /tmp/quark-vod-wheel/bin/quark-vod --help
-          /tmp/quark-vod-wheel/bin/python -I - <<'PY'
+          cp .env.example .env
+          docker compose config --quiet
+      - run: python -m build
+      - name: Run the shipped regression suite from the source distribution
+        run: |
+          scratch=$(mktemp -d)
+          trap 'rm -rf -- "$scratch"' EXIT
+          tar -xzf dist/*.tar.gz -C "$scratch"
+          cd "$scratch"/quark_vod-*
+          test ! -e Makefile.homelab
+          make test
+      - name: Start both installed distributions outside the source tree
+        run: |
+          artifacts=("$PWD"/dist/*.whl "$PWD"/dist/*.tar.gz)
+          scratch=$(mktemp -d)
+          trap 'rm -rf -- "$scratch"' EXIT
+          cd "$scratch"
+          for artifact in "${artifacts[@]}"; do
+            venv="$scratch/$(basename "$artifact").venv"
+            python -m venv "$venv"
+            "$venv/bin/python" -m pip install --no-cache-dir "$artifact"
+            "$venv/bin/quark-vod" --help
+            "$venv/bin/quark-vod" --version
+            "$venv/bin/python" -BI - <<'PY'
+          import asyncio
+          from importlib.metadata import version
           from importlib.resources import files
+          import os
+          from pathlib import Path
+          import sys
+          import tempfile
+
           import quark_vod
           from quark_vod.api import create_app
-          assert str(quark_vod.__file__).startswith("/tmp/quark-vod-wheel/")
+
+          assert Path(quark_vod.__file__).is_relative_to(sys.prefix)
           assert files("quark_vod").joinpath("static/admin.html").is_file()
-          assert create_app() is not None
+
+          async def start():
+              app = create_app()
+              from quark_vod import db
+
+              assert app.version == quark_vod.__version__ == version("quark-vod")
+              async with app.router.lifespan_context(app):
+                  assert db._conn().execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+
+          with tempfile.TemporaryDirectory() as state:
+              os.environ["VOD_BASE_DIR"] = state
+              asyncio.run(start())
           PY
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: python-${{ matrix.python-version }}
@@ -45,19 +82,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t quark-vod:ci .
+      - name: Build and inspect OCI metadata
+        run: |
+          VERSION="$(PYTHONPATH=app python3 -c 'from quark_vod import __version__; print(__version__)')"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          docker build --build-arg VOD_VERSION="$VERSION" --build-arg VCS_REF="$GITHUB_SHA" -t quark-vod:ci .
+          test "$(docker image inspect quark-vod:ci --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')" = "$VERSION"
+          test "$(docker image inspect quark-vod:ci --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$GITHUB_SHA"
+          test "$(docker image inspect quark-vod:ci --format '{{ .Config.User }}')" = "10001:10001"
       - name: Empty non-root/read-only startup
         run: |
           docker run -d --name quark-vod-ci --read-only --memory 256m \
             --tmpfs /tmp:rw,size=32m --tmpfs /data:rw,size=16m,uid=10001,gid=10001 \
             -p 127.0.0.1:18099:8099 quark-vod:ci
-          python3 - <<'PY'
-          import json, time, urllib.request
+          python3 - "$VERSION" <<'PY'
+          import json, sys, time, urllib.request
           for attempt in range(30):
               try:
                   with urllib.request.urlopen("http://127.0.0.1:18099/health", timeout=2) as r:
                       result = json.load(r)
-                      assert r.status == 200 and result["status"] == "ok"
+                      assert r.status == 200 and result["status"] == "ok" and result["version"] == sys.argv[1]
                       break
               except OSError:
                   time.sleep(1)

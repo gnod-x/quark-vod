@@ -10,7 +10,7 @@ test: test-offline
 test-offline:
 	@set -e; for file in tests/test_*.py; do \
 	  case "$$file" in tests/test_portal_vod.py|tests/test_probe_wrapper.py) continue ;; esac; \
-	  PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -I "$$file"; \
+	  $(PYTHON) -BI "$$file"; \
 	done
 
 package:
@@ -33,3 +33,5 @@ logs:
 
 status:
 	docker compose ps
+
+-include Makefile.homelab

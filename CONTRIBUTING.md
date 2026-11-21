@@ -9,19 +9,21 @@ Use Python 3.11 or newer. The CI matrix currently checks Python 3.11, 3.12 and 3
 ```sh
 python -m pip install -e '.[test]'
 make test
-python -m build
+python -m build --sdist --wheel
 ```
 
-`make test` runs the standalone Python regression suite with synthetic data and
-local fixtures. It does not require a sibling home-server repository or real
-service credentials. The CI workflow also builds the wheel and source
-distribution, installs the wheel outside the source tree, checks the packaged
-admin page and CLI, and starts the container as a non-root user with a
-read-only root filesystem and resource limits.
+`make test` runs the standalone Python regression suite with synthetic data and local fixtures. It intentionally skips the two legacy host integration tests. CI checks Compose configuration, builds both distribution formats, installs the wheel and source distribution outside the source tree, verifies the CLI/API/package resources, and inspects the container's OCI version and revision labels before its non-root, read-only startup check.
+
+## Version and release metadata
+
+`app/quark_vod/__init__.py` is the package version source. Setuptools reads that value for wheel and source distribution metadata; the CLI and API health/OpenAPI responses use the same value. When creating a release, update the Dockerfile and Compose fallback defaults together; the consistency test fails if either drifts. Compose passes the selected image version into `VOD_VERSION`, and CI also passes the package version explicitly. Release builds should pass the package version as `VOD_VERSION` and the source commit as `VCS_REF` so OCI labels identify the exact artifact.
+
+Runtime dependencies remain declared as supported compatibility ranges in `pyproject.toml`, not frozen to one machine's resolution. CI resolves those ranges on each supported Python version. Update dependency bounds intentionally and keep the 3.11–3.13 test matrix green; do not copy a local environment's exact package versions into the runtime contract.
 
 Deployment-specific portal, host-job and playback-wrapper tests are maintained
-with the deployment adapter. They are outside this standalone release's source
-tree and test targets.
+with the deployment adapter. Its optional Makefile targets and fixtures are not
+shipped in this standalone source tree or source distribution. Run those checks
+from the deployment checkout when changing an integration.
 
 ## Change and test expectations
 

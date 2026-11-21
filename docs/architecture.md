@@ -55,10 +55,28 @@ configured independently; cross-process lock files live under
 `VOD_DATA_DIR/locks`, and the optional media-library root has its own
 `VOD_CINEMA2_DIR` setting.
 
+`app/quark_vod/db.py` owns the monotonic schema version in SQLite
+`PRAGMA user_version`. A version-0 database from the supported legacy schema is
+checked with SQLite `quick_check` and upgraded transactionally during application
+startup, before stale-transfer cleanup or background work begins. Startup
+validates the required tables and columns; a failed integrity check or incomplete
+migration aborts startup and rolls back its transaction. Already-current
+databases do not incur the integrity scan on routine startup. A database from a
+newer schema version is rejected without application schema or data changes. The
+service does not perform automatic downgrades or create backups; operators must
+make and verify an SQLite online backup before upgrading. Restoring an older
+database is an explicit recovery decision because it discards state written after
+that backup.
+
 The supported service topology is one process and one ASGI worker. Resolver
 reservations, semaphores, and caches are process-local; they are not a distributed
 job queue. Host-side jobs that share a library must also use the data directory's
 lock files so maintenance cannot race playback or another maintenance run.
+Upgrades are single-writer operations, not rolling deployments: stop every old
+service process and host-side state writer before starting a new version. Startup
+locking serializes schema initialization, but it cannot prevent an already-running
+older binary from continuing to write after a migration. Schema changes that need
+overlap require an explicitly staged, backward-compatible migration.
 
 ## Playback modes
 

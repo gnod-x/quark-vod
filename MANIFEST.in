@@ -6,7 +6,9 @@ exclude examples/search.json
 recursive-include .github/workflows *.yml *.yaml
 include tests/test_*.py
 include tests/check_sync.py
+recursive-include tests/fixtures *.sql
 recursive-include docs *.md
+exclude Makefile.homelab
 exclude tests/test_portal_vod.py tests/test_probe_wrapper.py
 exclude docs/agent-architecture.md
 prune app/jobs

@@ -1,6 +1,6 @@
 # 安装、配置与运维
 
-本文按仓库中的 Quark-VOD 3.0.0 源码、`docker-compose.yml` 和当前 API 行为编写。默认 Compose 部署从本地源码构建镜像；配置中的 `quark-vod:3.0.0` 是本地镜像标签，不代表已经发布到公共镜像仓库。
+本文按仓库中的 Quark-VOD 3.0.0 源码、`docker-compose.yml` 和当前 API 行为编写。默认 Compose 部署从本地源码构建镜像；配置中的 `quark-vod:3.0.0` 是本地镜像标签，不代表已经发布到公共镜像仓库。镜像 OCI version label 默认跟随该标签；发布构建应显式传入 `QUARK_VOD_IMAGE_VERSION` 与 `QUARK_VOD_IMAGE_REVISION`，分别记录包版本和源码提交。
 
 ## 部署前准备
 
@@ -215,38 +215,102 @@ Compose 将整个 `examples/` 目录以只读方式挂载到容器 `/config`，�
 
 ## 升级、备份与回滚
 
-升级前安排维护窗口，人工确认没有正在进行的保存任务或播放。管理面板中的最近记录可辅助查看，但不能可靠证明远端保存已经完全空闲。备份 `.env`、自定义 Compose 覆盖文件、`examples/search.json` 和集成部署中的 STRM/NFO 文件；这些文件可能包含凭据或个人媒体路径，需妥善保管。
+### 从旧的宿主耦合部署迁移
 
-默认 Compose 状态库路径是容器内 `/data/data/quark_plays.db`。使用 SQLite online backup API 生成一致快照，再复制到宿主机并检查完整性：
+3.0.0 将公共 Compose 与宿主集成分开。旧部署可能使用 host 网络、宿主目录和源码挂载；新版公共 Compose 使用独立的数据卷，默认只发布回环端口。直接替换 Compose 后启动，可能得到一个全新的空状态库；这不表示旧数据已经迁移。数据库 schema 兼容不等于部署配置兼容。
 
-```sh
-docker compose exec -T quark-vod python -c "import sqlite3; s=sqlite3.connect('file:/data/data/quark_plays.db?mode=ro',uri=True); d=sqlite3.connect('/data/data/quark_plays.backup.db'); s.backup(d); d.close(); s.close()"
-docker compose cp quark-vod:/data/data/quark_plays.backup.db ./quark_plays.backup.db
-docker compose exec -T quark-vod rm -f /data/data/quark_plays.backup.db
-python3 -c "import sqlite3; c=sqlite3.connect('file:./quark_plays.backup.db?mode=ro',uri=True); print(c.execute('PRAGMA integrity_check').fetchone()[0]); c.close()"
+替换旧 checkout 前，保留旧 Compose、覆盖文件、项目名和实际挂载信息。使用旧镜像及旧 Compose 完成下方备份流程，把 `state_db` 改为旧容器实际使用的状态库路径。确认已备份状态库、STRM/NFO、凭据和搜索配置后，再选择继续使用宿主适配，或将已校验的快照迁入独立部署。
+
+沿用旧数据时，通过自己的 Compose 覆盖文件显式保留数据挂载和容器内路径，并设置 `VOD_STATE_DB`、`VOD_CINEMA2_DIR` 及所需集成。`strm_map` 中的既有路径必须仍能从新容器访问；只复制 SQLite 文件不能完成媒体库迁移。核对非 root 用户对各持久目录的访问权限，不要通过递归修改整个媒体库属主来解决权限错误。保留旧部署和备份，验收后再决定是否移除。
+
+新版本只在显式指定 `VOD_ENV_FILE` 时读取环境文件；搜索源、OpenList 凭据来源和可选集成也必须明确配置。Jellyfin、AI、自愈和破坏性维护默认关闭，不能依赖旧版的隐式 HOME 路径、站点或开关。
+
+### 备份与回滚流程
+
+升级前安排维护窗口，确认没有正在进行的远端保存或播放，再暂停入口和共用状态库的宿主作业。停止所有旧版服务进程、容器和其他写者，并确认它们已退出后才启动新版；升级不支持新旧版本重叠运行。SQLite 启动锁只串行化迁移过程，不能阻止旧进程在迁移完成后继续写。最近记录只能辅助判断。保留旧版 Compose 文件、项目名和启动参数、`.env`、私有搜索配置、凭据文件及集成部署的 STRM/NFO；备份应限制访问。
+
+以下 Bash 示例在旧版项目目录执行。若部署使用自定义项目名、环境文件或覆盖文件，请将这些参数加入 `compose` 数组。自定义数据目录时，先确认实际数据卷及容器内状态库路径，再调整 `state_db`。脚本错误即停止，服务可能已停止；备份未经校验不能继续升级。
+
+```bash
+(
+set -euo pipefail
+umask 077
+compose=(docker compose -f docker-compose.yml)
+state_db=/data/data/quark_plays.db
+container=$("${compose[@]}" ps --all --quiet quark-vod)
+[[ -n "$container" && "$container" != *$'\n'* ]] || {
+  echo '预期 quark-vod 恰好对应一个容器，已停止操作。' >&2
+  exit 1
+}
+image_id=$(docker inspect --type container --format '{{.Image}}' "$container")
+backup_dir=$(mktemp -d "$PWD/quark-vod-backup.XXXXXXXX")
+printf '备份目录：%s\n' "$backup_dir"
+rollback_image="quark-vod:rollback-${backup_dir##*.}"
+docker image tag "$image_id" "$rollback_image"
+docker image save -o "$backup_dir/image.tar" "$rollback_image"
+printf 'services:\n  quark-vod:\n    image: %s\n' "$rollback_image" > "$backup_dir/rollback.yml"
+
+"${compose[@]}" stop quark-vod
+temporary=$(mktemp "$backup_dir/.state.XXXXXXXX")
+trap 'rm -f -- "$temporary"' EXIT
+"${compose[@]}" -f "$backup_dir/rollback.yml" run --rm --no-deps -T \
+  --pull never --entrypoint python quark-vod - "$state_db" > "$temporary" <<'PY'
+import shutil
+import sqlite3
+import sys
+import tempfile
+from contextlib import closing
+from pathlib import Path
+
+with tempfile.TemporaryDirectory() as directory:
+    copy = Path(directory) / "state.db"
+    with closing(sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True)) as source:
+        with closing(sqlite3.connect(copy)) as destination:
+            source.backup(destination)
+            if destination.execute("PRAGMA journal_mode=DELETE").fetchone() != ("delete",):
+                raise SystemExit("无法生成独立的 SQLite 快照")
+    with copy.open("rb") as stream:
+        shutil.copyfileobj(stream, sys.stdout.buffer)
+PY
+test -s "$temporary"
+python3 - "$temporary" <<'PY'
+import sqlite3
+import sys
+from contextlib import closing
+from pathlib import Path
+
+with closing(sqlite3.connect(Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True)) as db:
+    if db.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+        raise SystemExit("SQLite 备份校验失败")
+    print("备份校验通过，schema =", db.execute("PRAGMA user_version").fetchone()[0])
+PY
+ln -- "$temporary" "$backup_dir/state.db"
+)
 ```
 
-最后一条应输出 `ok`。该路径仅适用于未覆盖默认 Compose 数据目录的部署；自定义挂载或状态库路径应先用 `docker compose config` 确认。不要只复制运行中的 `quark_plays.db` 主文件；SQLite WAL 状态需要一致快照。
+SQLite backup API 将已提交的 WAL 内容纳入快照。备份容器在临时目录生成快照；数据库若接近 Compose 的 `/tmp` 容量上限，须为备份命令提供容量足够的专用临时空间。成功后保留完整备份目录，其中有旧镜像、回滚覆盖文件和通过校验的状态库。
 
-保留当前镜像用于应用回滚，再构建和部署新镜像：
+当前代码支持把 `PRAGMA user_version=0` 的既有 schema 迁移到版本 1。升级时服务先在事务内执行 SQLite `quick_check`，再迁移 schema 并检查必需表和列；任何完整性或迁移检查失败都会回滚并阻止服务继续启动。已经是当前版本的数据库不会在每次日常启动时重复扫描。版本高于当前程序支持值的数据库会被拒绝，程序不会自动降级，也不会自动创建备份。若启动报 schema 或完整性错误，保留数据库和日志，先确认运行的程序版本及备份；不要手工改 `user_version` 让旧程序绕过检查。恢复数据库前先停止服务，并确认接受丢弃备份之后写入的状态。
 
-```sh
-docker image tag quark-vod:3.0.0 quark-vod:rollback-before-upgrade
-docker image save quark-vod:rollback-before-upgrade -o ./quark-vod-rollback.tar
-docker compose build --pull quark-vod
-docker compose up -d --no-build --force-recreate quark-vod
-curl --fail --show-error http://127.0.0.1:8099/health
-```
-
-回滚应用镜像时恢复保留的标签，不要同时自动覆盖正在使用的数据卷：
+换成新版源码和匹配配置后，沿用同一 Compose 项目名和原数据卷。使用同样的项目参数及需要的覆盖文件，依次执行：
 
 ```sh
-docker image load -i ./quark-vod-rollback.tar
-docker image tag quark-vod:rollback-before-upgrade quark-vod:3.0.0
-docker compose up -d --no-build --force-recreate quark-vod
+docker compose config -q
+docker compose build quark-vod
+docker compose up -d --no-build --pull never --force-recreate quark-vod
 ```
 
-程序版本回滚和数据库回滚是两件事。旧程序可能无法处理新版本已经迁移的状态；代码没有通用的降级迁移。只有明确接受备份时点之后新增的转存、播放及状态记录全部丢失，才应在停服后恢复旧数据库快照。`docker compose down` 默认保留数据卷；绝不要把 `docker compose down -v` 或删除卷当作常规升级步骤。
+核对 `/health` 返回的版本并完成下方验收，再恢复定时任务和入口。只有确认旧程序兼容当前状态库与配置时，才能只回滚镜像。停掉服务和共享写者后，切回旧版配置，确认项目名、卷和路径正确。在其他覆盖文件之后追加备份目录的 `rollback.yml`，独立选用旧镜像。默认 Compose 示例：
+
+```sh
+backup_dir=/absolute/path/to/quark-vod-backup.XXXXXXXX
+docker image load -i "$backup_dir/image.tar" &&
+  docker compose -f docker-compose.yml -f "$backup_dir/rollback.yml" config -q &&
+  docker compose -f docker-compose.yml -f "$backup_dir/rollback.yml" \
+    up -d --no-build --pull never --force-recreate quark-vod
+```
+
+状态库不兼容时，先停掉全部写者并关闭其他数据库连接。保留升级后的配置和状态库，把主库及存在的 `-wal`、`-shm`、`-journal` 一起移离原路径。只有接受备份后新增的状态记录丢失时，才把校验过的 `state.db` 恢复到原路径，保持卷内属主和权限。恢复的主库不能与之前的 WAL/SHM 混用。再次验证完整性后，用与备份匹配的镜像和配置启动。升级与回滚均应保留数据卷。
 
 ## 验收顺序
 

@@ -38,12 +38,12 @@ package-dir = {"" = "app"}
 py-modules = ["main"]
 include-package-data = true
 
-[tool.setuptools.dynamic]
-version = {attr = "quark_vod.__version__"}
-
 [tool.setuptools.packages.find]
 where = ["app"]
 include = ["quark_vod", "quark_vod.*"]
 
 [tool.setuptools.package-data]
 quark_vod = ["static/*.html"]
+
+[tool.setuptools.dynamic]
+version = {attr = "quark_vod.__version__"}

@@ -2,7 +2,10 @@ services:
   quark-vod:
     build:
       context: .
-    image: quark-vod:3.0.0
+      args:
+        VOD_VERSION: "${QUARK_VOD_IMAGE_VERSION:-3.0.0}"
+        VCS_REF: "${QUARK_VOD_IMAGE_REVISION:-unknown}"
+    image: quark-vod:${QUARK_VOD_IMAGE_VERSION:-3.0.0}
     restart: unless-stopped
     env_file:
       - .env
@@ -31,6 +34,7 @@ services:
       resources:
         limits:
           memory: 256M
+          pids: 128
     stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/health', timeout=5)"]

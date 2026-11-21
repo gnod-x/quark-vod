@@ -38,6 +38,9 @@ playback-reachable OpenList and Quark-VOD URLs, and then build and start the
 service. The supplied Compose file builds from the local source tree; its image
 tag is not a promise that a public registry image is available.
 
+Existing deployments should follow the [upgrade and backup guide](docs/quickstart.md#升级备份与回滚)
+before replacing their Compose configuration or data mounts.
+
 The supplied Compose file publishes only on loopback, runs the image as a
 non-root user, keeps its root filesystem read-only and limits memory to 256 MiB.
 Persistent state is stored in a Compose-managed named volume. Search nodes are
@@ -96,13 +99,14 @@ Unknown quality is never a proof of HD/4K.
 python -m pip install -e '.[test]'
 make test
 python -m build
-docker build -t quark-vod:3.0.0 .
+VOD_VERSION="$(PYTHONPATH=app python -c 'from quark_vod import __version__; print(__version__)')"
+docker build --build-arg VOD_VERSION="$VOD_VERSION" -t "quark-vod:$VOD_VERSION" .
 ```
 
-`make test` runs the public core, plugin, configuration and API regressions with
-synthetic data. It does not require a sibling home-server repository or real
-cloud credentials. Deployment-specific compatibility checks belong to the
-deployment adapter and are not part of this standalone release.
+`make test` runs isolated core and plugin/configuration/API regressions without a
+sibling home-server repository or real cloud credentials. Deployment-specific
+compatibility checks are maintained with the deployment adapter and are not
+part of this standalone release.
 
 Read [architecture](docs/architecture.md), [contributing](CONTRIBUTING.md) and
 [security boundaries](SECURITY.md). The package, source distribution and image

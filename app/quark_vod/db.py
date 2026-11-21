@@ -14,21 +14,32 @@ import time
 
 from . import config
 
+SCHEMA_VERSION = 1
+_BUSY_TIMEOUT = 30
 _local = threading.local()
 
 
-def _conn():
+class DatabaseUpgradeError(RuntimeError):
+    """Raised when the state database cannot be safely opened or upgraded."""
+
+
+def _raw_conn():
+    """Return this thread's connection without triggering initialization."""
     if not hasattr(_local, "conn"):
         os.makedirs(os.path.dirname(config.STATE_DB), exist_ok=True)
-        con = sqlite3.connect(config.STATE_DB, timeout=30)
+        con = sqlite3.connect(config.STATE_DB, timeout=_BUSY_TIMEOUT)
         con.row_factory = sqlite3.Row
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("PRAGMA busy_timeout=30000")
         _local.conn = con
+        _local.initialized = False
     return _local.conn
 
 
-SCHEMA = """
+def _conn():
+    return init_db()
+
+
+# Freeze the SQL for each released migration. Add changes as a new migration.
+_SCHEMA_V1 = """
 -- 转存任务：一次点播对应一条
 CREATE TABLE IF NOT EXISTS transfers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,19 +162,184 @@ CREATE INDEX IF NOT EXISTS idx_name_parse_cache_origin ON name_parse_cache(origi
 """
 
 
+def _schema_statements(script):
+    # executescript() commits any pending transaction before running the SQL.
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            yield statement
+            statement = ""
+    if statement.strip():
+        raise DatabaseUpgradeError("state schema has an unterminated SQL statement")
+
+
+_REQUIRED_COLUMNS = {
+    "transfers": {
+        "id", "cat", "title", "season", "episode", "share_url", "share_pwd", "pan_type",
+        "status", "error", "remote_path", "file_size", "created_at", "updated_at", "save_task_id",
+        "save_target", "save_started_at",
+    },
+    "strm_map": {"cat", "title", "season", "episode", "strm_path"},
+    "plays": {"id", "cat", "title", "season", "episode", "transfer_id", "played_at", "finished"},
+    "playback_access": {"transfer_id", "accessed_at"},
+    "cleanup_queue": {"id", "transfer_id", "remote_path", "due_at", "cleaned"},
+    "dead_sources": {"source_url", "source_type", "reason", "created_at", "expires_at"},
+    "source_audits": {
+        "id", "cat", "title", "season", "episode", "has_quark_source", "is_4k", "best_share_url",
+        "best_share_title", "checked_at", "check_status",
+    },
+    "user_pinned": {"id", "cat", "title", "reason", "pinned_at"},
+    "name_parse_cache": {"cache_key", "file_name", "season", "episode", "confidence", "origin", "created_at"},
+}
+_PRIMARY_KEYS = {
+    "transfers": ("id",),
+    "strm_map": ("cat", "title", "season", "episode"),
+    "plays": ("id",),
+    "playback_access": ("transfer_id",),
+    "cleanup_queue": ("id",),
+    "dead_sources": ("source_url",),
+    "source_audits": ("id",),
+    "user_pinned": ("id",),
+    "name_parse_cache": ("cache_key",),
+}
+_UNIQUE_KEYS = {
+    "source_audits": ("cat", "title", "season", "episode"),
+    "user_pinned": ("cat", "title"),
+}
+
+
+def _validate_schema(con):
+    problems = []
+    for table, required in _REQUIRED_COLUMNS.items():
+        columns = {row["name"]: row for row in con.execute("SELECT * FROM pragma_table_info(?)", (table,))}
+        if not columns:
+            problems.append(f"{table} (missing table)")
+            continue
+        absent = sorted(required - columns.keys())
+        if absent:
+            problems.append(f"{table} (missing columns: {', '.join(absent)})")
+        primary = tuple(
+            column["name"] for column in sorted(columns.values(), key=lambda column: column["pk"]) if column["pk"]
+        )
+        expected_key = _PRIMARY_KEYS[table]
+        if primary != expected_key:
+            problems.append(f"{table} (expected primary key: {', '.join(expected_key)})")
+        key = _UNIQUE_KEYS.get(table)
+        if primary == ("id",) or key:
+            indexes = list(con.execute("SELECT * FROM pragma_index_list(?)", (table,)))
+            # Inserts into these tables omit id and need SQLite to allocate a rowid.
+            if primary == ("id",) and (
+                columns["id"]["type"].upper() != "INTEGER" or any(index["origin"] == "pk" for index in indexes)
+            ):
+                problems.append(f"{table} (id must be an auto-assigned integer primary key)")
+            if key and not any(
+                set(key) == {row["name"] for row in con.execute("SELECT * FROM pragma_index_info(?)", (index["name"],))}
+                for index in indexes if index["unique"] and not index["partial"]
+            ):
+                problems.append(f"{table} (missing unique key: {', '.join(key)})")
+    if problems:
+        raise DatabaseUpgradeError("incompatible state database schema: " + "; ".join(problems))
+
+
+def _migration_1(con):
+    """Create the 3.0 state schema and add fields from pre-versioned databases."""
+    tables = {row[0] for row in con.execute("SELECT name FROM sqlite_schema WHERE type IN ('table', 'view')")}
+    if "transfers" not in tables and any(not name.startswith("sqlite_") for name in tables):
+        raise DatabaseUpgradeError("unrecognized unversioned state database: missing transfers table")
+    for statement in _schema_statements(_SCHEMA_V1):
+        con.execute(statement)
+    columns = {row[1] for row in con.execute("PRAGMA table_info(transfers)")}
+    for name, kind in (("save_task_id", "TEXT"), ("save_target", "TEXT"), ("save_started_at", "INTEGER")):
+        if name not in columns:
+            con.execute(f"ALTER TABLE transfers ADD COLUMN {name} {kind}")
+
+
+_MIGRATIONS = {1: _migration_1}
+
+
+def _read_version(con):
+    version = con.execute("PRAGMA user_version").fetchone()[0]
+    if not 0 <= version <= SCHEMA_VERSION:
+        raise DatabaseUpgradeError(
+            f"unsupported state database schema version {version}; this binary supports 0 through {SCHEMA_VERSION}"
+        )
+    return version
+
+
+def _validate_database_integrity(con):
+    results = [row[0] for row in con.execute("PRAGMA quick_check")]
+    if results != ["ok"]:
+        raise DatabaseUpgradeError(
+            "state database failed SQLite quick_check; restore a verified backup before retrying"
+        )
+
+
+def _ensure_wal(con):
+    # A peer can briefly hold a read lock between our commit and the mode change.
+    deadline = time.monotonic() + _BUSY_TIMEOUT
+    while True:
+        try:
+            mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+            if mode == "wal" or con.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal":
+                return
+            break
+        except sqlite3.OperationalError as exc:
+            remaining = deadline - time.monotonic()
+            if exc.sqlite_errorcode & 0xff != sqlite3.SQLITE_BUSY or remaining <= 0:
+                raise DatabaseUpgradeError("cannot enable WAL on compatible state database; retry startup") from exc
+            time.sleep(min(0.05, remaining))
+    raise DatabaseUpgradeError("SQLite refused WAL for the state database; check its filesystem")
+
+
 def init_db():
-    con = _conn()
-    con.executescript(SCHEMA)
-    con.execute('BEGIN IMMEDIATE')
+    """Open or upgrade the state database in one transactional, retryable step.
+
+    Databases created before schema versioning report ``user_version=0`` and
+    receive the idempotent version-1 migration.  A database newer than this
+    binary is rejected without writes; downgrade requires restoring a backup.
+    """
     try:
-        columns = {r[1] for r in con.execute('PRAGMA table_info(transfers)')}
-        for name, kind in [('save_task_id','TEXT'),('save_target','TEXT'),('save_started_at','INTEGER')]:
-            if name not in columns:
-                con.execute(f'ALTER TABLE transfers ADD COLUMN {name} {kind}')
+        con = _raw_conn()
+    except (OSError, sqlite3.Error) as exc:
+        raise DatabaseUpgradeError("cannot open state database") from exc
+    if _local.initialized:
+        return con
+    if con.in_transaction:
+        raise DatabaseUpgradeError("cannot initialize state database during an active transaction")
+    try:
+        # Serialize startup too, so an older process cannot observe a peer's migration midway.
+        con.execute("BEGIN IMMEDIATE")
+        current = _read_version(con)
+        if current < SCHEMA_VERSION:
+            _validate_database_integrity(con)
+        for target_version in range(current + 1, SCHEMA_VERSION + 1):
+            migration = _MIGRATIONS.get(target_version)
+            if migration is None:
+                raise DatabaseUpgradeError(f"no migration registered for schema version {target_version}")
+            migration(con)
+        _validate_schema(con)
+        if current < SCHEMA_VERSION:
+            con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         con.commit()
-    except BaseException:
-        con.rollback()
+        _ensure_wal(con)
+        _local.initialized = True
+    except BaseException as exc:
+        # Closing also releases a failed transaction, including on a failed commit.
+        close()
+        if isinstance(exc, sqlite3.Error):
+            raise DatabaseUpgradeError(f"cannot validate or migrate state database: {exc}") from exc
         raise
+    return con
+
+
+def close():
+    """Close this thread's state connection, primarily for tests and maintenance."""
+    con = getattr(_local, "conn", None)
+    if con is not None:
+        con.close()
+        del _local.conn
+    _local.initialized = False
 
 
 def save_source_audit(cat, title, season, episode, has_quark_source, is_4k,
@@ -568,6 +744,3 @@ def is_pinned(title, cat=""):
 def get_all_pinned_titles():
     """Protection is safety-critical: database errors must propagate."""
     return {r['title'].strip() for r in _conn().execute('SELECT title FROM user_pinned') if r['title']}
-
-
-init_db()

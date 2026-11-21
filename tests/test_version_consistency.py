@@ -96,6 +96,14 @@ class VersionConsistency(unittest.TestCase):
         self.assertIn('version = {attr = "quark_vod.__version__"}', pyproject)
         self.assertNotIn('version = "3.0.0"', pyproject)
 
+    def test_container_and_compose_version_defaults_match_package(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        compose = (ROOT / "docker-compose.yml").read_text()
+        self.assertIn(f"ARG VOD_VERSION={__version__}", dockerfile)
+        self.assertIn(f"QUARK_VOD_IMAGE_VERSION:-{__version__}", compose)
+        self.assertIn('VOD_VERSION: "${QUARK_VOD_IMAGE_VERSION:-' + __version__ + '}"', compose)
+        self.assertIn("org.opencontainers.image.version=", dockerfile)
+
 
 if __name__ == "__main__":
     unittest.main()

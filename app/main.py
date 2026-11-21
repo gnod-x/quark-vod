@@ -19,9 +19,8 @@ from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
-from quark_vod import __version__
 
-from quark_vod import cleaner, cleanup, config, db, search as search_mod, selfheal, server as legacy_srv, strm_manager
+from quark_vod import __version__, cleaner, cleanup, config, db, search as search_mod, selfheal, server as legacy_srv, strm_manager
 from quark_vod.transfer import QuarkTransfer
 from quark_vod import coordination
 from quark_vod import media_cache
@@ -85,6 +84,9 @@ class DummyHandler:
 async def lifespan(app: FastAPI):
     """服务启动期自愈与后台守护线程初始化（对齐原 server.main()）。"""
     config.ensure_dirs()
+    # Initialize and, when needed, upgrade the state schema before any startup
+    # cleanup or background task can observe partially migrated data.
+    db.init_db()
     legacy_srv._cleanup_stale_transfers()
 
     def _bg_scan():
@@ -116,6 +118,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         stop_event.set()
+        db.close()
 
 
 app = FastAPI(
