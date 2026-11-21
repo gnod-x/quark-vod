@@ -162,6 +162,32 @@ class AuditRecoveryAndRegistrationTests(unittest.TestCase):
             with self.subTest(variant=variant):
                 self.assertIsNone(transfer.select_share_video([item], "午夜规则 (2026)", 1, 1))
 
+    def test_explicit_cut_labels_are_not_stripped_as_release_groups(self):
+        transfer = QuarkTransfer(Mock())
+        variants = (
+            "-DirectorsCut", "-DirectorCut", "-Director's.Cut", "-Director’s_Cut",
+            ".DIRECTOR.S.CUT-NTb", ".[Director's Cut]-FLUX",
+            "-Theatrical", ".[Theatrical Cut]-NTb", "-TheatricalEdition",
+            "-Extended", ".[Extended Edition]-FLUX", "-Unrated", "-Uncut",
+            "-Remastered", "-Remaster", "-Version2", ".[Version 2]-NTb",
+        )
+        for title in ("The.Rules", "午夜规则"):
+            for variant in variants:
+                name = f"{title}.S01E01.1080p.WEB-DL.AAC.H.264{variant}.mp4"
+                item = {"file_name": name, "relative_path": "午夜规则 (2026) 泰剧 1080p/" + name,
+                        "size": 1024**3}
+                with self.subTest(title=title, variant=variant):
+                    self.assertIsNone(transfer.select_share_video([item], "午夜规则 (2026)", 1, 1))
+
+    def test_release_group_boundaries_do_not_reject_unrelated_group_names(self):
+        transfer = QuarkTransfer(Mock())
+        for group in ("NTb", "FLUX", "SPARKS", "DirectorCutWEB", "TheatricalWEB", "VERSION2WEB"):
+            name = f"The.Rules.S01E01.1080p.WEB-DL.AAC.H.264-{group}.mp4"
+            item = {"file_name": name, "relative_path": "午夜规则 (2026) 泰剧 1080p/" + name,
+                    "size": 1024**3}
+            with self.subTest(group=group):
+                self.assertIsNotNone(transfer.select_share_video([item], "午夜规则 (2026)", 1, 1))
+
     def test_version_one_state_upgrades_to_persist_file_identity(self):
         with tempfile.TemporaryDirectory(prefix="vod-v1-upgrade-") as temporary:
             state = str(Path(temporary) / "state.db")

@@ -34,6 +34,14 @@ conflicting title, year, season, or episode. Quark share parsing, account
 authorization, official save requests, and task polling stay in
 `QuarkTransfer`.
 
+Episode basenames in an unknown Latin translation may inherit an exact work
+label from their enumerated parent directory only after season, episode, year,
+and technical suffix checks. Generic release-group suffixes are allowed, while
+explicit cut/edition labels such as Director's Cut, Theatrical, Extended, Unrated,
+Remastered, and numbered Version labels remain identity conflicts. The checks
+apply before release-group removal and also preserve known title/version
+conflicts; a release-group prefix alone is not an edition label.
+
 The service records a save intent before submitting an uncertain remote write.
 If a request times out or the process restarts, the next attempt checks the
 recorded target and task ID before it can submit another save. Before renaming a

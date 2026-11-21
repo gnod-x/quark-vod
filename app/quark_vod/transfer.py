@@ -891,6 +891,18 @@ class QuarkTransfer:
                         file_title = file_title[:episode_match.start()]
                 if re.match(r'\s*[-~～+]\s*\d{1,4}\b', release_suffix):
                     continue
+                # An explicit edition is identity evidence, not a release group.
+                # Check before generic group removal, including spaced/bracketed
+                # labels and possessives such as "Director's Cut".
+                if re.search(
+                    r"(?i)(?<![A-Za-z0-9])(?:Director(?:[ ._-]*['’]?s)?[ ._-]*Cut"
+                    r"|Theatrical(?:[ ._-]*(?:Cut|Edition|Version))?"
+                    r"|Extended(?:[ ._-]*(?:Cut|Edition|Version))?"
+                    r"|Uncut|Unrated|Remaster(?:ed)?"
+                    r"|Version[ ._-]*\d+)(?![A-Za-z0-9])",
+                    release_suffix,
+                ):
+                    continue
                 suffix_identity = re.sub(r'国语中字|简体中字|繁体中字|中文字幕|国语|中字', '', release_suffix)
                 if (re.search(r'(?i)(?<![A-Za-z])(?:Anime|Movie|OVA|OAD|Special|Live[ ._-]*Action|Part\s*\d+)(?![A-Za-z])', suffix_identity)
                         or re.search(r'[一-龥\uac00-\ud7af\u3040-\u30ff]', suffix_identity)):
