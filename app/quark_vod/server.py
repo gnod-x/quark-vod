@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import cleaner, cleanup, config, coordination, db, strm_manager
+from . import cleaner, cleanup, config, coordination, db, download_http, strm_manager
 from .auditor import is_4k_candidate
 from .identity import Work, same_title, split_title
 from .openlist_client import OpenListClient
@@ -87,7 +87,7 @@ def _wait_direct_url_ready(direct_url, remote_path=None, max_wait=12):
     while time.monotonic() < deadline:
         try:
             req = urllib.request.Request(direct_url, headers={'Range': 'bytes=0-31', 'User-Agent': 'curl/8.5.0'})
-            with urllib.request.urlopen(req, timeout=min(4, max(.1, deadline-time.monotonic()))) as response:
+            with download_http.urlopen(req, timeout=min(4, max(.1, deadline-time.monotonic()))) as response:
                 head = response.read(32)
                 content_type = response.headers.get('Content-Type', '').lower()
                 if response.status in (200, 206) and head and not any(t in content_type for t in ('text/html', 'application/json')):
@@ -277,6 +277,14 @@ def _submit(work):
     return future, True
 
 
+def invalidate_transfer_cache(transfer_id):
+    """Drop ready aliases for a reset transfer without touching other work."""
+    with _ready_lock:
+        for key, (_, result) in list(_ready_results.items()):
+            if result.transfer_id == transfer_id:
+                _ready_results.pop(key, None)
+
+
 def resolve_playback(work):
     # Recover the unique dated library identity for legacy undated URLs before
     # reserving a task; otherwise aliases could save the same film concurrently.
@@ -309,7 +317,7 @@ def trigger_preheat_task(cat, title, season=0, episode=0):
     work = Work(cat, db.library_title(cat,title,season,episode), season, episode)
     _, started = _submit(work)  # reservation precedes background execution
     if started:
-        db.pin_item(cat, title, reason='preheated')
+        db.pin_item(work.cat, work.title, reason='preheated')
     return True, 'started' if started else 'in_progress'
 
 

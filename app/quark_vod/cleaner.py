@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
-from . import config
+from . import config, download_http
 
 # 伪装特征常量
 PNG_MAGIC_HEX = "89504e470d0a1a0a"
@@ -107,7 +107,7 @@ def open_clean_stream(url, skip, range_header="", request_headers=None, *, opene
         translated = f"bytes={start + skip}-{end + skip if end is not None else ''}"
     headers["Range"] = translated
     try:
-        response = (opener or urllib.request.urlopen)(urllib.request.Request(url, headers=headers), timeout=20)
+        response = (opener or download_http.urlopen)(urllib.request.Request(url, headers=headers), timeout=20)
     except urllib.error.HTTPError as exc:
         try:
             if exc.code == 416:
@@ -182,7 +182,7 @@ def detect_stream_obfuscation(direct_url, timeout=2.5):
         req = urllib.request.Request(direct_url)
         req.add_header("Range", "bytes=0-63")
         req.add_header("User-Agent", "curl/8.14.1")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with download_http.urlopen(req, timeout=timeout) as resp:
             data = resp.read(64)
             if not data or len(data) < 16:
                 return False, 0, ""

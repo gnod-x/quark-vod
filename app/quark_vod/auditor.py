@@ -278,16 +278,18 @@ class VodAuditor:
             if not os.path.isdir(cat_dir) or cat.startswith("."):
                 continue
 
-            is_tv = cat in {"国产剧集", "欧美剧集", "热门韩剧", "国产动漫", "日本动漫", "日本剧集", "泰国剧集"}
             for item_dir in sorted(os.listdir(cat_dir)):
                 ipath = os.path.join(cat_dir, item_dir)
                 if not os.path.isdir(ipath) or item_dir.startswith("."):
                     continue
 
-                if is_tv:
-                    for sub in sorted(os.listdir(ipath)):
-                        if not sub.startswith("Season "):
-                            continue
+                # The library layout, not a fixed category list, distinguishes
+                # episodic works. This also covers new and user-defined categories.
+                season_dirs = [sub for sub in sorted(os.listdir(ipath))
+                               if sub.startswith("Season ")
+                               and os.path.isdir(os.path.join(ipath, sub))]
+                if season_dirs:
+                    for sub in season_dirs:
                         s_dir = os.path.join(ipath, sub)
                         try:
                             s_num = int(sub.split()[1])

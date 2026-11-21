@@ -24,7 +24,7 @@ import time
 
 from . import config
 from . import db
-from . import cleaner
+from . import cleaner, download_http
 
 PENDING_PREFIX = f"{config.PENDING_BASE_URL}/pending"
 
@@ -140,54 +140,80 @@ def library_search_identity(cat, title, season):
 
 
 def scan_and_register():
-    """扫描 cinema2，把 strm 登记到 strm_map（供回写定位）。
+    """Commit a complete library mapping scan in one transaction.
 
-    路径规则（与 tmdb_populate.py 一致）：
-      电影: <cat>/<title> [(year)]/<title> [(year)].strm
-      剧集: <cat>/<title>/Season NN/<title> - SNNENN.strm
-    剧集的 title 取影片目录名（去掉年份后缀）。
+    Missing files are pruned only after successful enumeration of the same root.
+    A missing/unreadable library or partial scan cannot erase existing mappings.
     """
     import re
-    registered = 0
-    if not os.path.isdir(config.CINEMA2_DIR):
+    from . import coordination
+
+    root = os.path.abspath(config.CINEMA2_DIR)
+    if not os.path.isdir(root):
         return 0
-    for cat in sorted(os.listdir(config.CINEMA2_DIR)):
-        catdir = os.path.join(config.CINEMA2_DIR, cat)
-        if not os.path.isdir(catdir):
-            continue
-        for title_dir in sorted(os.listdir(catdir)):
-            tdir = os.path.join(catdir, title_dir)
-            if not os.path.isdir(tdir):
+    with coordination.file_lock("library", exclusive=True, timeout=5):
+        root_before = os.stat(root)
+        rows = []
+        for cat in sorted(os.listdir(root)):
+            catdir = os.path.join(root, cat)
+            if not os.path.isdir(catdir):
                 continue
-            # 去掉 " (2026)" 年份后缀，得到纯 title
-            title = title_dir.strip()
-
-            # 电影：目录下直接有 .strm
-            for fn in sorted(os.listdir(tdir)):
-                if fn.endswith(".strm") and " - S" not in fn:
-                    db.save_strm_map(cat, title, 0, 0, os.path.join(tdir, fn))
-                    registered += 1
-
-            # 剧集：Season NN 子目录
-            for sub in sorted(os.listdir(tdir)):
-                if not sub.startswith("Season "):
+            for title_dir in sorted(os.listdir(catdir)):
+                tdir = os.path.join(catdir, title_dir)
+                if not os.path.isdir(tdir):
                     continue
-                sdir = os.path.join(tdir, sub)
-                if not os.path.isdir(sdir):
+                title = title_dir.strip()
+                for fn in sorted(os.listdir(tdir)):
+                    path = os.path.join(tdir, fn)
+                    if fn.endswith(".strm") and " - S" not in fn and os.path.isfile(path):
+                        rows.append((cat, title, 0, 0, path))
+                for sub in sorted(os.listdir(tdir)):
+                    if not sub.startswith("Season "):
+                        continue
+                    sdir = os.path.join(tdir, sub)
+                    if not os.path.isdir(sdir):
+                        continue
+                    try:
+                        season = int(sub.split()[1])
+                    except (IndexError, ValueError):
+                        continue
+                    for fn in sorted(os.listdir(sdir)):
+                        match = re.search(r"- S(\d{1,3})E(\d{1,4})\.strm$", fn)
+                        if not match or int(match.group(1)) != season:
+                            continue
+                        path = os.path.join(sdir, fn)
+                        if os.path.isfile(path):
+                            rows.append((cat, title, season, int(match.group(2)), path))
+        root_after = os.stat(root)
+        if (root_before.st_dev, root_before.st_ino) != (root_after.st_dev, root_after.st_ino):
+            raise RuntimeError("library root changed during registration scan")
+
+        con = db._conn()
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            con.executemany(
+                "INSERT OR REPLACE INTO strm_map (cat,title,season,episode,strm_path) VALUES (?,?,?,?,?)",
+                rows,
+            )
+            stale = []
+            prefix = root.rstrip(os.sep) + os.sep
+            for row in con.execute("SELECT cat,title,season,episode,strm_path FROM strm_map"):
+                path = os.path.abspath(row["strm_path"])
+                if not path.startswith(prefix):
                     continue
                 try:
-                    season = int(sub.split()[1])
-                except (IndexError, ValueError):
-                    continue
-                for fn in sorted(os.listdir(sdir)):
-                    m = re.search(r"- S(\d{1,3})E(\d{1,4})\.strm$", fn)
-                    if not m:
-                        continue
-                    episode = int(m.group(2))
-                    db.save_strm_map(cat, title, season, episode,
-                                     os.path.join(sdir, fn))
-                    registered += 1
-    return registered
+                    os.stat(path)
+                except FileNotFoundError:
+                    stale.append((row["cat"], row["title"], row["season"], row["episode"], row["strm_path"]))
+            con.executemany(
+                "DELETE FROM strm_map WHERE cat=? AND title=? AND season=? AND episode=? AND strm_path=?",
+                stale,
+            )
+            con.commit()
+        except BaseException:
+            con.rollback()
+            raise
+        return len(rows)
 
 
 def read_strm(path):
@@ -292,6 +318,11 @@ def _atomic_write(path, content):
             os.unlink(temporary)
 
 
+def _is_configured_openlist_download(url):
+    """Share the configured-origin/path rules with the media transport."""
+    return download_http.allowed_openlist_url(url)
+
+
 def write_live(path, direct_url, force=False):
     """把 strm 写成直链（原子写入）。若内容相同则跳过。
 
@@ -312,7 +343,7 @@ def write_live(path, direct_url, force=False):
             # 否则 clean→direct 的画质升级会被误判为降级而拒绝
             # （唐宫奇案：1080P clean 源挡住了 4K 臻彩 direct 源）。
             # 只有 CMS 第三方切片才应被网盘源覆盖，反之不允许。
-            if "/clean?" in u or "/play?" in u or "5244/d/" in u:
+            if "/clean?" in u or "/play?" in u or _is_configured_openlist_download(u):
                 return 2
             if ".m3u8" in u:
                 return 1

@@ -26,13 +26,34 @@ class OpenListError(Exception):
     pass
 
 
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
+class _NoAPIRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, newurl):
+        # Login bodies and Authorization tokens belong only to the configured API.
+        # Even same-origin redirects can change a write request into a GET.
+        return None
+
+
+def _api_urlopen(request, timeout=60):
+    return urllib.request.build_opener(_NoAPIRedirect()).open(request, timeout=timeout)
+
+
+def _read_json(response):
+    raw = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise OpenListError("OpenList response exceeds size limit")
+    return json.loads(raw.decode("utf-8"))
+
+
 class OpenListClient:
     def __init__(self, base=None, user=None, password=None):
         self.base = base or config.OPENLIST_API
         self.user = user or config.OPENLIST_ADMIN_USER
         self.password = password or config.OPENLIST_ADMIN_PASS
         self.token = ""
-        self.token_expires = 0
+        self._login_lock = threading.Lock()
         self._write_probe_lock = threading.Lock()
         self._write_probe_cache = None
         self._login()
@@ -42,44 +63,55 @@ class OpenListClient:
         url = self.base + path
         body = json.dumps(data).encode() if data is not None else None
         headers = {"Content-Type": "application/json"}
-        if self.token:
-            headers["Authorization"] = self.token
+        requested_token = self.token
+        if requested_token:
+            headers["Authorization"] = requested_token
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                result = json.loads(r.read().decode("utf-8"))
+            with _api_urlopen(req, timeout=timeout) as r:
+                result = _read_json(r)
             # OpenList also reports expired tokens as HTTP 200 / JSON code 401.
             if isinstance(result, dict) and result.get("code") == 401 and retry:
-                self._login()
+                self._refresh_login(requested_token)
                 return self._request(path, data, method, timeout, retry=False)
             return result
         except urllib.error.HTTPError as e:
-            raw = e.read().decode("utf-8", "ignore")
-            # token 失效则重登录重试一次
-            if e.code == 401 and retry:
-                self._login()
+            code = e.code
+            e.close()
+            if code == 401 and retry:
+                self._refresh_login(requested_token)
                 return self._request(path, data, method, timeout, retry=False)
-            raise OpenListError(f"HTTP {e.code}: {raw[:200]}")
+            raise OpenListError(f"HTTP {code}") from None
+        except OpenListError:
+            raise
         except Exception as e:
-            raise OpenListError(f"{type(e).__name__}: {e}")
+            # Responses and exception text can contain credentials or signed URLs.
+            raise OpenListError(f"OpenList request failed: {type(e).__name__}") from None
+
+    def _refresh_login(self, rejected_token):
+        with self._login_lock:
+            if self.token == rejected_token:
+                self._login()
 
     def _ok(self, resp, action):
         """统一校验：HTTP 200 不代表成功，必须看 code。"""
         if not isinstance(resp, dict):
-            raise OpenListError(f"{action}: 响应异常 {resp}")
+            raise OpenListError(f"{action}: invalid response")
         code = resp.get("code")
+        if type(code) is not int:
+            raise OpenListError(f"{action}: invalid response code")
         if code == 200:
             return resp.get("data")
-        raise OpenListError(f"{action}: code={code} msg={resp.get('message')}")
+        raise OpenListError(f"{action}: code={code}")
 
     def _login(self):
         resp = self._request("/api/auth/login",
                              {"username": self.user, "password": self.password},
                              retry=False)
         data = self._ok(resp, "登录")
+        if not isinstance(data, dict) or not isinstance(data.get("token"), str) or not data["token"]:
+            raise OpenListError("OpenList login returned no token")
         self.token = data["token"]
-        # config.token_expires_in 单位小时，留 1 小时余量
-        self.token_expires = time.time() + 47 * 3600
 
     # ── 读操作 ────────────────────────────────────────
     def list(self, path, password="", refresh=False):
@@ -194,12 +226,16 @@ class OpenListClient:
         if isinstance(data, (bytes, bytearray)):
             req.add_header("X-File-Size", str(len(data)))
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                resp = json.loads(r.read().decode("utf-8"))
+            with _api_urlopen(req, timeout=timeout) as r:
+                resp = _read_json(r)
         except urllib.error.HTTPError as e:
-            raise OpenListError(f"put HTTP {e.code}: {e.read().decode('utf-8','ignore')[:200]}")
+            code = e.code
+            e.close()
+            raise OpenListError(f"put HTTP {code}") from None
+        except OpenListError:
+            raise
         except Exception as e:
-            raise OpenListError(f"put {type(e).__name__}: {e}")
+            raise OpenListError(f"put failed: {type(e).__name__}") from None
         self._ok(resp, f"put {path}")
         return True
 

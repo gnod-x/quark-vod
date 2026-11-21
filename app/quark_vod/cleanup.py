@@ -8,10 +8,11 @@
   1. 账号容量自适应配额：每日查询账号真实容量，整盘使用率超 85% 时按 LRU 淘汰至 70%。
      点播低于 200GB 时永不淘汰（避免因 /视频、/游戏 等其它目录占满而误删点播资源）。
   2. LRU 智能淘汰排序：
-     - 白名单保护：正在追的剧集（未看完）、已收藏（Favorites）及港台经典专区绝不删除。
-     - 淘汰优先级：从未播放（0次播放）> 最早播放（played_at 最旧）。
-  3. 回收站安全删除：通过 OpenList 将云端视频移入网盘回收站，防误删。
-  4. 虚拟解耦与 strm 还原：删除云端视频后，原子还原对应 .strm 为 pending 占位符，
+     - 永久保护：Jellyfin 收藏、未看完进度、显式用户置顶；近 6 小时访问另有临时保护。
+     - 其他候选按最后访问时间由旧到新淘汰；从未访问优先，访问时间相同则大目录优先。
+     - 已看历史和自动预热/入库/播放标记不构成永久保护。
+  3. 后端确认删除：仅处理身份与引用可确认的云端对象，不假设回收站语义。
+  4. 虚拟解耦与 strm 还原：先原子还原对应 .strm 为 pending，再删除云端视频，
      保留本地高清海报与 NFO 元数据，用户随时可二次点击秒级转存。
   5. 到期常规清理：原有 7 天未重播到期清理任务（KEEP_DAYS 机制）。
 """
@@ -76,7 +77,7 @@ def resolve_quotas(max_bytes=None, target_bytes=None):
 
 
 def get_protected_titles():
-    """获取所有受保护（不可被网盘配额清理删除）的影片标题集合。包含收藏、在看以及用户置顶/预热项目。"""
+    """仅返回收藏和未看完的在看片目；已看历史与临时预热由 LRU 管理。"""
     from contextlib import closing
     protected = set()
     if not os.path.isfile(JF_DB):
@@ -89,7 +90,8 @@ def get_protected_titles():
             cur.execute("""
                 SELECT b.Type, b.Name, b.SeriesName FROM BaseItems b
                 JOIN UserData u ON b.Id = u.ItemId
-                WHERE u.IsFavorite = 1 OR u.Played = 1 OR u.PlayCount > 0 OR u.PlaybackPositionTicks > 0
+                WHERE u.IsFavorite = 1
+                   OR (u.PlaybackPositionTicks > 0 AND COALESCE(u.Played, 0) = 0)
             """)
             for row in cur.fetchall():
                 item_type, name, series_name = row
@@ -105,7 +107,8 @@ def get_protected_titles():
     except Exception as e:
         raise RuntimeError("无法读取 Jellyfin 保护状态，停止清理") from e
 
-    # 2. 查询用户手动置顶/预热保护的项目
+    # 2. Only explicit pins/favorites are permanent. Legacy automatic preheat,
+    # portal add and playback markers must not turn retention into an infinite pin.
     try:
         pinned = db.get_all_pinned_titles()
         protected.update(pinned)
@@ -120,7 +123,10 @@ def protected_title(title, protected):
     return title in protected or split_title(title)[0] in protected
 
 
-def get_vod_disk_usage(ol, max_depth=4, max_entries=400):
+MAX_VOD_DISK_ENTRIES = 10000
+
+
+def get_vod_disk_usage(ol, max_depth=4, max_entries=MAX_VOD_DISK_ENTRIES):
     """统计 /夸克/点播 目录下所有影视目录及文件的实际字节占用。
 
     2026-10-20 修复（网盘爆满 500GB 无感知）：原实现只展开【一层】子目录。
@@ -130,13 +136,27 @@ def get_vod_disk_usage(ol, max_depth=4, max_entries=400):
     最终网盘仅剩 1.83 GB，任何 4K 转存必失败（save_as_top_fids: []）。
 
     与铁律十六（转存验票必须递归展开子目录）同一模式：那次修的是验票层，
-    这次修的是配额层。限深 4 层、限 400 项，兼顾准确度与夸克 API 风控。
+    这次修的是配额层。限深 4 层、限 10,000 项，兼顾准确度与夸克 API 风控。
     """
     vod_root = config.QUARK_VOD_ROOT  # /夸克/点播
     items = []
     total_bytes = 0
     visited_entries = 0
     truncated = False
+
+    def validated_entries(path):
+        entries = ol.list(path)
+        if not isinstance(entries, list):
+            raise OpenListError("点播目录响应结构无效，停止配额统计")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise OpenListError("点播目录条目无效，停止配额统计")
+            name, is_dir, size = entry.get("name"), entry.get("is_dir"), entry.get("size")
+            if (not isinstance(name, str) or not name or name in (".", "..")
+                    or "/" in name or "\\" in name or chr(0) in name
+                    or type(is_dir) is not bool or type(size) is not int or size < 0):
+                raise OpenListError("点播目录字段无效，停止配额统计")
+        return entries
 
     def _walk(path, depth):
         """递归统计目录字节数，返回 (总字节, 文件数)。超限深/超条目数即截断。"""
@@ -147,7 +167,7 @@ def get_vod_disk_usage(ol, max_depth=4, max_entries=400):
         total = 0
         nfiles = 0
         try:
-            entries = ol.list(path)
+            entries = validated_entries(path)
         except Exception as exc:
             raise OpenListError("点播目录未完整读取，停止配额统计") from exc
         for it in entries:
@@ -164,7 +184,7 @@ def get_vod_disk_usage(ol, max_depth=4, max_entries=400):
                 nfiles += 1
         return total, nfiles
 
-    for it in ol.list(vod_root):
+    for it in validated_entries(vod_root):
         visited_entries += 1
         if visited_entries > max_entries:
             truncated = True
@@ -199,6 +219,30 @@ def get_vod_disk_usage(ol, max_depth=4, max_entries=400):
             "拒绝用不完整数据执行配额淘汰"
         )
     return total_bytes, items
+
+
+def _unresolved_cloud_references(con):
+    """All non-done and durable-intent paths constrain every cloud deletion."""
+    rows = con.execute(
+        "SELECT * FROM transfers WHERE status<>'done' OR save_target IS NOT NULL "
+        "OR save_task_id IS NOT NULL OR save_started_at IS NOT NULL "
+        "OR save_file_fid IS NOT NULL").fetchall()
+    for row in rows:
+        if ((row["save_target"] or row["save_task_id"] or row["save_started_at"]
+             or row["save_file_fid"] or row["status"] == "saving")
+                and not (row["save_target"] or row["remote_path"])):
+            raise OpenListError("未决保存意图缺少可核对路径，停止云端删除")
+    return rows
+
+
+def _has_unresolved_overlap(remote, references):
+    root = config.write_path(remote or "").rstrip("/")
+    def overlaps(value):
+        value = config.write_path(value or "").rstrip("/")
+        return bool(value and root) and (
+            value == root or value.startswith(root + "/") or root.startswith(value + "/"))
+    return any(overlaps(row["remote_path"]) or overlaps(row["save_target"])
+               for row in references)
 
 
 @maintenance
@@ -253,7 +297,7 @@ def enforce_vod_quota(ol=None, max_bytes=None, target_bytes=None,
     #   ③ 实际淘汰量 = min(①, ②)，且不超过全部可淘汰候选之和。
     if acct_total:
         need_total = max(0, acct_used - target_bytes)
-        # 点播保留线：只淘汰多余的部分，至少保留 30% 的现有资源兜底
+        # 点播保留线：只淘汰多余的部分，至少保留 70% 的现有资源兜底
         keep_floor = int(total_bytes * VOD_KEEP_FLOOR_PCT)
         max_evict = max(0, total_bytes - keep_floor)
         evict_goal = min(need_total, max_evict)
@@ -271,6 +315,9 @@ def enforce_vod_quota(ol=None, max_bytes=None, target_bytes=None,
     cur = con.cursor()
     cur.execute("SELECT * FROM transfers WHERE status='done'")
     done_transfers = cur.fetchall()
+    # A complete directory deletion must account for every nonterminal intent,
+    # not only the done rows used to form eviction candidates.
+    unresolved = _unresolved_cloud_references(con)
 
     # 2026-10-20 修复（淘汰后残留 151 条死链）：原实现按目录名匹配到
     # 【第一条】done 记录就 break，淘汰时只还原这一条的 strm、只把这一条
@@ -294,6 +341,8 @@ def enforce_vod_quota(ol=None, max_bytes=None, target_bytes=None,
 
         if not matched_group:
             continue
+        if _has_unresolved_overlap(item["remote_path"], unresolved):
+            continue
         matched_tr = matched_group[0]
         cat = matched_tr["cat"] if matched_tr else ""
         title = matched_tr["title"] if matched_tr else item["name"]
@@ -312,13 +361,17 @@ def enforce_vod_quota(ol=None, max_bytes=None, target_bytes=None,
                 print(f"  [白名单保护] {title}（用户已收藏，豁免淘汰）", flush=True)
             continue
 
-        # 查询该片在 plays 表中的最后播放时间和总播放次数
-        cur.execute(
-            "SELECT COUNT(*) as cnt, MAX(played_at) as last_play FROM plays WHERE title=?",
-            (title,))
-        p_row = cur.fetchone()
-        play_cnt = p_row["cnt"] if p_row else 0
-        last_played = p_row["last_play"] if p_row and p_row["last_play"] else 0
+        # playback_access is the active signal written by real playback routes.
+        # The legacy plays table may be empty and is used only as a fallback timestamp.
+        transfer_ids = [tr["id"] for tr in matched_group]
+        placeholders = ",".join("?" for _ in transfer_ids)
+        access = con.execute(
+            f"SELECT MAX(accessed_at) AS at FROM playback_access WHERE transfer_id IN ({placeholders})",
+            transfer_ids).fetchone()
+        legacy_play = con.execute(
+            f"SELECT MAX(played_at) AS at FROM plays WHERE transfer_id IN ({placeholders})",
+            transfer_ids).fetchone()
+        last_accessed = max(access["at"] or 0, legacy_play["at"] or 0)
 
         candidates.append({
             "item": item,
@@ -326,13 +379,12 @@ def enforce_vod_quota(ol=None, max_bytes=None, target_bytes=None,
             "matched_group": matched_group,
             "title": title,
             "cat": cat,
-            "play_cnt": play_cnt,
-            "last_played": last_played,
+            "last_accessed": last_accessed,
             "size": item["size"]
         })
 
-    # 排序规则：从未播放 (play_cnt == 0) 排在最前，其次按最后播放时间由旧到新 (last_played ASC)
-    candidates.sort(key=lambda x: (x["play_cnt"] > 0, x["last_played"], -x["size"]))
+    # Least recently accessed entries go first; completed history is not a hard pin.
+    candidates.sort(key=lambda x: (x["last_accessed"], -x["size"]))
 
     evicted_cnt = 0
     freed_bytes = 0
@@ -380,7 +432,7 @@ def enforce_vod_quota(ol=None, max_bytes=None, target_bytes=None,
         try:
             if not ol.remove(remote):
                 raise OpenListError("存储后端未确认删除")
-            print(f"  [已移入回收站] {remote} ({title}, 释放 {sz / gb:.2f} GB)", flush=True)
+            print(f"  [后端已确认删除] {remote} ({title}, 释放 {sz / gb:.2f} GB)", flush=True)
         except OpenListError as e:
             removed = False
             print(f"  [删除异常] {remote}: {e}（仍将还原 strm 状态）", flush=True)
@@ -416,6 +468,7 @@ def run_cleanup(dry_run=False, verbose=True):
     ol = OpenListClient()
     protected_titles = get_protected_titles()
     rows = db.due_cleanups(limit=100)
+    unresolved = _unresolved_cloud_references(db._conn())
     ok = fail = skip = 0
 
     for row in rows:
@@ -440,6 +493,9 @@ def run_cleanup(dry_run=False, verbose=True):
             if not dry_run:
                 db._conn().execute("UPDATE cleanup_queue SET cleaned=1 WHERE id=?", (qid,))
                 db._conn().commit()
+            skip += 1
+            continue
+        if _has_unresolved_overlap(remote, unresolved):
             skip += 1
             continue
         # The queue stores the saved directory, while transfers store leaf
@@ -467,17 +523,9 @@ def run_cleanup(dry_run=False, verbose=True):
                 print(f"  [收藏保护] {tr['title']} 用户已收藏，跳过到期清理", flush=True)
             skip += 1
             continue
-        # 有播放记录且未看完的，延后清理（保护正在追的剧）
-        plays = [db.last_play(item["cat"], item["title"], item["season"], item["episode"])
-                 for item in affected]
-        if any(last and not last["finished"] for last in plays):
-            if not dry_run:
-                db.defer_cleanup(qid)
-            if verbose:
-                print(f"  [延后] {tr['title']} S{tr['season']}E{tr['episode']} 仍在观看", flush=True)
-            skip += 1
-            continue
-
+        # Access-session records do not prove unfinished viewing. Jellyfin
+        # progress is checked through protected_titles; recent access has its
+        # own grace period above.
         if dry_run:
             print(f"  [预演] 将删除 {remote} ({tr['title']})", flush=True)
             ok += 1
@@ -575,6 +623,7 @@ def clean_mismatched_short_dramas(dry_run=False, verbose=True):
 
     cur.execute("SELECT id, cat, title, season, episode, remote_path FROM transfers WHERE season=0 AND episode=0 AND status='done' AND remote_path IS NOT NULL")
     done_movies = cur.fetchall()
+    unresolved = _unresolved_cloud_references(con)
     protected_titles = get_protected_titles()
 
     cleaned_count = 0
@@ -603,6 +652,8 @@ def clean_mismatched_short_dramas(dry_run=False, verbose=True):
             write_dir = config.write_path(target_dir)
             if (not write_dir.startswith(config.QUARK_VOD_ROOT + "/")
                     or ".." in write_dir.split("/")):
+                continue
+            if _has_unresolved_overlap(write_dir, unresolved):
                 continue
             # A directory also used by a valid series/movie is not disposable
             # merely because one movie identity was matched incorrectly.
@@ -709,17 +760,26 @@ def _plan_orphan_metadata(lib_dir):
 
 
 def _metadata_references(connection, lib_dir):
+    from urllib.parse import urlsplit
     referenced = set()
-    prefix = '/config/metadata/library/'
-    for (path,) in connection.execute(
-            "SELECT Path FROM BaseItemImageInfos WHERE Path LIKE '%/metadata/library/%'"):
+    prefix = config.JELLYFIN_METADATA_LIBRARY_PREFIX.rstrip("/") + "/"
+    if prefix == "/" or not prefix.startswith("/") or ".." in prefix.split("/"):
+        raise MetadataCleanupError("reference_mapping_unconfigured")
+    for (path,) in connection.execute("SELECT Path FROM BaseItemImageInfos"):
         if not isinstance(path, str) or not path or chr(0) in path:
-            raise MetadataCleanupError('invalid_reference_path')
+            raise MetadataCleanupError("invalid_reference_path")
+        # Remote image URLs cannot reference files in this local directory.
+        # Other local path categories have no implicit mapping: stop rather
+        # than silently omit a possibly relevant reference.
+        if urlsplit(path).scheme in ("http", "https"):
+            continue
         if path.startswith(prefix):
             path = os.path.join(lib_dir, path[len(prefix):])
+        elif not path.startswith(lib_dir + os.sep):
+            raise MetadataCleanupError("unmapped_reference_path")
         path = os.path.normpath(path)
         if not path.startswith(lib_dir + os.sep):
-            raise MetadataCleanupError('invalid_reference_path')
+            raise MetadataCleanupError("invalid_reference_path")
         referenced.add(path)
     return referenced
 
@@ -727,7 +787,11 @@ def _metadata_references(connection, lib_dir):
 @maintenance
 def prune_jellyfin2_orphan_metadata(dry_run=False, verbose=True, strict=False):
     """Delete only unreferenced metadata after a complete, fail-closed preflight."""
-    lib_dir = os.path.abspath(os.path.join(config.BASE_DIR, 'jellyfin2/config/metadata/library'))
+    if not config.JELLYFIN_METADATA_LIBRARY_DIR or not config.JELLYFIN_METADATA_LIBRARY_PREFIX:
+        if strict:
+            raise MetadataCleanupError("metadata_cleanup_unconfigured")
+        return 0, 0
+    lib_dir = os.path.abspath(config.JELLYFIN_METADATA_LIBRARY_DIR)
     try:
         candidates = _plan_orphan_metadata(lib_dir)
     except MetadataCleanupError as exc:
@@ -800,7 +864,8 @@ def main():
     import sys
     import fcntl
     dry = "--dry-run" in sys.argv
-    enforce_quota_only = "--enforce-quota" in sys.argv
+    # Preserve the historical quota-only flag unless expiry is explicitly added.
+    enforce_quota_only = "--enforce-quota" in sys.argv and "--with-expiry" not in sys.argv
 
     lock_path = os.path.join(config.DATA_DIR, "vod_maintenance.lock")
     os.makedirs(config.DATA_DIR, exist_ok=True)

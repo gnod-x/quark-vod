@@ -5,7 +5,7 @@ import sys
 import unittest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'app'))
-from quark_vod import cleaner,media_cache
+from quark_vod import cleaner,download_http,media_cache
 
 
 class CacheTests(unittest.TestCase):
@@ -16,7 +16,8 @@ class CacheTests(unittest.TestCase):
         self.patch=patch.object(cleaner,'open_clean_stream',side_effect=self.upstream)
         self.patch.start();self.addCleanup(self.patch.stop)
 
-    def upstream(self,url,skip,rng):
+    def upstream(self,url,skip,rng,*,opener=None):
+        self.assertIs(opener, download_http.urlopen)
         self.calls.append(rng)
         start,end=map(int,rng[6:].split('-'));end=min(end,len(self.body)-1)
         if start>=len(self.body):raise cleaner.CleanStreamError(416,'end',{'Content-Range':f'bytes */{len(self.body)}'})

@@ -173,7 +173,7 @@ class StorageContractTests(unittest.TestCase):
         store = FakeStore()
         transfer = QuarkTransfer(storage=store)
         item = {"fid": "file-id", "name": "disguised.mp3", "size": 60 * 1024**2}
-        with patch("urllib.request.urlopen", return_value=Response()), \
+        with patch("quark_vod.download_http.urlopen", return_value=Response()), \
                 patch.object(transfer, "rename_quark_file", return_value=True):
             fixed = transfer.sniff_and_fix_file(item, config.QUARK_VOD_ROOT + "/slot")
         self.assertTrue(fixed["path"].endswith("disguised.mkv"))

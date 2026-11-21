@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 TMP = tempfile.TemporaryDirectory(prefix="vod-api-")
 SEARCH = Path(TMP.name) / "search.json"
@@ -86,6 +86,28 @@ class PublicAPI(unittest.TestCase):
             probe.assert_not_called()
             self.assertEqual(self.client.post("/api/admin/capability/probe", headers=AUTH).status_code, 200)
             probe.assert_called_once()
+
+    def test_probe_does_not_report_search_ready_without_enabled_nodes(self):
+        store = Mock()
+        store.check_write_capable.return_value = (True, "synthetic ready")
+        transfer = Mock()
+        transfer.check_cookie_alive.return_value = (True, "synthetic ready")
+        with patch.object(main.legacy_srv, "get_openlist", return_value=store), \
+             patch.object(main.legacy_srv, "get_transfer", return_value=transfer):
+            response = self.client.post("/api/admin/capability/probe", headers=AUTH)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["panshare_ready"])
+        self.assertFalse(response.json()["ready"])
+        self.assertFalse(self.client.get("/capability", headers=AUTH).json()["ready"])
+
+    def test_preheat_pin_uses_the_resolved_library_title(self):
+        server = main.legacy_srv
+        with patch.object(server, "_resolve_strm_row", return_value=("电影", 0, 0, None)), \
+             patch.object(server.db, "library_title", return_value="Fixture (2026)"), \
+             patch.object(server, "_submit", return_value=(Mock(), True)), \
+             patch.object(server.db, "pin_item") as pin:
+            self.assertEqual(server.trigger_preheat_task("电影", "Fixture"), (True, "started"))
+        pin.assert_called_once_with("电影", "Fixture (2026)", reason="preheated")
 
     def test_rejected_cookie_does_not_disclose_value_or_probe_account(self):
         with patch.object(main.QuarkTransfer, "check_cookie_alive") as probe:

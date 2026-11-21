@@ -257,8 +257,9 @@ def _ask_model(names, season):
         ],
         "max_tokens": config.AI_PARSE_MAX_TOKENS,
         "temperature": 0,
-        "reasoning_effort": config.AI_PARSE_REASONING_EFFORT,
     }
+    if config.AI_PARSE_REASONING_EFFORT:
+        payload["reasoning_effort"] = config.AI_PARSE_REASONING_EFFORT
     req = urllib.request.Request(
         f"{config.AI_PARSE_BASE_URL.rstrip('/')}/chat/completions",
         data=json.dumps(payload).encode("utf-8"), method="POST")

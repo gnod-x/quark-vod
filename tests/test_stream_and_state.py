@@ -60,15 +60,91 @@ class StreamTests(unittest.TestCase):
             with self.assertRaises(OSError):asyncio.run(response({},None,None))
         slot.release.assert_called_once()
 
+    def test_health_responds_while_worker_pool_is_saturated(self):
+        import anyio
+        import httpx
+        async def saturated_health():
+            limiter = anyio.to_thread.current_default_thread_limiter()
+            original = limiter.total_tokens
+            limiter.total_tokens = 1
+            started = asyncio.Event()
+            release = threading.Event()
+            loop = asyncio.get_running_loop()
+            def block_worker():
+                loop.call_soon_threadsafe(started.set)
+                release.wait(timeout=5)
+            try:
+                async with anyio.create_task_group() as tasks:
+                    tasks.start_soon(anyio.to_thread.run_sync, block_worker)
+                    await started.wait()
+                    try:
+                        with anyio.fail_after(1):
+                            async with httpx.AsyncClient(
+                                transport=httpx.ASGITransport(app=main.app),
+                                base_url="http://fixture.invalid",
+                            ) as client:
+                                response = await client.get("/health")
+                            self.assertEqual(response.status_code, 200)
+                            self.assertEqual(response.json()["status"], "ok")
+                    finally:
+                        release.set()
+            finally:
+                limiter.total_tokens = original
+        asyncio.run(saturated_health())
+
+    def test_clean_slot_limit_rejects_before_opening_upstream(self):
+        slots = Mock()
+        slots.acquire.return_value = False
+        with patch.object(main.media_cache, "stream_slots", slots), \
+             patch.object(main.cleaner, "open_clean_stream") as opened:
+            result = main.clean_stream(request(), "http://fixture.invalid/d/video", 8)
+        self.assertEqual(result.status_code, 503)
+        opened.assert_not_called()
+        slots.release.assert_not_called()
+
+    def test_clean_open_error_releases_slot(self):
+        slots = Mock()
+        slots.acquire.return_value = True
+        with patch.object(main.media_cache, "stream_slots", slots), \
+             patch.object(main.cleaner, "open_clean_stream", side_effect=OSError("offline")):
+            result = main.clean_stream(request(), "http://fixture.invalid/d/video", 8)
+        self.assertEqual(result.status_code, 502)
+        slots.release.assert_called_once()
+
+    def test_clean_disconnect_closes_upstream_and_releases_slot(self):
+        upstream = Upstream(b"0123456789", 206, {
+            "Content-Length": "10", "Content-Range": "bytes 8-17/18"
+        })
+        slots = Mock()
+        slots.acquire.return_value = True
+        async def fail(*args): raise OSError("disconnected")
+        with patch.object(main.media_cache, "stream_slots", slots), \
+             patch.object(main.download_http, "urlopen", return_value=upstream), \
+             patch.object(main.StreamingResponse, "__call__", side_effect=fail):
+            result = main.clean_stream(request(), "http://fixture.invalid/d/video", 8)
+            with self.assertRaises(OSError):
+                asyncio.run(result({}, None, None))
+        self.assertTrue(upstream.closed)
+        slots.release.assert_called_once()
+
     def invoke(self, body, code, headers, rng='', method='GET'):
         upstream = Upstream(body, code, headers)
-        def capture_stream(body, **kwargs):
+        def capture_stream(body, close_stream=None, **kwargs):
             response = main.Response(**kwargs)
             response.sync_body = body
+            response.sync_close = close_stream
             return response
-        with patch.object(main, 'StreamingResponse', side_effect=capture_stream), patch.object(main.download_http, 'urlopen', return_value=upstream) as opened:
+        slots = Mock()
+        slots.acquire.return_value = True
+        with patch.object(main.media_cache, 'stream_slots', slots), \
+             patch.object(main, 'MediaResponse', side_effect=capture_stream), \
+             patch.object(main.download_http, 'urlopen', return_value=upstream) as opened:
             result = main.clean_stream(request(rng, method), 'http://fixture.invalid/d/video', 8)
             actual = response_bytes(result)
+            if getattr(result, 'sync_close', None):
+                result.sync_close()
+                slots.release()
+        slots.release.assert_called_once()
         return result, actual, opened.call_args.args[0], upstream
 
     def test_closed_range(self):
@@ -151,6 +227,13 @@ class StateTests(unittest.TestCase):
         self.assertEqual(r.status_code, 409)
         self.assertEqual(db.get_transfer_by_id(self.tid)['status'], 'done')
 
+    def test_old_access_session_does_not_create_permanent_expiry_protection(self):
+        with patch.object(db, 'now', return_value=1):
+            db.record_access(self.tid)
+        with patch.object(cleanup, 'OpenListClient', return_value=Mock()), patch.object(cleanup, 'get_protected_titles', return_value=set()):
+            self.assertEqual(cleanup.run_cleanup(verbose=False), (1, 0, 0))
+        self.assertEqual(db.get_transfer_by_id(self.tid)['status'], 'cleaned')
+
     def test_expiry_restore_failure_preserves_done(self):
         with patch.object(cleanup, 'OpenListClient', return_value=Mock()) as factory, patch.object(cleanup, 'get_protected_titles', return_value=set()), patch.object(strm_manager, 'restore_pending', side_effect=OSError('fixture read-only')):
             result = cleanup.run_cleanup(verbose=False)
@@ -170,6 +253,7 @@ class StateTests(unittest.TestCase):
 
     def test_mkdir_checks_application_error(self):
         ol = OpenListClient.__new__(OpenListClient)
+        ol._login_lock = threading.Lock()
         ol._request = Mock(return_value={'code': 500, 'message': 'fixture failure'})
         ol.list = Mock(return_value=[])
         with self.assertRaises(OpenListError):
@@ -177,18 +261,20 @@ class StateTests(unittest.TestCase):
 
     def test_openlist_json_401_reauth_once(self):
         ol = OpenListClient.__new__(OpenListClient)
+        ol._login_lock = threading.Lock()
         ol.base = 'http://fixture.invalid'
         ol.token = 'synthetic-old'
         ol._login = Mock(side_effect=lambda: setattr(ol, 'token', 'synthetic-new'))
         first = Upstream(b'{"code":401}', 200, {})
         second = Upstream(b'{"code":200,"data":{}}', 200, {})
-        with patch('urllib.request.urlopen', side_effect=[first, second]) as opened:
+        with patch('quark_vod.openlist_client._api_urlopen', side_effect=[first, second]) as opened:
             self.assertEqual(ol._request('/api/fs/list', {})['code'], 200)
         ol._login.assert_called_once()
         self.assertEqual(opened.call_count, 2)
 
     def test_write_probe_cleanup_on_failed_readback(self):
         ol = OpenListClient.__new__(OpenListClient)
+        ol._login_lock = threading.Lock()
         ol._write_probe_lock = threading.Lock()
         ol._write_probe_cache = None
         ol._request = Mock(side_effect=[{'code':200},{'code':200,'data':{'content':[]}}])
@@ -213,7 +299,8 @@ class StateTests(unittest.TestCase):
         self.assertEqual(result.status_code,302)
         self.assertIn('/d/',result.headers['location'])
         transfer.assert_not_called()
-        self.assertEqual(db._conn().execute('SELECT COUNT(*) FROM plays').fetchone()[0],0)
+        self.assertEqual(db.stats()['playback_access_sessions'],1)
+        self.assertEqual(db._conn().execute('SELECT SUM(finished) FROM plays').fetchone()[0],0)
         self.assertTrue(db.recently_accessed(self.tid))
 
     def test_fastapi_redirect_encodes_unicode_location(self):
@@ -271,10 +358,66 @@ class StateTests(unittest.TestCase):
 
     def test_recursive_usage_enforces_entry_limit(self):
         ol = Mock()
-        ol.list.return_value = [{'name': 'd'+str(i), 'is_dir': True} for i in range(5)]
+        ol.list.return_value = [{'name': 'd'+str(i), 'is_dir': True, 'size': 0} for i in range(5)]
         with self.assertRaises(OpenListError):
             cleanup.get_vod_disk_usage(ol, max_entries=7)
         self.assertLessEqual(ol.list.call_count, 8)
+
+    def test_usage_invalid_entries_stop_instead_of_becoming_empty(self):
+        for entry in ({'name':'../escape','is_dir':False,'size':1},
+                      {'name':'folder','size':1},
+                      {'name':'negative','is_dir':False,'size':-1},
+                      {'name':'invalid','is_dir':False,'size':True}):
+            with self.subTest(entry=entry):
+                ol=Mock()
+                ol.list.return_value=[entry]
+                with self.assertRaises(OpenListError):
+                    cleanup.get_vod_disk_usage(ol)
+
+    def test_expiry_preserves_directory_with_unresolved_save_target(self):
+        db._conn().execute('UPDATE cleanup_queue SET remote_path=?',('/夸克网盘/点播/样例',))
+        db._conn().commit()
+        db.upsert_transfer('电视剧','另一作品 (2025)',1,1,status='failed',
+            save_target='/夸克网盘/点播/样例/inflight.mkv',save_started_at=1,
+            save_file_fid='fixture-fid')
+        with patch.object(cleanup,'OpenListClient',return_value=Mock()) as factory,patch.object(cleanup,'get_protected_titles',return_value=set()):
+            self.assertEqual(cleanup.run_cleanup(verbose=False),(0,0,1))
+        factory.return_value.remove.assert_not_called()
+        self.assertEqual(db.get_transfer_by_id(self.tid)['status'],'done')
+
+    def test_mismatch_preserves_directory_with_unresolved_save_target(self):
+        db.upsert_transfer('电影','样例 (2026)',0,0,status='done',
+            remote_path='/夸克网盘/点播/短剧包/main.mkv')
+        db.upsert_transfer('电视剧','另一作品 (2025)',1,1,status='saving',
+            save_target='/夸克网盘/点播/短剧包/inflight.mkv',save_started_at=1,
+            save_file_fid='fixture-fid')
+        with patch.object(cleanup,'OpenListClient',return_value=Mock()),patch.object(cleanup,'get_protected_titles',return_value=set()),patch.object(QuarkTransfer,'delete_remote') as remove:
+            self.assertEqual(cleanup.clean_mismatched_short_dramas(verbose=False),0)
+        remove.assert_not_called()
+        self.assertEqual(db.get_transfer_by_id(self.tid)['status'],'done')
+
+    def test_quota_preserves_directory_with_nonterminal_intent(self):
+        items=[{'name':'样例','remote_path':'/夸克网盘/点播/样例','size':300*1024**3,'is_dir':True,'files':[],'file_count':1}]
+        for status in ('failed','saving'):
+            other=db.upsert_transfer('电视剧','不同作品 (2025)',1,1,status=status,
+                save_target='/夸克网盘/点播/样例/pending.mkv',save_started_at=1,
+                save_file_fid='fixture-fid')
+            with patch.object(cleanup,'get_vod_disk_usage',return_value=(300*1024**3,items)),patch.object(cleanup,'resolve_quotas',return_value=(1,1,0,0)),patch.object(cleanup,'get_protected_titles',return_value=set()):
+                ol=Mock()
+                self.assertEqual(cleanup.enforce_vod_quota(ol=ol,verbose=False)[:2],(0,0))
+                ol.remove.assert_not_called()
+            db._conn().execute('DELETE FROM transfers WHERE id=?',(other,))
+            db._conn().commit()
+
+    def test_default_usage_limit_accepts_more_than_two_hundred_saved_files(self):
+        ol = Mock()
+        ol.list.return_value = [
+            {'name': f'vod_{i:024x}', 'is_dir': False, 'size': i}
+            for i in range(401)
+        ]
+        total, items = cleanup.get_vod_disk_usage(ol)
+        self.assertEqual(len(items), 401)
+        self.assertEqual(total, sum(range(401)))
 
     def test_expiry_already_pending_completes(self):
         strm_manager.restore_pending(str(self.path), '电影', '样例 (2026)', 0, 0)
@@ -422,6 +565,30 @@ class StateTests(unittest.TestCase):
             self.assertEqual(cleanup.run_cleanup(verbose=False),(0,0,1))
             factory.return_value.remove.assert_not_called()
 
+    def test_quota_lru_uses_latest_playback_access(self):
+        recent = db.upsert_transfer('电影', '近期访问', 0, 0, status='done',
+                                    remote_path='/夸克网盘/点播/recent/video.mkv')
+        db.upsert_transfer('电影', '从未访问', 0, 0, status='done',
+                           remote_path='/夸克网盘/点播/never/video.mkv')
+        db.record_access(recent)
+        items = [
+            {'name':'recent', 'remote_path':'/夸克网盘/点播/recent', 'size':300*1024**3,
+             'is_dir':True, 'files':[], 'file_count':1},
+            {'name':'never', 'remote_path':'/夸克网盘/点播/never', 'size':300*1024**3,
+             'is_dir':True, 'files':[], 'file_count':1},
+        ]
+        import contextlib
+        import io
+        output=io.StringIO()
+        with patch.object(cleanup,'get_vod_disk_usage',return_value=(600*1024**3,items)), \
+             patch.object(cleanup,'resolve_quotas',return_value=(1,1,0,0)), \
+             patch.object(cleanup,'get_protected_titles',return_value=set()), \
+             patch.object(cleanup.db,'recently_accessed',return_value=False), \
+             contextlib.redirect_stdout(output):
+            cleanup.enforce_vod_quota(ol=Mock(),dry_run=True,verbose=False)
+        text=output.getvalue()
+        self.assertLess(text.index('/夸克网盘/点播/never'), text.index('/夸克网盘/点播/recent'))
+
     def test_share_pagination_and_parent_fid(self):
         tr=QuarkTransfer(Mock())
         pages=[{'code':0,'data':{'_total':101,'list':[{'file_name':f'S01E{i:02}.mkv','fid':str(i),'dir':False,'size':1024**3} for i in range(1,101)]}},
@@ -559,14 +726,25 @@ class StateTests(unittest.TestCase):
             ''')
             con.execute('INSERT INTO BaseItems VALUES (?,?,?,?)', ('episode','第一集','样例剧','MediaBrowser.Controller.Entities.TV.Episode'))
             con.execute('INSERT INTO UserData VALUES (?,?,?,?,?)', ('episode',1,0,0,0))
-            con.execute('INSERT INTO BaseItems VALUES (?,?,?,?)', ('movie','样例电影','','MediaBrowser.Controller.Entities.Movies.Movie'))
-            con.execute('INSERT INTO UserData VALUES (?,?,?,?,?)', ('movie',0,0,2,0))
+            con.execute('INSERT INTO BaseItems VALUES (?,?,?,?)', ('movie','已看电影','','MediaBrowser.Controller.Entities.Movies.Movie'))
+            con.execute('INSERT INTO UserData VALUES (?,?,?,?,?)', ('movie',0,1,2,0))
+            con.execute('INSERT INTO BaseItems VALUES (?,?,?,?)', ('in-progress','在看电影','','MediaBrowser.Controller.Entities.Movies.Movie'))
+            con.execute('INSERT INTO UserData VALUES (?,?,?,?,?)', ('in-progress',0,0,1,1200))
         with patch.object(cleanup,'JF_DB',str(protected_db)), \
              patch.object(cleanup.db,'get_all_pinned_titles',return_value=set()):
             protected=cleanup.get_protected_titles()
         self.assertNotIn('第一集',protected)
         self.assertIn('样例剧',protected)
-        self.assertIn('样例电影',protected)
+        self.assertNotIn('已看电影',protected)
+        self.assertIn('在看电影',protected)
+
+    def test_automatic_pins_do_not_become_permanent_retention_protection(self):
+        db.pin_item('电影', '预热项', reason='preheated')
+        db.pin_item('电影', '门户入库', reason='manual_add')
+        db.pin_item('电影', '播放历史', reason='played')
+        db.pin_item('电影', '显式收藏', reason='favorited')
+        db.pin_item('电影', '显式置顶', reason='manual')
+        self.assertEqual(db.get_all_pinned_titles(), {'显式收藏', '显式置顶'})
 
     def test_protection_query_fails_closed_for_episode_without_series(self):
         protected_db=Path(TMP.name)/'protected-episode-without-series.db'
@@ -726,6 +904,20 @@ class CleanupScheduleTests(unittest.TestCase):
         mismatch.assert_called_once()
         quota.assert_called_once()
         expiry.assert_not_called()
+        pictures.assert_not_called()
+
+
+    def test_cleanup_explicit_expiry_can_extend_quota_only_schedule(self):
+        with patch.object(sys, "argv", ["cleanup", "--enforce-quota", "--with-expiry"]), \
+             patch.object(cleanup, "OpenListClient"), \
+             patch.object(cleanup, "clean_mismatched_short_dramas") as mismatch, \
+             patch.object(cleanup, "enforce_vod_quota") as quota, \
+             patch.object(cleanup, "run_cleanup", return_value=(0, 0, 0)) as expiry, \
+             patch.object(cleanup, "prune_jellyfin2_orphan_metadata") as pictures:
+            self.assertEqual(cleanup.main(), 0)
+        mismatch.assert_called_once()
+        quota.assert_called_once()
+        expiry.assert_called_once_with(dry_run=False)
         pictures.assert_not_called()
 
 

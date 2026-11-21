@@ -9,7 +9,7 @@ import hashlib
 import re
 import threading
 import time
-from . import cleaner, config
+from . import cleaner, config, download_http
 
 BLOCK_SIZE = 512 * 1024
 MAX_BYTES = 24 * 1024**2
@@ -49,7 +49,10 @@ class RangeCache:
             if cached is not None:return cached
             start=index*self.block_size
             with self._fetch_slots:
-                stream=cleaner.open_clean_stream(url,skip,f'bytes={start}-{start+self.block_size-1}')
+                stream=cleaner.open_clean_stream(
+                    url, skip, f'bytes={start}-{start+self.block_size-1}',
+                    opener=download_http.urlopen,
+                )
                 try:
                     match=re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',stream.headers.get('Content-Range',''))
                     if stream.status!=206 or not match or int(match[1])!=start or stream.discard>8:

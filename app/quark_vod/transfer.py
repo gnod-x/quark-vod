@@ -28,7 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import config
+from . import config, download_http
 from . import db
 from . import strm_manager
 from . import name_parser
@@ -296,14 +296,15 @@ class QuarkTransfer:
         return vod_fid
 
     def _get_quark_fid(self, path):
-        """通过夸克 API 获取目录的 fid。path 格式如 /夸克网盘/点播"""
-        # 拆分路径，逐级查询 fid
-        parts = [p for p in path.split("/") if p]
-        if not parts or parts[0] != "夸克网盘":
+        """通过夸克 API 获取目录的 fid；挂载名来自显式配置。"""
+        normalized = config.write_path(path or "")
+        mount = config.QUARK_MOUNT.rstrip("/")
+        if normalized != mount and not normalized.startswith(mount + "/"):
             return None
-        # 夸克网盘是挂载名，实际从根目录开始查
+        relative = normalized[len(mount):].strip("/")
+        parts = [p for p in relative.split("/") if p]
         current_fid = "0"
-        for part in parts[1:]:  # 跳过挂载名
+        for part in parts:
             # Exhaust pages before declaring absence. Network/authentication
             # failures must propagate; treating them as missing deletes state.
             found = next((f.get("fid") for f in self._quark_list_fid(current_fid)
@@ -402,10 +403,13 @@ class QuarkTransfer:
         real_path = f"{parent_path}/{name}"
         play_path = config.play_path(real_path)
         try:
+            if self.storage:
+                # OpenList may cache the destination slot immediately after save.
+                self.storage.refresh_path_tree(config.play_path(parent_path))
             url = self.storage.direct_url(play_path) if self.storage else None
             if url:
                 req = urllib.request.Request(url, headers={"Range": "bytes=0-15", "User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with download_http.urlopen(req, timeout=5) as resp:
                     head = resp.read(16)
                     correct_ext = detect_video_magic(head)
         except Exception:
@@ -764,14 +768,19 @@ class QuarkTransfer:
         fid = self._get_quark_fid(parent)
         if not fid:
             raise TransferNotReady('原转存目录缺失，需核对原任务状态')
+        saved_fid = previous.get("save_file_fid")
         def lookup():
-            return next((f for f in self._quark_list_fid(fid) if not f['is_dir'] and f['name']==name),None)
+            matches = [f for f in self._quark_list_fid(fid) if not f["is_dir"]
+                       and (str(f.get("fid")) == str(saved_fid) if saved_fid else f["name"] == name)]
+            if len(matches) > 1:
+                raise TransferNotReady("原转存文件身份不唯一，停止自动覆盖")
+            return matches[0] if matches else None
         item = lookup()
         if item is None and previous.get('save_task_id'):
             try:
                 self._wait_saved_task(previous['save_task_id'])
             except TransferTaskFailed:
-                db.upsert_transfer(*work.args,status='failed',save_target=None,save_task_id=None,save_started_at=None)
+                db.upsert_transfer(*work.args,status='failed',save_target=None,save_task_id=None,save_started_at=None,save_file_fid=None)
                 raise
             deadline = time.monotonic()+min(30,config.PROBE_VERIFY_TIMEOUT)
             while item is None and time.monotonic()<deadline:
@@ -783,9 +792,21 @@ class QuarkTransfer:
         expected = previous.get('file_size') or 0
         if expected and item['size'] != expected:
             raise TransferNotReady('原任务文件大小不符，停止自动覆盖')
-        tid = db.upsert_transfer(*work.args,status='done',remote_path=target,file_size=item['size'],error=None,
-                                 save_target=None,save_task_id=None,save_started_at=None)
-        db.enqueue_cleanup(tid,target,db.now()+config.KEEP_DAYS*86400)
+        current_name = item.get("name", name)
+        if not current_name or "/" in current_name or current_name in (".", ".."):
+            raise TransferNotReady("原转存文件名无效")
+        target = parent + "/" + current_name
+        if os.path.splitext(current_name)[1].lower() not in VIDEO_EXTS:
+            # A successful rename may precede a process crash or failed DB commit.
+            # Persist the stable Quark file identity before changing its name.
+            if not item.get("fid"):
+                raise TransferNotReady("原转存文件身份尚未确认")
+            db.upsert_transfer(*work.args, save_file_fid=str(item["fid"]))
+            fixed = self.sniff_and_fix_file(item, parent)
+            if not fixed:
+                raise TransferNotReady("原转存文件格式尚未确认，请稍后重试")
+            target = fixed["path"]
+        tid = db.complete_transfer(*work.args, target, item['size'], db.now()+config.KEEP_DAYS*86400)
         try:
             self.storage.refresh_path_tree(config.play_path(target))
         except Exception:
@@ -811,7 +832,7 @@ class QuarkTransfer:
             # Do not erase arbitrary descriptions: another work, sequel,
             # adaptation or special edition must keep this context untrusted.
             rest = re.sub(r'(?<!\d)(?:19|20)\d{2}(?!\d)', '', rest)
-            rest = re.sub(r'(?i)4k|2160p?|1080p?|720p?|HDR\d*|WEB[- ]?DL|HEVC|AAC|国语中字|国语|中字|高码率|单集\s*\d+(?:\.\d+)?\s*[GM]B?|全\s*\d+\s*集|德剧|美剧|英剧|韩剧|日剧|国产剧', '', rest)
+            rest = re.sub(r'(?i)4k|2160p?|1080p?|720p?|HDR\d*|WEB[- ]?DL|HEVC|AAC|国语中字|国语|中字|高码率|单集\s*\d+(?:\.\d+)?\s*[GM]B?|全\s*\d+\s*集|德剧|美剧|英剧|韩剧|日剧|国产剧|泰剧|港剧|台剧|动漫|番剧|高码|臻彩|杜比视界|内封|双语|简繁', '', rest)
             return not rest.strip(' ._-()[]（）【】')
         videos=[]
         for item in files:
@@ -900,7 +921,9 @@ class QuarkTransfer:
                         # A translated basename loses its title at the episode
                         # token, but its tail must still be technical metadata.
                         # Do not silently discard another work/adaptation/part.
-                        safe_suffix = re.sub(r'(?i)-(?:LeagueWEB)$', '', release_suffix)
+                        safe_suffix = re.sub(
+                            r'(?i)-(?!(?:Part\d*|Movie|OVA|OAD|SP|Special|Anime|Extended|Uncut|Remastered)$)[A-Za-z0-9]{2,14}$',
+                            '', release_suffix)
                         safe_suffix = re.sub(r'(?i)(?<![A-Za-z0-9])(?:WEB[- ]?DL|WEBRIP|BLURAY|REMUX|2160p?|1080p?|720p?|4k|HDR\d*|HEVC|AVC|AAC|H\.?26[45]|X26[45]|DDP?\d?(?:\.\d)?)(?![A-Za-z0-9])', '', safe_suffix)
                         suffix_is_metadata = not safe_suffix.strip(' ._-()[]')
                         if not (unknown_name and not explicit_variant and parent_identity and not conflicting_parent and suffix_is_metadata):
@@ -978,13 +1001,13 @@ class QuarkTransfer:
                 ok, _ = self._check_capacity(best['size'])
                 if not ok:
                     raise TransferFailed('网盘剩余空间不足以保存所选视频')
-                db.upsert_transfer(*work.args,status='saving',save_target=target,save_started_at=db.now(),save_task_id=None,file_size=best['size'])
+                db.upsert_transfer(*work.args,status='saving',save_target=target,save_started_at=db.now(),save_task_id=None,save_file_fid=None,file_size=best['size'])
                 payload = {'pwd_id':pwd_id,'stoken':stoken,'to_pdir_fid':str(fid),
                            'fid_list':[selected['fid']], 'fid_token_list':[selected.get('share_fid_token','')],
                            'pdir_fid':str(selected.get('parent_fid','0')), 'scene':'link'}
                 response = self._request(QUARK_SHARE_SAVE,payload=payload,method='POST',timeout=30)
                 if response.get('code') != 0:
-                    db.upsert_transfer(*work.args,save_started_at=None,save_target=None,save_task_id=None)
+                    db.upsert_transfer(*work.args,save_started_at=None,save_target=None,save_task_id=None,save_file_fid=None)
                     raise TransferFailed('转存请求被拒绝: ' + str(response.get('code')))
                 task_id = (response.get('data') or {}).get('task_id')
                 if task_id:
@@ -1002,12 +1025,16 @@ class QuarkTransfer:
             # A disguised filename may be corrected only after inspecting it.
             ext = os.path.splitext(saved['name'])[1].lower()
             if ext not in VIDEO_EXTS:
+                if not saved.get("fid"):
+                    raise TransferNotReady("转存文件身份尚未确认")
+                db.upsert_transfer(*work.args, status="saving", save_target=target,
+                                   save_started_at=previous.get("save_started_at") or db.now(),
+                                   save_file_fid=str(saved["fid"]), file_size=best["size"])
                 fixed = self.sniff_and_fix_file(saved, slot)
-                if fixed:
-                    target = fixed['path']
-            db.upsert_transfer(*work.args,status='done',remote_path=target,file_size=best['size'],error=None,
-                               save_target=None,save_task_id=None,save_started_at=None)
-            db.enqueue_cleanup(tid,target,db.now()+config.KEEP_DAYS*86400)
+                if not fixed:
+                    raise TransferNotReady("转存文件格式尚未确认，请稍后重试")
+                target = fixed["path"]
+            tid = db.complete_transfer(*work.args, target, best['size'], db.now()+config.KEEP_DAYS*86400)
             try:
                 self.storage.refresh_path_tree(config.play_path(target))
             except Exception:
@@ -1015,7 +1042,7 @@ class QuarkTransfer:
             return tid,target
         except Exception as exc:
             if isinstance(exc, TransferTaskFailed):
-                db.upsert_transfer(*work.args,save_started_at=None,save_target=None,save_task_id=None)
+                db.upsert_transfer(*work.args,save_started_at=None,save_target=None,save_task_id=None,save_file_fid=None)
             db.upsert_transfer(*work.args,status='failed',error=type(exc).__name__ + ': ' + str(exc)[:180])
             raise
 

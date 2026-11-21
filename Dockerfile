@@ -6,7 +6,7 @@ COPY app/ ./app/
 RUN python -m pip wheel --no-cache-dir --wheel-dir /wheels .
 
 FROM python:3.12-slim
-ARG VOD_VERSION=3.0.0
+ARG VOD_VERSION=3.0.1
 ARG VCS_REF=unknown
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

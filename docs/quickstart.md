@@ -1,6 +1,6 @@
 # 安装、配置与运维
 
-本文按仓库中的 Quark-VOD 3.0.0 源码、`docker-compose.yml` 和当前 API 行为编写。默认 Compose 部署从本地源码构建镜像；配置中的 `quark-vod:3.0.0` 是本地镜像标签，不代表已经发布到公共镜像仓库。镜像 OCI version label 默认跟随该标签；发布构建应显式传入 `QUARK_VOD_IMAGE_VERSION` 与 `QUARK_VOD_IMAGE_REVISION`，分别记录包版本和源码提交。
+本文按仓库中的 Quark-VOD 3.0.1 源码、`docker-compose.yml` 和当前 API 行为编写。默认 Compose 部署从本地源码构建镜像；配置中的 `quark-vod:3.0.1` 是本地镜像标签，不代表已经发布到公共镜像仓库。镜像 OCI version label 默认跟随该标签；发布构建应显式传入 `QUARK_VOD_IMAGE_VERSION` 与 `QUARK_VOD_IMAGE_REVISION`，分别记录包版本和源码提交。
 
 ## 部署前准备
 
@@ -290,7 +290,7 @@ ln -- "$temporary" "$backup_dir/state.db"
 
 SQLite backup API 将已提交的 WAL 内容纳入快照。备份容器在临时目录生成快照；数据库若接近 Compose 的 `/tmp` 容量上限，须为备份命令提供容量足够的专用临时空间。成功后保留完整备份目录，其中有旧镜像、回滚覆盖文件和通过校验的状态库。
 
-当前代码支持把 `PRAGMA user_version=0` 的既有 schema 迁移到版本 1。升级时服务先在事务内执行 SQLite `quick_check`，再迁移 schema 并检查必需表和列；任何完整性或迁移检查失败都会回滚并阻止服务继续启动。已经是当前版本的数据库不会在每次日常启动时重复扫描。版本高于当前程序支持值的数据库会被拒绝，程序不会自动降级，也不会自动创建备份。若启动报 schema 或完整性错误，保留数据库和日志，先确认运行的程序版本及备份；不要手工改 `user_version` 让旧程序绕过检查。恢复数据库前先停止服务，并确认接受丢弃备份之后写入的状态。
+当前代码支持把 `PRAGMA user_version=0` 的既有 schema 及版本 1 迁移到版本 2；新增可空的 save_file_fid 字段用于保存后改名恢复。升级时服务先在事务内执行 SQLite `quick_check`，再迁移 schema 并检查必需表和列；任何完整性或迁移检查失败都会回滚并阻止服务继续启动。已经是当前版本的数据库不会在每次日常启动时重复扫描。版本高于当前程序支持值的数据库会被拒绝，程序不会自动降级，也不会自动创建备份。若启动报 schema 或完整性错误，保留数据库和日志，先确认运行的程序版本及备份；不要手工改 `user_version` 让旧程序绕过检查。恢复数据库前先停止服务，并确认接受丢弃备份之后写入的状态。
 
 换成新版源码和匹配配置后，沿用同一 Compose 项目名和原数据卷。使用同样的项目参数及需要的覆盖文件，依次执行：
 

@@ -101,8 +101,10 @@ class UpgradeCompatibilityTests(unittest.TestCase):
     def _assert_release_rows(self, connection):
         for table, row in RELEASE_ROWS.items():
             with self.subTest(table=table):
+                columns = {column[1] for column in connection.execute(f"PRAGMA table_info({table})")}
+                expected = row + (None,) if table == "transfers" and "save_file_fid" in columns else row
                 self.assertEqual([tuple(r) for r in connection.execute(f"SELECT * FROM {table}")],
-                                 [row])
+                                 [expected])
 
     def test_pre3_main_upgrades_without_losing_existing_state(self):
         old_rows = {table: row for table, row in RELEASE_ROWS.items() if table != "playback_access"}
@@ -420,7 +422,7 @@ class UpgradeCompatibilityTests(unittest.TestCase):
         results = [process.communicate(timeout=10) for process in processes]
 
         self.assertEqual([process.returncode for process in processes], [0, 0], results)
-        self.assertEqual([stdout.strip() for stdout, _ in results], ["1", "1"])
+        self.assertEqual([stdout.strip() for stdout, _ in results], [str(db.SCHEMA_VERSION)] * 2)
         self.assertTrue(all(not stderr for _, stderr in results), results)
         with closing(sqlite3.connect(self.state_db)) as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)

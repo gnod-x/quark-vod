@@ -41,7 +41,7 @@ function renderPlugins(data){
 function renderOverview(data){
   const cap=data.capability||{};byId('capability').textContent=(cap.cookie_status||'尚未验证账号')+' · '+(cap.openlist_reason||'尚未验证读取与转存服务');
   const metrics=byId('metrics');metrics.replaceChildren();
-  for(const[label,value]of[['已保存',data.stats?.done||0],['播放请求',data.stats?.plays||0],['失败记录',data.stats?.failed||0],['STRM登记',data.strm_summary?.registered||0]]){const box=document.createElement('div');box.className='metric';const b=document.createElement('b');b.textContent=value;box.append(b,document.createTextNode(label));metrics.append(box);}
+  for(const[label,value]of[['已保存',data.stats?.done||0],['播放访问会话',data.stats?.playback_access_sessions??data.stats?.plays??0],['失败记录',data.stats?.failed||0],['STRM登记',data.strm_summary?.registered||0]]){const box=document.createElement('div');box.className='metric';const b=document.createElement('b');b.textContent=value;box.append(b,document.createTextNode(label));metrics.append(box);}
   const rows=byId('transfers');rows.replaceChildren();
   for(const item of data.recent_transfers||[]){const row=document.createElement('tr');for(const value of[item.id,item.title,'S'+item.season+'E'+item.episode,item.status,item.size_gb?item.size_gb+' GiB':'—'])cell(row,value);const actions=cell(row,'');button(actions,'预热',async()=>{const params=new URLSearchParams({cat:item.cat,t:item.title,s:item.season,e:item.episode});await api('/preheat?'+params);notify('预热任务已提交。');});button(actions,'重置',async()=>{if(!confirm('将这条记录恢复为待处理状态？'))return;await api('/api/admin/transfer/'+encodeURIComponent(item.id),{method:'DELETE'});await refresh();notify('记录已重置。');});rows.append(row);}
 }

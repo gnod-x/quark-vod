@@ -177,6 +177,9 @@ PENDING_BASE_URL = _url("PENDING_BASE_URL", "http://127.0.0.1:8099")
 JELLYFIN2_API = _url("JELLYFIN2_API_BASE", "http://127.0.0.1:8097")
 JELLYFIN2_DB = _path("JELLYFIN2_DB", "jellyfin2/config/data/jellyfin.db", BASE_DIR)
 JELLYFIN_LIBRARY_ROOT = _mount("JELLYFIN_LIBRARY_ROOT", "/cinema2")
+# Metadata deletion requires an explicit host root and database path mapping.
+JELLYFIN_METADATA_LIBRARY_DIR = os.getenv("JELLYFIN_METADATA_LIBRARY_DIR", "").strip()
+JELLYFIN_METADATA_LIBRARY_PREFIX = os.getenv("JELLYFIN_METADATA_LIBRARY_PREFIX", "").strip()
 VOD_JELLYFIN_ENABLED = _boolean("VOD_JELLYFIN_ENABLED")
 VOD_MAINTENANCE_ENABLED = _boolean("VOD_MAINTENANCE_ENABLED")
 VOD_STARTUP_SCAN = _boolean("VOD_STARTUP_SCAN")
@@ -296,7 +299,9 @@ if AI_PARSE_ENABLED and not (AI_PARSE_BASE_URL and AI_PARSE_MODEL):
     raise ValueError("AI_PARSE_ENABLED requires AI_PARSE_BASE_URL and AI_PARSE_MODEL")
 AI_PARSE_TIMEOUT = _number("AI_PARSE_TIMEOUT", 20.0, 0.1, 300.0, float)
 AI_PARSE_MAX_TOKENS = _number("AI_PARSE_MAX_TOKENS", 4096, 1, 131072)
-AI_PARSE_REASONING_EFFORT = _value("AI_PARSE_REASONING_EFFORT", "low")
+# This extension is not supported by every OpenAI-compatible endpoint.
+# Leave it out by default; deployments may explicitly opt in.
+AI_PARSE_REASONING_EFFORT = _value("AI_PARSE_REASONING_EFFORT", "")
 AI_PARSE_BATCH_SIZE = _number("AI_PARSE_BATCH_SIZE", 24, 1, 256)
 AI_PARSE_MIN_CONFIDENCE = _number("AI_PARSE_MIN_CONFIDENCE", 0.7, 0.0, 1.0, float)
 AI_PARSE_MAX_FAILS = _number("AI_PARSE_MAX_FAILS", 3, 1, 100)

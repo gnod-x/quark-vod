@@ -8,15 +8,18 @@
 """
 
 import os
+import logging
 import sqlite3
 import threading
 import time
 
 from . import config
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _BUSY_TIMEOUT = 30
 _local = threading.local()
+_log = logging.getLogger(__name__)
+ACCESS_SESSION_SECONDS = 30 * 60
 
 
 class DatabaseUpgradeError(RuntimeError):
@@ -178,7 +181,7 @@ _REQUIRED_COLUMNS = {
     "transfers": {
         "id", "cat", "title", "season", "episode", "share_url", "share_pwd", "pan_type",
         "status", "error", "remote_path", "file_size", "created_at", "updated_at", "save_task_id",
-        "save_target", "save_started_at",
+        "save_target", "save_started_at", "save_file_fid",
     },
     "strm_map": {"cat", "title", "season", "episode", "strm_path"},
     "plays": {"id", "cat", "title", "season", "episode", "transfer_id", "played_at", "finished"},
@@ -255,7 +258,14 @@ def _migration_1(con):
             con.execute(f"ALTER TABLE transfers ADD COLUMN {name} {kind}")
 
 
-_MIGRATIONS = {1: _migration_1}
+def _migration_2(con):
+    """Persist the exact saved file identity before a remote format rename."""
+    columns = {row[1] for row in con.execute("PRAGMA table_info(transfers)")}
+    if "save_file_fid" not in columns:
+        con.execute("ALTER TABLE transfers ADD COLUMN save_file_fid TEXT")
+
+
+_MIGRATIONS = {1: _migration_1, 2: _migration_2}
 
 
 def _read_version(con):
@@ -346,16 +356,19 @@ def save_source_audit(cat, title, season, episode, has_quark_source, is_4k,
                       best_share_url="", best_share_title="", check_status="unknown"):
     """保存或更新片源预检审计结果。"""
     now_ts = now()
+    con = _conn()
     try:
-        _conn().execute("""
+        con.execute("""
             INSERT OR REPLACE INTO source_audits
             (cat, title, season, episode, has_quark_source, is_4k, best_share_url, best_share_title, checked_at, check_status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (cat, title, season, episode, int(has_quark_source), int(is_4k),
               best_share_url, best_share_title, now_ts, check_status))
-        _conn().commit()
-    except Exception:
-        pass
+        con.commit()
+    except Exception as exc:
+        con.rollback()
+        _log.error("state write failed: save_source_audit (%s)", type(exc).__name__)
+        raise
 
 
 def get_source_audit(cat, title, season=0, episode=0):
@@ -396,6 +409,7 @@ def bump_audit_checked_at(cat, title, season, share_url, ts=None):
     """
     if not share_url:
         return
+    con = _conn()
     try:
         con = _conn()
         con.execute(
@@ -404,14 +418,17 @@ def bump_audit_checked_at(cat, title, season, share_url, ts=None):
             (ts if ts is not None else now(), cat, title, season, share_url)
         )
         con.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        con.rollback()
+        _log.error("state write failed: bump_audit_checked_at (%s)", type(exc).__name__)
+        raise
 
 
 def purge_audit_locked_share(cat, title, season, share_url):
     """作废某季下所有锁定了指定分享源的审计行（剧集回退为待补源）。"""
     if not share_url:
         return
+    con = _conn()
     try:
         con = _conn()
         con.execute(
@@ -420,8 +437,10 @@ def purge_audit_locked_share(cat, title, season, share_url):
             (now(), cat, title, season, share_url)
         )
         con.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        con.rollback()
+        _log.error("state write failed: purge_audit_locked_share (%s)", type(exc).__name__)
+        raise
 
 
 def mark_dead_source(source_url, source_type="panshare", reason="", ban_days=7):
@@ -430,15 +449,18 @@ def mark_dead_source(source_url, source_type="panshare", reason="", ban_days=7):
         return
     now_ts = now()
     exp_ts = now_ts + ban_days * 86400
+    con = _conn()
     try:
-        _conn().execute(
+        con.execute(
             "INSERT OR REPLACE INTO dead_sources (source_url, source_type, reason, created_at, expires_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (source_url.strip(), source_type, reason[:200], now_ts, exp_ts)
         )
-        _conn().commit()
-    except Exception:
-        pass
+        con.commit()
+    except Exception as exc:
+        con.rollback()
+        _log.error("state write failed: mark_dead_source (%s)", type(exc).__name__)
+        raise
 
 
 def is_dead_source(source_url):
@@ -480,7 +502,7 @@ def now():
 
 
 # ── transfers ─────────────────────────────────────────
-def upsert_transfer(cat, title, season, episode, **fields):
+def upsert_transfer(cat, title, season, episode, *, _cleanup_due_at=None, **fields):
     """按 (cat,title,season,episode) 定位；不存在则插入。
 
     2026-10-25：入口统一清洗 cat/title 中的零宽字符与不可见控制符。
@@ -495,9 +517,11 @@ def upsert_transfer(cat, title, season, episode, **fields):
     except Exception:
         pass
     con = _conn()
-    allowed = {'status', 'share_url', 'share_pwd', 'pan_type', 'error', 'remote_path', 'file_size', 'save_task_id', 'save_target', 'save_started_at'}
+    allowed = {'status', 'share_url', 'share_pwd', 'pan_type', 'error', 'remote_path', 'file_size', 'save_task_id', 'save_target', 'save_started_at', 'save_file_fid'}
     if not fields.keys() <= allowed:
         raise ValueError('invalid transfer fields')
+    if _cleanup_due_at is not None and (fields.get("status") != "done" or not fields.get("remote_path")):
+        raise ValueError("cleanup scheduling requires a completed transfer and exact path")
     # Serialize SELECT+INSERT across threads and host cron processes.
     # Historical duplicates keep their queue/play references.
     con.execute("BEGIN IMMEDIATE")
@@ -516,11 +540,23 @@ def upsert_transfer(cat, title, season, episode, **fields):
             vals = [cat, title, season, episode, now(), now(), *fields.values()]
             cur = con.execute(f"INSERT INTO transfers ({','.join(cols)}) VALUES ({','.join('?' for _ in vals)})", vals)
             tid = cur.lastrowid
+        if _cleanup_due_at is not None:
+            con.execute("INSERT INTO cleanup_queue (transfer_id,remote_path,due_at) VALUES (?,?,?)",
+                        (tid, fields["remote_path"], _cleanup_due_at))
         con.commit()
         return tid
     except BaseException:
         con.rollback()
         raise
+
+
+def complete_transfer(cat, title, season, episode, remote_path, file_size, due_at):
+    """Atomically finish a confirmed save and record its expiry work."""
+    return upsert_transfer(
+        cat, title, season, episode, status="done", remote_path=remote_path,
+        file_size=file_size, error=None, save_target=None, save_task_id=None,
+        save_started_at=None, save_file_fid=None, _cleanup_due_at=due_at,
+    )
 
 
 def get_transfer(cat, title, season, episode):
@@ -566,17 +602,30 @@ def library_title(cat, title, season, episode):
 
 
 def find_done_transfer(cat, title, season, episode):
-    """Reuse only an identical work and media kind; never guess a missing year."""
-    from .identity import same_title, media_kind
+    """Resolve exact work identity with one query, including legacy mapping years."""
+    from .identity import same_title, media_kind, split_title
     rows = _conn().execute(
-        "SELECT * FROM transfers WHERE season=? AND episode=? AND status='done' "
-        "AND remote_path IS NOT NULL AND remote_path<>'' ORDER BY updated_at DESC,id DESC",
-        (season, episode)).fetchall()
+        "SELECT t.*, m.strm_path AS identity_strm_path FROM transfers t "
+        "LEFT JOIN strm_map m ON m.cat=t.cat AND m.title=t.title "
+        "AND m.season=t.season AND m.episode=t.episode "
+        "WHERE t.season=? AND t.episode=? AND t.status='done' "
+        "AND t.remote_path IS NOT NULL AND t.remote_path<>'' "
+        "ORDER BY t.updated_at DESC,t.id DESC", (season, episode)).fetchall()
     candidates = []
+    root = os.path.abspath(config.CINEMA2_DIR)
     for row in rows:
         if media_kind(row['cat'], season) != media_kind(cat, season):
             continue
-        actual_title = library_title(row['cat'], row['title'], season, episode)
+        actual_title = row['title']
+        if split_title(actual_title)[0].casefold() != split_title(title)[0].casefold():
+            continue
+        mapped = row['identity_strm_path']
+        if not split_title(actual_title)[1] and mapped:
+            path = os.path.abspath(mapped)
+            if path.startswith(root + os.sep):
+                parts = os.path.relpath(path, root).split(os.sep)
+                if len(parts) >= 3 and split_title(parts[1])[0].casefold() == split_title(actual_title)[0].casefold():
+                    actual_title = parts[1]
         if same_title(title, actual_title):
             candidates.append(row)
     candidates.sort(key=lambda row: row['cat'] != cat)
@@ -639,10 +688,25 @@ def get_strm_path(cat, title, season, episode):
 
 # ── plays ─────────────────────────────────────────────
 def record_access(transfer_id):
-    with _conn() as con:
+    """Refresh retention on every request; count access sessions, not Range blocks."""
+    con = _conn()
+    con.execute('BEGIN IMMEDIATE')
+    try:
+        timestamp = now()
+        previous = con.execute('SELECT accessed_at FROM playback_access WHERE transfer_id=?',
+                               (transfer_id,)).fetchone()
+        if previous is None or timestamp - previous['accessed_at'] >= ACCESS_SESSION_SECONDS:
+            con.execute(
+                'INSERT INTO plays(cat,title,season,episode,transfer_id,played_at,finished) '
+                'SELECT cat,title,season,episode,id,?,0 FROM transfers WHERE id=?',
+                (timestamp, transfer_id))
         con.execute('INSERT INTO playback_access(transfer_id,accessed_at) VALUES (?,?) '
-                    'ON CONFLICT(transfer_id) DO UPDATE SET accessed_at=excluded.accessed_at',
-                    (transfer_id,now()))
+                    'ON CONFLICT(transfer_id) DO UPDATE SET accessed_at=MAX(playback_access.accessed_at,excluded.accessed_at)',
+                    (transfer_id,timestamp))
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
 
 
 def recently_accessed(transfer_id, grace_seconds=6*3600):
@@ -698,6 +762,7 @@ def stats():
     for s in ("pending", "searching", "found", "saving", "done", "failed", "cleaned"):
         out[s] = con.execute("SELECT COUNT(*) c FROM transfers WHERE status=?", (s,)).fetchone()["c"]
     out["plays"] = con.execute("SELECT COUNT(*) c FROM plays").fetchone()["c"]
+    out["playback_access_sessions"] = out["plays"]
     out["cleanup_pending"] = con.execute(
         "SELECT COUNT(*) c FROM cleanup_queue WHERE cleaned=0").fetchone()["c"]
     return out
@@ -705,19 +770,22 @@ def stats():
 
 # ── user_pinned ───────────────────────────────────────
 def pin_item(cat, title, reason="preheated"):
-    """将影视条目登记为用户置顶/预热保护（绝不淘汰）。"""
+    """Record an automatic marker without weakening an existing explicit pin."""
     if not title:
         return
     clean_title = title.rsplit(" (", 1)[0].strip() if " (" in title else title.strip()
     try:
-        con = _conn()
-        con.execute("""
-            INSERT OR REPLACE INTO user_pinned (cat, title, reason, pinned_at)
-            VALUES (?, ?, ?, ?)
-        """, (cat or "", clean_title, reason, now()))
-        con.commit()
-    except Exception:
-        pass
+        with _conn() as con:
+            con.execute("""
+                INSERT INTO user_pinned (cat,title,reason,pinned_at) VALUES (?,?,?,?)
+                ON CONFLICT(cat,title) DO UPDATE SET
+                  reason=excluded.reason, pinned_at=excluded.pinned_at
+                WHERE user_pinned.reason IN ('preheated','manual_add','played')
+                   OR excluded.reason NOT IN ('preheated','manual_add','played')
+            """, (cat or "",clean_title,reason,now()))
+    except Exception as exc:
+        _log.error("state write failed: pin_item (%s)", type(exc).__name__)
+        raise
 
 
 def is_pinned(title, cat=""):
@@ -737,10 +805,14 @@ def is_pinned(title, cat=""):
                 (title, clean_title)
             ).fetchone()
         return bool(row)
-    except Exception:
-        return False
+    except Exception as exc:
+        _log.error("protection query failed: is_pinned (%s)", type(exc).__name__)
+        raise
 
 
 def get_all_pinned_titles():
-    """Protection is safety-critical: database errors must propagate."""
-    return {r['title'].strip() for r in _conn().execute('SELECT title FROM user_pinned') if r['title']}
+    """Return explicit pins only; automatic/legacy reasons do not block retention."""
+    rows = _conn().execute(
+        "SELECT title FROM user_pinned WHERE COALESCE(reason,'') NOT IN ('preheated','manual_add','played')"
+    )
+    return {r['title'].strip() for r in rows if r['title']}

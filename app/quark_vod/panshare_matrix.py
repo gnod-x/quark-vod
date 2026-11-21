@@ -22,6 +22,8 @@ SEARCH_CACHE_DIR = os.path.join(config.DATA_DIR, "search_cache")
 _CACHE_MAGIC = 4
 _mem_cache = {}
 _cache_lock = threading.RLock()
+_cache_sweep_at = 0.0
+CACHE_SWEEP_INTERVAL = 60
 _search_slots = threading.BoundedSemaphore(2)
 _http_slots = threading.BoundedSemaphore(12)
 
@@ -113,13 +115,40 @@ def _cache_get(key):
                 with open(_cache_path(key),encoding='utf-8') as f:blob=json.load(f)
             except (OSError,ValueError):return None
         if blob.get('magic')!=_CACHE_MAGIC or blob.get('expire',0)<=time.time():
-            _mem_cache.pop(key,None);return None
+            _mem_cache.pop(key,None)
+            try:os.unlink(_cache_path(key))
+            except OSError:pass
+            return None
         _mem_cache[key]=blob
         while len(_mem_cache)>128:_mem_cache.pop(next(iter(_mem_cache)))
         return blob['payload']
 
 
+def _expire_disk_cache():
+    """Remove only our regular cache files after their maximum possible TTL."""
+    global _cache_sweep_at
+    with _cache_lock:
+        now = time.monotonic()
+        if now < _cache_sweep_at:
+            return
+        _cache_sweep_at = now + CACHE_SWEEP_INTERVAL
+        cutoff = time.time() - SEARCH_CACHE_TTL
+        try:
+            with os.scandir(SEARCH_CACHE_DIR) as entries:
+                for entry in entries:
+                    if not re.fullmatch(r"ps4_[0-9a-f]{32}\.json", entry.name):
+                        continue
+                    try:
+                        if entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime <= cutoff:
+                            os.unlink(entry.path)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+
 def _cache_put(key,payload):
+    _expire_disk_cache()
     # Partial/outage results expire quickly; never hide failures for 30 minutes.
     ttl=SEARCH_CACHE_TTL if payload['items'] and not payload['partial'] else 45
     blob={'magic':_CACHE_MAGIC,'expire':time.time()+ttl,'payload':payload}

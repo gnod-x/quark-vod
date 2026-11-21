@@ -273,6 +273,20 @@ class PlaybackTests(unittest.TestCase):
         with patch.object(coordination.os.path,'isfile',return_value=True),patch.object(config,'get_jellyfin2_key',return_value='synthetic'),patch.object(urllib.request,'urlopen',side_effect=OSError('offline')):
             with self.assertRaises(coordination.Busy):coordination.ensure_idle()
 
+    def test_readiness_probe_uses_configured_download_transport(self):
+        import io
+        self.stack[0].stop()  # setUp normally stubs this resolver for playback tests
+        try:
+            response = io.BytesIO(b"synthetic media")
+            response.status = 206
+            response.headers = {"Content-Type": "video/mp4"}
+            url = config.OPENLIST_PUBLIC + "/d/fixture.mkv"
+            with patch.object(server.download_http, "urlopen", return_value=response) as opened:
+                self.assertTrue(server._wait_direct_url_ready(url, max_wait=0.1))
+            opened.assert_called_once()
+        finally:
+            self.stack[0].start()
+
     def test_maintenance_stops_when_jellyfin_database_is_missing(self):
         import urllib.request
         with patch.object(config, 'JELLYFIN2_DB', str(Path(TMP.name)/'missing.db')), \

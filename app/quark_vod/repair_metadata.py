@@ -16,12 +16,22 @@ import sys
 import json
 import sqlite3
 import subprocess
-import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quark_vod import config
+from quark_vod import config, strm_manager
 from quark_vod.openlist_client import OpenListClient
+
+
+def live_refresh_parent(content):
+    """Return the OpenList playback parent for a recognized active STRM URL."""
+    if not strm_manager.is_live(content):
+        return None
+    remote = strm_manager.parse_live_remote_path(content)
+    if not remote:
+        return None
+    return os.path.dirname(config.play_path(remote))
+
 
 def jellyfin_library_path(path):
     """Map a local library member to the explicitly configured Jellyfin root."""
@@ -49,7 +59,7 @@ def main():
                 try:
                     with open(strm_path, "r", encoding="utf-8", errors="ignore") as fp:
                         content = fp.read().strip()
-                        if content.startswith("http") and not content.startswith(f"{config.PENDING_BASE_URL}/pending"):
+                        if strm_manager.is_live(content):
                             live_strms.append((strm_path, content))
                 except Exception:
                     pass
@@ -66,14 +76,10 @@ def main():
         for strm_path, url in live_strms:
             # 1. 刷新 OpenList 目录缓存
             try:
-                parsed = urllib.parse.urlparse(url)
-                remote = urllib.parse.unquote(parsed.path)
-                if remote.startswith("/d/"):
-                    play_remote = remote[len("/d"):]
-                    parent_dir = play_remote.rsplit("/", 1)[0]
-                    if parent_dir not in refreshed_dirs and ol:
-                        ol.refresh_path_tree(parent_dir)
-                        refreshed_dirs.add(parent_dir)
+                parent_dir = live_refresh_parent(url)
+                if parent_dir and parent_dir not in refreshed_dirs and ol:
+                    ol.refresh_path_tree(parent_dir)
+                    refreshed_dirs.add(parent_dir)
             except Exception:
                 pass
 

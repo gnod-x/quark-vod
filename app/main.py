@@ -30,16 +30,23 @@ from quark_vod import download_http
 
 class MediaResponse(StreamingResponse):
     """Release capacity even when send(), the client or the iterator fails."""
-    def __init__(self,chunks,**kwargs):
+    def __init__(self,chunks,close_stream=None,**kwargs):
         super().__init__(chunks,**kwargs)
         self.chunks=chunks
+        self.close_stream=close_stream
 
     async def __call__(self,scope,receive,send):
         try:
             await super().__call__(scope,receive,send)
         finally:
-            try:self.chunks.close()
-            finally:media_cache.stream_slots.release()
+            try:
+                try:
+                    self.chunks.close()
+                finally:
+                    if self.close_stream:
+                        self.close_stream()
+            finally:
+                media_cache.stream_slots.release()
 
 
 class DummyHandler:
@@ -162,7 +169,7 @@ async def maintenance_busy(request, exc):
 
 @app.get("/health", tags=["Core VOD"])
 @app.head("/health", tags=["Core VOD"])
-def health(request: Request):
+async def health(request: Request):
     if request.method == "HEAD":
         return Response(status_code=200, media_type="application/json")
     return {"status": "ok", "service": config.SERVICE_NAME, "engine": "fastapi-v3", "version": __version__}
@@ -191,7 +198,7 @@ def capability(request: Request):
         "openlist_write": checked.get("openlist_write"),
         "openlist_reason": checked.get("openlist_reason", "尚未执行连接验证"),
         "panshare_ready": bool(registry.get("enabled_count")),
-        "ready": bool(checked.get("ready")),
+        "ready": bool(checked.get("ready") and registry.get("enabled_count")),
         "probe_time": checked.get("probe_time"),
         "plugins": registry,
     }
@@ -208,6 +215,7 @@ def _probe_capability():
     tr_probe = legacy_srv.get_transfer() or QuarkTransfer(None)
     cookie_alive, cookie_status = tr_probe.check_cookie_alive()
     cur_cookie = config.get_quark_cookie()
+    registry = search_plugins.get_registry().status()
     result = {
         "cookie_ready": bool(cur_cookie),
         "cookie_alive": cookie_alive,
@@ -215,8 +223,8 @@ def _probe_capability():
         "cookie_hint": config.redact_cookie(cur_cookie),
         "openlist_write": write_ok,
         "openlist_reason": write_reason,
-        "panshare_ready": True,
-        "ready": bool(cookie_alive and write_ok),
+        "panshare_ready": bool(registry.get("enabled_count")),
+        "ready": bool(cookie_alive and write_ok and registry.get("enabled_count")),
         "probe_time": int(time.time()),
     }
     app.state.capability_probe = result
@@ -341,19 +349,30 @@ def clean_stream(
         return JSONResponse(status_code=400, content={"error": "missing url"})
     if not media_url_allowed(url):
         return JSONResponse(status_code=403, content={"error": "media_origin_not_allowed"})
+    if not media_cache.stream_slots.acquire(timeout=10):
+        return Response(status_code=503, headers={"Retry-After": "2"})
+    stream = None
+    handed_off = False
     try:
         stream = cleaner.open_clean_stream(url, skip, request.headers.get("range", ""), request.headers,
                                           opener=download_http.urlopen)
         if request.method == "HEAD":
-            stream.close()
             return Response(status_code=stream.status, headers=stream.headers)
-        from starlette.background import BackgroundTask
-        return StreamingResponse(stream.chunks(), status_code=stream.status,
-                                 headers=stream.headers, background=BackgroundTask(stream.close))
+        response = MediaResponse(stream.chunks(), close_stream=stream.close,
+                                 status_code=stream.status, headers=stream.headers)
+        handed_off = True
+        return response
     except cleaner.CleanStreamError as exc:
         return JSONResponse(status_code=exc.status, content={"error": str(exc)}, headers=exc.headers)
     except Exception as exc:
         return JSONResponse(status_code=502, content={"error": "clean proxy stream error", "type": type(exc).__name__})
+    finally:
+        if not handed_off:
+            try:
+                if stream is not None:
+                    stream.close()
+            finally:
+                media_cache.stream_slots.release()
 
 
 # ==============================================================================
@@ -427,6 +446,7 @@ def admin_overview():
         "strm_summary": {"registered": total_strm_map, "active_done": live_strm_count},
         "recent_transfers": recent_transfers,
         "recent_plays": recent_plays,
+        "playback_metric": "access_sessions",
         "server_time": int(time.time()),
     }
 
@@ -534,13 +554,20 @@ def admin_check_quota():
 @app.delete("/api/admin/transfer/{transfer_id}", tags=["Whitebox Admin"])
 @coordination.maintenance
 def admin_reset_transfer(transfer_id: int):
-    """重置单条转存记录（将 strm 还原为 pending 并将 DB 状态标为 cleaned，方便重新选源转存）。"""
+    """重置可确认的记录；未决保存意图必须先核对，避免重复提交。"""
     con = db._conn()
     row = con.execute(
-        "SELECT id, cat, title, season, episode, remote_path FROM transfers WHERE id=?", (transfer_id,)
+        "SELECT id, cat, title, season, episode, remote_path, status, "
+        "save_target, save_task_id, save_started_at, save_file_fid FROM transfers WHERE id=?", (transfer_id,)
     ).fetchone()
     if not row:
         return JSONResponse(status_code=404, content={"error": "记录不存在"})
+    if (row["status"] == "saving" or row["save_target"] or row["save_task_id"]
+            or row["save_started_at"] or row["save_file_fid"]):
+        return JSONResponse(status_code=409, content={
+            "error": "原转存意图结果未知，已保留原任务和播放入口；请先通过原转存流程恢复并确认终态，待保存意图清除后再重置",
+            "code": "save_intent_unconfirmed",
+        })
     cat, title, s, e = row["cat"], row["title"], row["season"], row["episode"]
     sp = db.get_strm_path(cat, title, s, e)
     restored = False
@@ -552,9 +579,10 @@ def admin_reset_transfer(transfer_id: int):
         except Exception as exc:
             return JSONResponse(status_code=409, content={"error": "STRM 还原失败，数据库未修改", "type": type(exc).__name__})
     con.execute(
-        "UPDATE transfers SET status='cleaned', remote_path=NULL, error='[管理台手动重置]', updated_at=? WHERE id=?",
+        "UPDATE transfers SET status='cleaned', remote_path=NULL, save_target=NULL, "
+        "save_task_id=NULL, save_started_at=NULL, save_file_fid=NULL, error='[管理台手动重置]', updated_at=? WHERE id=?",
         (int(time.time()), transfer_id),
     )
     con.commit()
-    # 清除负缓存
+    legacy_srv.invalidate_transfer_cache(transfer_id)
     return {"ok": True, "id": transfer_id, "strm_restored": restored}

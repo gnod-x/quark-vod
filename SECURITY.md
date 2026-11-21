@@ -106,6 +106,13 @@ before changing anything. The OpenList remove call delegates deletion semantics
 to that backend; Quark-VOD does not assume that a removed object is recoverable
 or placed in a recycle bin.
 
+Quota eviction treats favorites, unfinished Jellyfin playback, explicit user
+pins, and playback during the last six hours as protected. Completed watch
+history and automatic preheat/import/playback markers do not create permanent
+exemptions. Eligible items are evicted least-recently-used first from
+`playback_access`, with legacy `plays` timestamps as a fallback; items with no
+access history come first, and larger items break timestamp ties.
+
 ## Secret storage
 
 Prefer private environment files or explicitly mounted secret files. Keep those
