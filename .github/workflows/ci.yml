@@ -32,7 +32,19 @@ jobs:
           tar -xzf dist/*.tar.gz -C "$scratch"
           cd "$scratch"/quark_vod-*
           test ! -e Makefile.homelab
-          make test
+          if make test > "$scratch/regression.log" 2>&1; then
+            cat "$scratch/regression.log"
+          else
+            cat "$scratch/regression.log"
+            python - "$scratch/regression.log" <<'PY'
+          import pathlib, sys
+          # Annotations remain available through the public checks API when raw logs need login.
+          message = pathlib.Path(sys.argv[1]).read_text(errors="replace")[-12000:]
+          message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print("::error title=Source distribution regression failure::" + message)
+          PY
+            exit 1
+          fi
       - name: Start both installed distributions outside the source tree
         run: |
           artifacts=("$PWD"/dist/*.whl "$PWD"/dist/*.tar.gz)
