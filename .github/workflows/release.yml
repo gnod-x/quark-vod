@@ -69,7 +69,12 @@ jobs:
         run: |
           cd dist
           sha256sum "quark_vod-$VERSION-py3-none-any.whl" "quark_vod-$VERSION.tar.gz" > SHA256SUMS
+          release_flags=()
+          if [[ "$VERSION" =~ (a|b|rc)[0-9]+$ ]]; then
+            release_flags+=(--prerelease)
+          fi
           gh release create "$GITHUB_REF_NAME" \
             "quark_vod-$VERSION-py3-none-any.whl" "quark_vod-$VERSION.tar.gz" SHA256SUMS \
             --verify-tag --title "Quark-VOD $VERSION" \
+            "${release_flags[@]}" \
             --notes-file "../docs/releases/$VERSION.md"

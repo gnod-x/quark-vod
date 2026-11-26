@@ -57,7 +57,10 @@ with sync_playwright() as p:
                 if data is not None:return r.fulfill(json=data)
             raise AssertionError('unexpected route '+path)
         page.route('**/*',route)
-        page.goto('http://quark.test/services/vod/admin');page.locator('#token').fill(TOKEN);page.locator('#connect button').click();page.locator('#workspace').wait_for(state='visible')
+        page.goto('http://quark.test/services/vod/admin#cinema');page.locator('#token').fill(TOKEN);page.locator('#connect button').click();page.locator('#workspace').wait_for(state='visible')
+        assert page.locator('#tab-cinema').get_attribute('aria-selected')=='true'
+        assert page.locator('#panel-cinema').is_visible()
+        assert TOKEN not in page.url
         page.locator('#tab-automation').click();page.wait_for_function("document.querySelector('#automationFields').disabled===false")
         assert not page.locator('#schedulerEnabled').is_checked()
         assert page.locator('#automationPrimary').input_value()==''

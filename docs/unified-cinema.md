@@ -68,3 +68,11 @@ The packaged UI accepts a reverse-proxy root prefix. The Jellyfin deep link is
 shown only with explicit `VOD_JELLYFIN_PUBLIC_URL`. It must be reachable by the
 actual client. Health, configuration and fixture success do not prove playback
 or access from the user's device.
+
+## Direct management links
+
+Use `/admin#cinema` or `/admin#automation` (with an existing reverse-proxy prefix
+when applicable) to select a management tab after authentication. Only fixed
+tab names are accepted. Enter the Bearer token on the page: the token stays in
+page memory and must never be included in a link, browser storage or iframe
+message. Changing the tab fragment does not authenticate the session.
