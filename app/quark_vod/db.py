@@ -8,6 +8,7 @@
 """
 
 import os
+import json
 import logging
 import sqlite3
 import threading
@@ -15,7 +16,7 @@ import time
 
 from . import config
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _BUSY_TIMEOUT = 30
 _local = threading.local()
 _log = logging.getLogger(__name__)
@@ -181,23 +182,28 @@ _REQUIRED_COLUMNS = {
     "transfers": {
         "id", "cat", "title", "season", "episode", "share_url", "share_pwd", "pan_type",
         "status", "error", "remote_path", "file_size", "created_at", "updated_at", "save_task_id",
-        "save_target", "save_started_at", "save_file_fid",
+        "save_target", "save_started_at", "save_file_fid", "variant",
     },
-    "strm_map": {"cat", "title", "season", "episode", "strm_path"},
+    "strm_map": {"cat", "title", "season", "episode", "strm_path", "variant"},
     "plays": {"id", "cat", "title", "season", "episode", "transfer_id", "played_at", "finished"},
     "playback_access": {"transfer_id", "accessed_at"},
     "cleanup_queue": {"id", "transfer_id", "remote_path", "due_at", "cleaned"},
     "dead_sources": {"source_url", "source_type", "reason", "created_at", "expires_at"},
     "source_audits": {
         "id", "cat", "title", "season", "episode", "has_quark_source", "is_4k", "best_share_url",
-        "best_share_title", "checked_at", "check_status",
+        "best_share_title", "checked_at", "check_status", "variant",
     },
     "user_pinned": {"id", "cat", "title", "reason", "pinned_at"},
     "name_parse_cache": {"cache_key", "file_name", "season", "episode", "confidence", "origin", "created_at"},
+    "staging_media": {"tmdb_id","cat","title","year","media_type","retry_count","next_check_at","status","metadata_json","created_at","updated_at"},
+    "airing_calendar": {"tmdb_id","cat","title","season","next_air_date","typical_air_hour","is_user_watching","metadata_json","updated_at"},
+    "notification_events": {"fingerprint","event","level","created_at","delivered_at"},
+    "wishlist_ingest": {"source","entry_key","status","metadata_json","updated_at"},
+    "replacement_commits": {"candidate_id", "old_transfer_id", "committed_at"},
 }
 _PRIMARY_KEYS = {
     "transfers": ("id",),
-    "strm_map": ("cat", "title", "season", "episode"),
+    "strm_map": ("cat", "title", "season", "episode", "variant"),
     "plays": ("id",),
     "playback_access": ("transfer_id",),
     "cleanup_queue": ("id",),
@@ -205,9 +211,14 @@ _PRIMARY_KEYS = {
     "source_audits": ("id",),
     "user_pinned": ("id",),
     "name_parse_cache": ("cache_key",),
+    "staging_media": ("tmdb_id","media_type"),
+    "airing_calendar": ("tmdb_id","season"),
+    "notification_events": ("fingerprint",),
+    "wishlist_ingest": ("source","entry_key"),
+    "replacement_commits": ("candidate_id",),
 }
 _UNIQUE_KEYS = {
-    "source_audits": ("cat", "title", "season", "episode"),
+    "source_audits": ("cat", "title", "season", "episode", "variant"),
     "user_pinned": ("cat", "title"),
 }
 
@@ -265,7 +276,27 @@ def _migration_2(con):
         con.execute("ALTER TABLE transfers ADD COLUMN save_file_fid TEXT")
 
 
-_MIGRATIONS = {1: _migration_1, 2: _migration_2}
+def _migration_3(con):
+    for table in ("transfers", "source_audits"):
+        con.execute(f"ALTER TABLE {table} ADD COLUMN variant TEXT NOT NULL DEFAULT ''")
+    con.execute("ALTER TABLE strm_map RENAME TO strm_map_v2")
+    con.execute("CREATE TABLE strm_map(cat TEXT NOT NULL,title TEXT NOT NULL,season INTEGER NOT NULL DEFAULT 0,episode INTEGER NOT NULL DEFAULT 0,variant TEXT NOT NULL DEFAULT '',strm_path TEXT NOT NULL,PRIMARY KEY(cat,title,season,episode,variant))")
+    con.execute("INSERT INTO strm_map(cat,title,season,episode,strm_path) SELECT cat,title,season,episode,strm_path FROM strm_map_v2")
+    con.execute("DROP TABLE strm_map_v2")
+    con.execute("DROP INDEX idx_source_audits_item")
+    con.execute("CREATE UNIQUE INDEX idx_source_audits_item ON source_audits(cat,title,season,episode,variant)")
+    con.execute("CREATE INDEX idx_strm_map_se_title ON strm_map(season,episode,title)")
+    con.execute("CREATE INDEX idx_transfers_status_lookup ON transfers(cat,season,episode,status)")
+    con.execute("CREATE TABLE staging_media(tmdb_id INTEGER NOT NULL,cat TEXT NOT NULL,title TEXT NOT NULL,year TEXT NOT NULL DEFAULT '',media_type TEXT NOT NULL,popularity REAL NOT NULL DEFAULT 0,release_date TEXT NOT NULL DEFAULT '',retry_count INTEGER NOT NULL DEFAULT 0,next_check_at INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'pending',metadata_json TEXT NOT NULL DEFAULT '{}',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(tmdb_id,media_type))")
+    con.execute("CREATE INDEX idx_staging_due ON staging_media(status,next_check_at)")
+    con.execute("CREATE TABLE airing_calendar(tmdb_id INTEGER NOT NULL,cat TEXT NOT NULL,title TEXT NOT NULL,season INTEGER NOT NULL,next_air_date TEXT NOT NULL DEFAULT '',typical_air_hour INTEGER NOT NULL DEFAULT 18,is_user_watching INTEGER NOT NULL DEFAULT 0,metadata_json TEXT NOT NULL DEFAULT '{}',updated_at INTEGER NOT NULL,PRIMARY KEY(tmdb_id,season))")
+    con.execute("CREATE INDEX idx_airing_due ON airing_calendar(next_air_date)")
+    con.execute("CREATE TABLE notification_events(fingerprint TEXT PRIMARY KEY,event TEXT NOT NULL,level TEXT NOT NULL,created_at INTEGER NOT NULL,delivered_at INTEGER)")
+    con.execute("CREATE TABLE wishlist_ingest(source TEXT NOT NULL,entry_key TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',metadata_json TEXT NOT NULL DEFAULT '{}',updated_at INTEGER NOT NULL,PRIMARY KEY(source,entry_key))")
+    con.execute("CREATE TABLE replacement_commits(candidate_id INTEGER PRIMARY KEY,old_transfer_id INTEGER,committed_at INTEGER NOT NULL)")
+
+
+_MIGRATIONS = {1: _migration_1, 2: _migration_2, 3: _migration_3}
 
 
 def _read_version(con):
@@ -353,17 +384,17 @@ def close():
 
 
 def save_source_audit(cat, title, season, episode, has_quark_source, is_4k,
-                      best_share_url="", best_share_title="", check_status="unknown"):
+                      best_share_url="", best_share_title="", check_status="unknown", *, variant=""):
     """保存或更新片源预检审计结果。"""
     now_ts = now()
     con = _conn()
     try:
         con.execute("""
             INSERT OR REPLACE INTO source_audits
-            (cat, title, season, episode, has_quark_source, is_4k, best_share_url, best_share_title, checked_at, check_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (cat, title, season, episode, has_quark_source, is_4k, best_share_url, best_share_title, checked_at, check_status, variant)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (cat, title, season, episode, int(has_quark_source), int(is_4k),
-              best_share_url, best_share_title, now_ts, check_status))
+              best_share_url, best_share_title, now_ts, check_status, validate_variant(variant)))
         con.commit()
     except Exception as exc:
         con.rollback()
@@ -371,26 +402,26 @@ def save_source_audit(cat, title, season, episode, has_quark_source, is_4k,
         raise
 
 
-def get_source_audit(cat, title, season=0, episode=0):
+def get_source_audit(cat, title, season=0, episode=0, *, variant=""):
     """获取指定条目的最新片源预检记录。"""
     try:
         return _conn().execute("""
             SELECT * FROM source_audits
-            WHERE cat=? AND title=? AND season=? AND episode=?
+            WHERE cat=? AND title=? AND season=? AND episode=? AND variant=?
             LIMIT 1
-        """, (cat, title, season, episode)).fetchone()
+        """, (cat, title, season, episode, validate_variant(variant))).fetchone()
     except Exception:
         return None
 
 
-def get_locked_4k_share(cat, title, season=0, episode=0):
+def get_locked_4k_share(cat, title, season=0, episode=0, *, variant=""):
     """提取经预检验证存活且为 4K 的锁定夸克分享源。
 
     2026-11-08：追加 check_status 过滤。旧实现只看 has_quark_source 与
     best_share_url，审计已判 dead / 空心分享并作废后若仍有残留字段，
     仍会把它当成最高优先级片源调取，导致播放/预热永远死在这条源上。
     """
-    row = get_source_audit(cat, title, season, episode)
+    row = get_source_audit(cat, title, season, episode, variant=variant)
     if row and row["has_quark_source"] and row["best_share_url"]:
         if str(row["check_status"] or "").lower() in ("dead", "not_found", "invalid", "expired"):
             return None, False, ""
@@ -447,6 +478,7 @@ def mark_dead_source(source_url, source_type="panshare", reason="", ban_days=7):
     """记录死链/失效分享源，进行秒级熔断。"""
     if not source_url:
         return
+    source_url = _canonical_source(source_url)
     now_ts = now()
     exp_ts = now_ts + ban_days * 86400
     con = _conn()
@@ -467,6 +499,7 @@ def is_dead_source(source_url):
     """检查链接是否处于熔断黑名单中（未过期算死链）。"""
     if not source_url:
         return False
+    source_url = _canonical_source(source_url)
     now_ts = now()
     try:
         r = _conn().execute(
@@ -502,7 +535,7 @@ def now():
 
 
 # ── transfers ─────────────────────────────────────────
-def upsert_transfer(cat, title, season, episode, *, _cleanup_due_at=None, **fields):
+def upsert_transfer(cat, title, season, episode, *, _cleanup_due_at=None, _transfer_id=None, variant="", **fields):
     """按 (cat,title,season,episode) 定位；不存在则插入。
 
     2026-10-25：入口统一清洗 cat/title 中的零宽字符与不可见控制符。
@@ -516,28 +549,36 @@ def upsert_transfer(cat, title, season, episode, *, _cleanup_due_at=None, **fiel
         title = strip_invisible(title) or title
     except Exception:
         pass
+    variant = validate_variant(variant)
     con = _conn()
     allowed = {'status', 'share_url', 'share_pwd', 'pan_type', 'error', 'remote_path', 'file_size', 'save_task_id', 'save_target', 'save_started_at', 'save_file_fid'}
     if not fields.keys() <= allowed:
         raise ValueError('invalid transfer fields')
-    if _cleanup_due_at is not None and (fields.get("status") != "done" or not fields.get("remote_path")):
+    if _cleanup_due_at is not None and ((fields.get("status") != "done" and not (_transfer_id is not None and fields.get("status") == "found")) or not fields.get("remote_path")):
         raise ValueError("cleanup scheduling requires a completed transfer and exact path")
     # Serialize SELECT+INSERT across threads and host cron processes.
     # Historical duplicates keep their queue/play references.
     con.execute("BEGIN IMMEDIATE")
     try:
-        row = con.execute(
-            "SELECT id FROM transfers WHERE cat=? AND title=? AND season=? AND episode=? "
-            "ORDER BY updated_at DESC,id DESC LIMIT 1",
-            (cat, title, season, episode)).fetchone()
+        if _transfer_id is not None:
+            row = con.execute(
+                "SELECT id FROM transfers WHERE id=? AND cat=? AND title=? AND season=? AND episode=? AND variant=?",
+                (_transfer_id, cat, title, season, episode, variant)).fetchone()
+            if row is None:
+                raise ValueError("transfer id does not match the requested work")
+        else:
+            row = con.execute(
+                "SELECT id FROM transfers WHERE cat=? AND title=? AND season=? AND episode=? AND variant=? "
+                "ORDER BY updated_at DESC,id DESC LIMIT 1",
+                (cat, title, season, episode, variant)).fetchone()
         if row:
             sets = [f"{k}=?" for k in fields] + ['updated_at=?']
             con.execute(f"UPDATE transfers SET {', '.join(sets)} WHERE id=?",
                         (*fields.values(), now(), row['id']))
             tid = row['id']
         else:
-            cols = ['cat', 'title', 'season', 'episode', 'created_at', 'updated_at', *fields.keys()]
-            vals = [cat, title, season, episode, now(), now(), *fields.values()]
+            cols = ['cat', 'title', 'season', 'episode', 'variant', 'created_at', 'updated_at', *fields.keys()]
+            vals = [cat, title, season, episode, variant, now(), now(), *fields.values()]
             cur = con.execute(f"INSERT INTO transfers ({','.join(cols)}) VALUES ({','.join('?' for _ in vals)})", vals)
             tid = cur.lastrowid
         if _cleanup_due_at is not None:
@@ -550,20 +591,39 @@ def upsert_transfer(cat, title, season, episode, *, _cleanup_due_at=None, **fiel
         raise
 
 
-def complete_transfer(cat, title, season, episode, remote_path, file_size, due_at):
+def create_transfer(cat, title, season, episode, *, variant="", share_url="", share_pwd="", status="pending"):
+    """Create a distinct transfer row for a staged operation such as source replacement."""
+    from .search import strip_invisible
+    cat = strip_invisible(cat) or cat
+    title = strip_invisible(title) or title
+    variant = validate_variant(variant)
+    if status not in ("pending", "searching", "saving"):
+        raise ValueError("invalid initial transfer status")
+    timestamp = now()
+    con = _conn()
+    with con:
+        cur = con.execute(
+            "INSERT INTO transfers (cat,title,season,episode,variant,share_url,share_pwd,pan_type,status,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (cat,title,season,episode,variant,share_url,share_pwd,"quark",status,timestamp,timestamp))
+    return cur.lastrowid
+
+
+def complete_transfer(cat, title, season, episode, remote_path, file_size, due_at, *, variant="", _transfer_id=None, _staged=False):
     """Atomically finish a confirmed save and record its expiry work."""
     return upsert_transfer(
-        cat, title, season, episode, status="done", remote_path=remote_path,
+        cat, title, season, episode, status="found" if _staged else "done", remote_path=remote_path,
         file_size=file_size, error=None, save_target=None, save_task_id=None,
         save_started_at=None, save_file_fid=None, _cleanup_due_at=due_at,
+        _transfer_id=_transfer_id, variant=variant,
     )
 
 
-def get_transfer(cat, title, season, episode):
+def get_transfer(cat, title, season, episode, *, variant=""):
     return _conn().execute(
-        "SELECT * FROM transfers WHERE cat=? AND title=? AND season=? AND episode=? "
+        "SELECT * FROM transfers WHERE cat=? AND title=? AND season=? AND episode=? AND variant=? "
         "ORDER BY updated_at DESC,id DESC LIMIT 1",
-        (cat, title, season, episode)).fetchone()
+        (cat, title, season, episode, validate_variant(variant))).fetchone()
 
 
 def get_transfer_by_id(tid):
@@ -581,14 +641,14 @@ def list_transfers(status=None, limit=200):
     return _conn().execute(q, args).fetchall()
 
 
-def library_title(cat, title, season, episode):
+def library_title(cat, title, season, episode, *, variant=""):
     """Recover a legacy row's missing year using its unique on-disk mapping."""
     from .identity import split_title
     if split_title(title)[1]:
         return title
     rows = _conn().execute(
-        'SELECT strm_path FROM strm_map WHERE cat=? AND title=? AND season=? AND episode=?',
-        (cat, title, season, episode)).fetchall()
+        'SELECT strm_path FROM strm_map WHERE cat=? AND title=? AND season=? AND episode=? AND variant=?',
+        (cat, title, season, episode, validate_variant(variant))).fetchall()
     names = set()
     for row in rows:
         path = os.path.abspath(row['strm_path'])
@@ -601,16 +661,16 @@ def library_title(cat, title, season, episode):
     return next(iter(names)) if len(names) == 1 else title
 
 
-def find_done_transfer(cat, title, season, episode):
+def find_done_transfer(cat, title, season, episode, *, variant=""):
     """Resolve exact work identity with one query, including legacy mapping years."""
     from .identity import same_title, media_kind, split_title
     rows = _conn().execute(
         "SELECT t.*, m.strm_path AS identity_strm_path FROM transfers t "
         "LEFT JOIN strm_map m ON m.cat=t.cat AND m.title=t.title "
-        "AND m.season=t.season AND m.episode=t.episode "
-        "WHERE t.season=? AND t.episode=? AND t.status='done' "
+        "AND m.season=t.season AND m.episode=t.episode AND m.variant=t.variant "
+        "WHERE t.season=? AND t.episode=? AND t.variant=? AND t.status='done' "
         "AND t.remote_path IS NOT NULL AND t.remote_path<>'' "
-        "ORDER BY t.updated_at DESC,t.id DESC", (season, episode)).fetchall()
+        "ORDER BY t.updated_at DESC,t.id DESC", (season, episode, validate_variant(variant))).fetchall()
     candidates = []
     root = os.path.abspath(config.CINEMA2_DIR)
     for row in rows:
@@ -663,11 +723,11 @@ def put_name_parse_cache(rows, origin="ai"):
 
 
 # ── strm_map ──────────────────────────────────────────
-def save_strm_map(cat, title, season, episode, strm_path):
+def save_strm_map(cat, title, season, episode, strm_path, *, variant=""):
     con = _conn()
     con.execute(
-        "INSERT OR REPLACE INTO strm_map (cat,title,season,episode,strm_path) VALUES (?,?,?,?,?)",
-        (cat, title, season, episode, strm_path))
+        "INSERT OR REPLACE INTO strm_map (cat,title,season,episode,strm_path,variant) VALUES (?,?,?,?,?,?)",
+        (cat, title, season, episode, strm_path, validate_variant(variant)))
     con.commit()
 
 
@@ -679,10 +739,10 @@ def remove_strm_maps_below(directory, connection=None):
         con.commit()
 
 
-def get_strm_path(cat, title, season, episode):
+def get_strm_path(cat, title, season, episode, *, variant=""):
     row = _conn().execute(
-        "SELECT strm_path FROM strm_map WHERE cat=? AND title=? AND season=? AND episode=?",
-        (cat, title, season, episode)).fetchone()
+        "SELECT strm_path FROM strm_map WHERE cat=? AND title=? AND season=? AND episode=? AND variant=?",
+        (cat, title, season, episode, validate_variant(variant))).fetchone()
     return row["strm_path"] if row else None
 
 
@@ -816,3 +876,102 @@ def get_all_pinned_titles():
         "SELECT title FROM user_pinned WHERE COALESCE(reason,'') NOT IN ('preheated','manual_add','played')"
     )
     return {r['title'].strip() for r in rows if r['title']}
+
+
+def validate_variant(variant):
+    if variant not in ("", "hdr", "sdr", "dubbed", "remux"):
+        raise ValueError("unsupported media variant")
+    return variant
+
+
+def _canonical_source(url):
+    from .panshare_matrix import canonical_share
+    return canonical_share(str(url)) or str(url).strip()
+
+
+def clear_source_audit(cat, title, season, episode, *, variant=""):
+    with _conn() as con:
+        con.execute("DELETE FROM source_audits WHERE cat=? AND title=? AND season=? AND episode=? AND variant=?",
+                    (cat,title,season,episode,validate_variant(variant)))
+
+
+def _metadata_row(row):
+    data = dict(row)
+    try:
+        data["metadata"] = json.loads(data.get("metadata_json") or "{}")
+    except (ValueError,TypeError):
+        data["metadata"] = {}
+    return data
+
+
+def upsert_staging_media(tmdb_id, cat, title, year, media_type, popularity=0, release_date="", status="pending", metadata=None, next_check_at=None):
+    if media_type not in ("tv","movie") or int(tmdb_id)<=0:
+        raise ValueError("invalid staged identity")
+    with _conn() as con:
+        con.execute("INSERT INTO staging_media(tmdb_id,cat,title,year,media_type,popularity,release_date,status,metadata_json,next_check_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(tmdb_id,media_type) DO UPDATE SET cat=excluded.cat,title=excluded.title,year=excluded.year,popularity=excluded.popularity,release_date=excluded.release_date,status=excluded.status,metadata_json=excluded.metadata_json,next_check_at=excluded.next_check_at,updated_at=excluded.updated_at",
+                    (int(tmdb_id),cat,title,str(year),media_type,popularity,release_date,status,json.dumps(metadata or {},ensure_ascii=False),now() if next_check_at is None else int(next_check_at),now(),now()))
+    return _metadata_row(_conn().execute("SELECT * FROM staging_media WHERE tmdb_id=? AND media_type=?",(tmdb_id,media_type)).fetchone())
+
+
+def list_staging_media(due_before=None, limit=100, status="pending"):
+    conditions=[]; args=[]
+    if status is not None:
+        conditions.append("status=?"); args.append(status)
+    if due_before is not None:
+        conditions.append("next_check_at<=?"); args.append(int(due_before))
+    args.append(min(1000,max(1,int(limit))))
+    query="SELECT * FROM staging_media"+(" WHERE "+" AND ".join(conditions) if conditions else "")+" ORDER BY next_check_at,popularity DESC LIMIT ?"
+    return [_metadata_row(row) for row in _conn().execute(query,args)]
+
+
+def update_staging_media(tmdb_id, media_type, **fields):
+    return _update_metadata("staging_media", {"tmdb_id":tmdb_id,"media_type":media_type},fields,
+                            {"cat","title","year","popularity","release_date","retry_count","next_check_at","status","metadata"})
+
+
+def upsert_airing_calendar(tmdb_id, cat, title, season, next_air_date, typical_air_hour=18, is_user_watching=False, metadata=None):
+    with _conn() as con:
+        con.execute("INSERT INTO airing_calendar(tmdb_id,cat,title,season,next_air_date,typical_air_hour,is_user_watching,metadata_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(tmdb_id,season) DO UPDATE SET cat=excluded.cat,title=excluded.title,next_air_date=excluded.next_air_date,typical_air_hour=excluded.typical_air_hour,is_user_watching=excluded.is_user_watching,metadata_json=excluded.metadata_json,updated_at=excluded.updated_at",
+                    (int(tmdb_id),cat,title,int(season),next_air_date,int(typical_air_hour),int(bool(is_user_watching)),json.dumps(metadata or {},ensure_ascii=False),now()))
+    return _metadata_row(_conn().execute("SELECT * FROM airing_calendar WHERE tmdb_id=? AND season=?",(tmdb_id,season)).fetchone())
+
+
+def list_airing_calendar(due_before=None, limit=100):
+    query="SELECT * FROM airing_calendar"
+    args=[]
+    if due_before is not None:
+        query+=" WHERE next_air_date<>'' AND next_air_date<=?"
+        args.append(str(due_before))
+    query+=" ORDER BY is_user_watching DESC,next_air_date LIMIT ?"
+    args.append(min(1000,max(1,int(limit))))
+    return [_metadata_row(row) for row in _conn().execute(query,args)]
+
+
+def update_airing_calendar(tmdb_id, season, **fields):
+    return _update_metadata("airing_calendar",{"tmdb_id":tmdb_id,"season":season},fields,
+                            {"cat","title","next_air_date","typical_air_hour","is_user_watching","metadata"})
+
+
+def _update_metadata(table, keys, fields, allowed):
+    if not fields or not fields.keys()<=allowed:
+        raise ValueError("invalid metadata fields")
+    values={("metadata_json" if k=="metadata" else k):(json.dumps(v,ensure_ascii=False) if k=="metadata" else v) for k,v in fields.items()}
+    values["updated_at"]=now()
+    with _conn() as con:
+        con.execute("UPDATE "+table+" SET "+",".join(k+"=?" for k in values)+" WHERE "+" AND ".join(k+"=?" for k in keys),[*values.values(),*keys.values()])
+    row=_conn().execute("SELECT * FROM "+table+" WHERE "+" AND ".join(k+"=?" for k in keys),list(keys.values())).fetchone()
+    return _metadata_row(row) if row else None
+
+
+def notification_claim(fingerprint,event,level,dedupe_seconds=21600):
+    con=_conn()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        row=con.execute("SELECT created_at FROM notification_events WHERE fingerprint=?",(fingerprint,)).fetchone()
+        if row and row["created_at"]>now()-dedupe_seconds:
+            con.rollback(); return False
+        con.execute("INSERT OR REPLACE INTO notification_events(fingerprint,event,level,created_at) VALUES(?,?,?,?)",(fingerprint,event,level,now()))
+        con.execute("DELETE FROM notification_events WHERE created_at<?",(now()-30*86400,))
+        con.commit(); return True
+    except BaseException:
+        con.rollback(); raise

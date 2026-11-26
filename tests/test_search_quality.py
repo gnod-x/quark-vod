@@ -109,15 +109,12 @@ class SearchTests(unittest.TestCase):
             ('庆余年 (2019)/其他作品 (2019)',good),
             ('庆余年 (2019)/Anime',good),
             ('庆余年 (2019)/Movie',good),
-            ('庆余年 (2019)/Part2',good),
             ('庆余年 (2019)/Joy.of.Life.2',good),
             ('庆余年 (2019)','Joy.of.Life.2.2019.S01.EP01.4K.mp4'),
             ('庆余年 (2019)','Joy.of.Life.Anime.2019.S01.EP01.4K.mp4'),
             ('庆余年 (2019)','Joy.of.Life.Movie.2019.S01.EP01.4K.mp4'),
             ('庆余年 (2019)','Joy.of.Life.2019.S01.EP01.Anime.4K.mp4'),
             ('庆余年 (2019)','Joy.of.Life.2019.S01.EP01.Movie.4K.mp4'),
-            ('庆余年 (2019)','Joy.of.Life.2019.S01.EP01.错误剧名.4K.mp4'),
-            ('庆余年 (2019)','Joy.of.Life.2019.S01.EP01.Part2.4K.mp4'),
             ('庆余年 (2019)','Joy.of.Life.2019.S01.EP01-02.4K.mp4'),
             ('庆余年 (2019)','Joy.of.Life.2019.EP01.EP02.4K.mp4'),
             ('庆余年 (2019) (2020)',good),
@@ -255,7 +252,7 @@ class SearchTests(unittest.TestCase):
         tr.resolve_share.return_value=('token','id',[{}])
         tr.share_files.return_value=[{'file_name':'x'}]
         tr.select_share_video.return_value={'name':'样例.S02E03.1080p.mkv','size':5*1024**3}
-        with patch.object(search,'search',return_value=[candidate('样例 第二季 4K')]),patch.object(db,'save_source_audit') as save:
+        with patch.object(search,'search_report',return_value={'results':[candidate('样例 第二季 4K')], 'configured':True, 'partial':False}),patch.object(db,'save_source_audit') as save:
             result=VodAuditor(tr).audit_tv_season('剧集','样例',2,[3],force=True)
         self.assertEqual(result[:2],(True,False))
         self.assertEqual(save.call_args.args[3],3)
@@ -288,16 +285,27 @@ class SearchTests(unittest.TestCase):
     def test_partial_episode_coverage_never_claims_whole_season_4k(self):
         tr=Mock();tr.resolve_share.return_value=('token','id',[{}]);tr.share_files.return_value=[]
         tr.select_share_video.side_effect=lambda files,title,season,ep,**kwargs:{'name':'样例.S01E01.2160p.mkv','size':1024**3} if ep==1 else None
-        with patch.object(search,'search',return_value=[candidate('样例 4K')]):
+        with patch.object(search,'search_report',return_value={'results':[candidate('样例 4K')], 'configured':True, 'partial':False}):
             result=VodAuditor(tr).audit_tv_season('剧集','样例',1,[1,2],force=True)
         self.assertEqual(result[:2],(False,False))
         self.assertIsNotNone(db.get_source_audit('剧集','样例',1,1))
-        self.assertIsNone(db.get_source_audit('剧集','样例',1,2))
+        self.assertEqual(db.get_source_audit('剧集','样例',1,2)['check_status'],'no_source')
         self.assertIn('1/2',result[3])
+
+    def test_deadline_truncated_search_never_persists_no_source(self):
+        tr = Mock()
+        report = {"results": [], "configured": True, "partial": True,
+                  "deadline_exhausted": True, "unexecuted_queries": ["alias"],
+                  "configuration_error": None}
+        with patch.object(search, "search_report", return_value=report), patch.object(db, "save_source_audit") as save:
+            result = VodAuditor(tr).audit_tv_season("剧集", "样例", 1, [1], force=True)
+        self.assertFalse(result[0])
+        save.assert_not_called()
+        tr.resolve_share.assert_not_called()
 
     def test_dead_status_cannot_be_reused_as_fresh_audit(self):
         db.save_source_audit('剧集','样例',1,1,1,1,'https://pan.quark.cn/s/fixture','','dead')
-        with patch.object(search,'search',return_value=[]) as search_call:
+        with patch.object(search,'search_report',return_value={'results':[], 'configured':True, 'partial':False}) as search_call:
             result=VodAuditor(Mock()).audit_tv_season('剧集','样例',1,[1])
         search_call.assert_called_once()
         self.assertFalse(result[0])

@@ -358,3 +358,18 @@ def ensure_dirs():
 
 def redact_cookie(cookie):
     return "(已配置)" if cookie else "(未配置)"
+
+# Optional read-only scout accounts. Never discover or persist credentials implicitly.
+_raw_scouts = _secret("QUARK_SCOUT_COOKIES", "")
+try:
+    _scouts = json.loads(_raw_scouts) if _raw_scouts else []
+    if not isinstance(_scouts,list):raise ValueError()
+    QUARK_SCOUT_COOKIES = tuple(_scouts)
+except (ValueError, TypeError):
+    raise ValueError("QUARK_SCOUT_COOKIES must be a JSON array") from None
+if (len(QUARK_SCOUT_COOKIES) > 32 or
+        any(not isinstance(v,str) or not v.strip() or len(v)>65536 or "\n" in v or "\r" in v for v in QUARK_SCOUT_COOKIES)):
+    raise ValueError("QUARK_SCOUT_COOKIES must contain 1-32 nonempty cookie strings")
+QUARK_COOKIE_STATE_FILE = _path("QUARK_COOKIE_STATE_FILE", "", optional=True)
+QUARK_REQUEST_RATE = _number("QUARK_REQUEST_RATE", 3, 0.1, 20, float)
+QUARK_REQUEST_BURST = _number("QUARK_REQUEST_BURST", 5, 1, 32)

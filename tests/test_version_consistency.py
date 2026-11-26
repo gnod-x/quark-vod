@@ -43,7 +43,7 @@ class AdminPageParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
-        self._inside_footer_version = tag == "span" and attrs.get("id") == "footer-version"
+        self._inside_footer_version = tag == "span" and attrs.get("id") == "footerVersion"
         self._inside_script = tag == "script"
         self.footer_version |= self._inside_footer_version
 
@@ -78,8 +78,8 @@ class VersionConsistency(unittest.TestCase):
         self.assertEqual("".join(page.footer_text), "Quark VOD")
         self.assertNotRegex(response.text, r"Quark VOD\s+\d+\.\d+\.\d+")
         script = "\n".join(page.scripts)
-        self.assertIn("fetch('/health'", script)
-        self.assertIn("byId('footer-version').textContent='Quark VOD '+(data.version||'')", script)
+        self.assertIn("fetch(BASE+'/health'", script)
+        self.assertIn("$('footerVersion').textContent='Quark VOD '+(data.version||'')", script)
         self.assertEqual(health_version, __version__)
 
     def test_cli_uses_package_version(self):

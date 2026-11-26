@@ -18,6 +18,40 @@
       "query_param": "q",
       "enabled": false,
       "timeout": 4
+    },
+    {
+      "id": "telegram-general",
+      "name": "公开频道候选（启用前核验）",
+      "provider": "tg_web",
+      "base": "https://t.me",
+      "timeout": 3.0,
+      "enabled": false,
+      "channels": [
+        "Quark_Movies",
+        "XiangxiuNB",
+        "Aliyun_4K_Movies",
+        "alyp_1",
+        "yunpanshare",
+        "PanjClub",
+        "Quark_4K",
+        "Aliyun_4K",
+        "shareAliyun",
+        "YunPanPan",
+        "tianyirigeng",
+        "NewAliPan",
+        "ucpanpan",
+        "zaihuayun",
+        "yunpanziyuan"
+      ]
+    },
+    {
+      "id": "pansou-local",
+      "name": "PanSou sidecar",
+      "provider": "pansou",
+      "base": "http://127.0.0.1:8888",
+      "path": "/api/search",
+      "timeout": 4,
+      "enabled": false
     }
   ]
 }

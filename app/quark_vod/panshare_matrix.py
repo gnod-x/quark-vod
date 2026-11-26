@@ -1,4 +1,6 @@
 """Bounded multi-node Quark search with pagination and observable failures."""
+import atexit
+from collections import OrderedDict, deque
 import hashlib
 import html
 import json
@@ -9,23 +11,153 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import httpx
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeout
 from . import config, db
 from . import search_plugins
 
-UA = {"User-Agent": "Mozilla/5.0"}
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7"}
 # Deprecated test/embedding override; deployment sources live in VOD_SEARCH_CONFIG.
 ACTIVE_PAN_NODES = []
 
 SEARCH_CACHE_TTL = 1800
 SEARCH_CACHE_DIR = os.path.join(config.DATA_DIR, "search_cache")
-_CACHE_MAGIC = 4
-_mem_cache = {}
+_CACHE_MAGIC = 5
+_mem_cache = OrderedDict()
 _cache_lock = threading.RLock()
 _cache_sweep_at = 0.0
 CACHE_SWEEP_INTERVAL = 60
 _search_slots = threading.BoundedSemaphore(2)
-_http_slots = threading.BoundedSemaphore(12)
+_http_slots = threading.BoundedSemaphore(24)
+_task_slots = threading.BoundedSemaphore(64)
+NODE_HARD_DEADLINE = 22.0
+_clients = OrderedDict()
+_clients_lock = threading.RLock()
+_health = {}
+_health_lock = threading.RLock()
+_health_limit = 128
+CIRCUIT_FAILURES = 3
+CIRCUIT_COOLDOWN = 300.0
+
+
+class ProviderRateLimited(RuntimeError):
+    """Upstream challenge/redirect, with safe status but no upstream details."""
+    def __init__(self, message, *, http_status=0, redirect=False):
+        super().__init__(message)
+        self.http_status = http_status
+        self.redirect = redirect
+
+
+def _error_status(exc, fallback=0):
+    status = (exc.response.status_code if isinstance(exc, httpx.HTTPStatusError)
+              else getattr(exc, "http_status", fallback))
+    return max(0, min(int(status), 599))
+
+
+def _caller_budget_exhausted(node, report):
+    deadline = node.get("_request_deadline")
+    return bool(deadline is not None and time.monotonic() >= deadline-.025
+                and (report.get("errors") or report.get("partial") or report.get("truncated"))
+                and report.get("http_status", 0) < 300
+                and not report.get("rate_limited") and not report.get("redirect"))
+
+
+def _start_task(function, *args):
+    """A hung trusted plugin cannot block shutdown or create unbounded threads."""
+    if not _task_slots.acquire(blocking=False):
+        return None
+    future = Future()
+    def run():
+        try:
+            if future.set_running_or_notify_cancel():
+                try:
+                    future.set_result(function(*args))
+                except BaseException as exc:
+                    future.set_exception(exc)
+        finally:
+            _task_slots.release()
+    threading.Thread(target=run, daemon=True, name="vod-search").start()
+    return future
+
+
+def _health_key(node):
+    # Config changes must not inherit another endpoint's circuit.
+    return hashlib.sha256(json.dumps(node, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def node_health():
+    with _health_lock:
+        return [{"node": value["node"], "state": (
+                    "HALF_OPEN" if value.get("probing") else
+                    "OPEN" if value.get("opened_until", 0) > time.monotonic() else "CLOSED"),
+                 "consecutive_failures": value["failures"],
+                 "successes": value["successes"], "attempts": value["attempts"],
+                 "ewma_seconds": round(value["latency"], 3),
+                 "candidates": value["candidates"],
+                 "budget_exhaustions": value.get("budget_exhaustions", 0),
+                 "success_rate_24h": round(sum(ok for ts,ok in value["events"] if ts >= time.monotonic()-86400) / max(1,sum(ts >= time.monotonic()-86400 for ts,ok in value["events"])), 3)}
+                for value in _health.values()]
+
+
+def _admit_node(node):
+    key = _health_key(node)
+    with _health_lock:
+        state = _health.get(key)
+        if state is None:
+            if len(_health) >= _health_limit:
+                _health.pop(next(iter(_health)))
+            _health[key] = {"node": node["key"], "failures": 0, "opened_until": 0,
+                            "probing": False, "successes": 0, "attempts": 0,
+                            "latency": 0.0, "candidates": 0, "events": deque(maxlen=2048)}
+            return True
+        if state["opened_until"]:
+            if time.monotonic() < state["opened_until"] or state["probing"]:
+                return False
+            state["probing"] = True
+        return True
+
+
+def _record_node(node, report):
+    with _health_lock:
+        state = _health.get(_health_key(node))
+        if state is None:
+            return
+        # Caller cancellation/capacity says nothing about upstream health.
+        if report.get("budget_exhausted") or report.get("error_type") in ("SearchDeadline", "SearchCapacity"):
+            state["probing"] = False
+            state["budget_exhaustions"] = state.get("budget_exhaustions", 0) + 1
+            return
+        state["attempts"] += 1
+        elapsed = max(0.0, float(report.get("seconds", 0)))
+        state["latency"] = elapsed if state["attempts"] == 1 else .25*elapsed + .75*state["latency"]
+        state["candidates"] += max(0, int(report.get("candidates", 0)))
+        failed = bool(report.get("errors") or report.get("partial")) and not report.get("degraded")
+        if failed:
+            state["failures"] += 1
+            if state["failures"] >= CIRCUIT_FAILURES or state["probing"]:
+                state["opened_until"] = time.monotonic() + CIRCUIT_COOLDOWN
+        else:
+            state["successes"] += 1
+            state["failures"] = 0
+            state["opened_until"] = 0
+        state["events"].append((time.monotonic(), not failed))
+        while state["events"] and state["events"][0][0] < time.monotonic()-86400:
+            state["events"].popleft()
+        state["probing"] = False
+
+
+def _close_clients():
+    with _clients_lock:
+        clients = list(_clients.values())
+        _clients.clear()
+    for client in clients:
+        client.close()
+
+
+atexit.register(_close_clients)
+
 
 
 def canonical_share(url):
@@ -67,7 +199,7 @@ def parse_download_rows(text):
 def detail_paths(text):
     links=re.findall(r'href\s*=\s*["\']([^"\']+)["\']',text,re.I)
     return list(dict.fromkeys(html.unescape(p) for p in links
-        if re.fullmatch(r'/(?:index\.php/vod/detail/id/\d+|voddetail/\d+)\.html',p)))
+        if re.fullmatch(r'/(?:index\.php/vod/detail/id/\d+|voddetail/\d+|vod/\d+|detail/\d+|play/\d+-\d+-\d+)\.html',p)))
 
 
 def next_page(text, current, base):
@@ -120,6 +252,7 @@ def _cache_get(key):
             except OSError:pass
             return None
         _mem_cache[key]=blob
+        if hasattr(_mem_cache, 'move_to_end'):_mem_cache.move_to_end(key)
         while len(_mem_cache)>128:_mem_cache.pop(next(iter(_mem_cache)))
         return blob['payload']
 
@@ -154,6 +287,7 @@ def _cache_put(key,payload):
     blob={'magic':_CACHE_MAGIC,'expire':time.time()+ttl,'payload':payload}
     with _cache_lock:
         _mem_cache[key]=blob
+        if hasattr(_mem_cache, 'move_to_end'):_mem_cache.move_to_end(key)
         while len(_mem_cache)>128:_mem_cache.pop(next(iter(_mem_cache)))
     tmp=None
     try:
@@ -180,18 +314,57 @@ def cache_purge(keyword=None):
     return len(keys)
 
 
-def _fetch_html(url,timeout):
-    if not _http_slots.acquire(timeout=timeout):raise TimeoutError('search capacity')
+def _http_request(url, timeout, *, method="GET", json_body=None):
+    """Persistent per-origin cookie/connection pool; bounded bytes and time."""
+    origin = urllib.parse.urlsplit(url)
+    client_key = (origin.scheme, origin.netloc)
+    with _clients_lock:
+        client = _clients.get(client_key)
+        if client is None:
+            # Config has at most 32 nodes; reject excess distinct origins rather
+            # than closing a client which another request may still be using.
+            if len(_clients) >= 64:
+                raise RuntimeError("search client capacity")
+            client = httpx.Client(headers=UA, follow_redirects=False,
+                                  limits=httpx.Limits(max_connections=4, max_keepalive_connections=4),
+                                  trust_env=False)
+            _clients[client_key] = client
+    timeout = max(.01, float(timeout))
+    started = time.monotonic()
+    if not _http_slots.acquire(timeout=timeout):
+        raise TimeoutError("search capacity")
     try:
-        with urllib.request.urlopen(urllib.request.Request(url,headers=UA),timeout=timeout) as response:
-            data=response.read(2*1024*1024+1)
-            if len(data)>2*1024*1024:raise ValueError('search response too large')
-            return data.decode('utf-8','replace')
-    finally:_http_slots.release()
+        remaining = max(.01, timeout - (time.monotonic()-started))
+        with client.stream(method, url, timeout=remaining, json=json_body) as response:
+            # Reject redirects; never send cookies or requests to Location.
+            if response.status_code in (301, 302, 303, 307, 308):
+                raise ProviderRateLimited("redirect or challenge",
+                    http_status=response.status_code, redirect=True)
+            response.raise_for_status()
+            data = bytearray()
+            for chunk in response.iter_bytes():
+                data.extend(chunk)
+                if len(data) > 2*1024*1024:
+                    raise ValueError("search response too large")
+                if time.monotonic()-started > timeout:
+                    raise TimeoutError("search response deadline")
+            return bytes(data).decode("utf-8", "replace")
+    finally:
+        _http_slots.release()
+
+
+def _fetch_html(url, timeout):
+    return _http_request(url, timeout)
+
+
+def _soft_block(text):
+    return bool(re.search(r"验证码|搜索太频繁|安全验证|Just a moment|cf-browser-verification",
+                          text, re.I))
+
 
 
 def _fetch_node(node,keyword,limit,max_pages):
-    start=time.monotonic();deadline=start+22
+    start=time.monotonic();deadline=min(start+NODE_HARD_DEADLINE,node.get('_request_deadline',float('inf')))
     base=node['base'].rstrip('/')
     url=base+'/index.php/vod/search.html?wd='+urllib.parse.quote(keyword)
     report={'node':node['key'],'pages':0,'details':0,'errors':0,'truncated':False}
@@ -202,27 +375,66 @@ def _fetch_node(node,keyword,limit,max_pages):
             visited.add(url)
             text=_fetch_html(url,min(node.get('timeout', 7),max(.1,deadline-time.monotonic())))
             report['pages']+=1
+            if _soft_block(text) and not detail_paths(text):raise ProviderRateLimited('challenge')
             paths=list(dict.fromkeys(paths+detail_paths(text)))
             following=next_page(text,url,base)
             if len(paths)>=limit or time.monotonic()>=deadline:
                 report['truncated']=bool(following) or len(paths)>limit;break
             url=following
         else:report['truncated']=bool(url)
-    except Exception as exc:report['errors']+=1;report['error_type']=type(exc).__name__
+    except Exception as exc:
+        report["errors"] += 1
+        report["error_type"] = type(exc).__name__
+        report["search_failed"] = True
+        report["http_status"] = _error_status(exc, 200 if report["pages"] else 0)
+        report["redirect"] = bool(getattr(exc, "redirect", False))
+        report["rate_limited"] = report["http_status"] == 429 or isinstance(exc, ProviderRateLimited)
     def detail(path):
         if time.monotonic()>=deadline:raise TimeoutError('node deadline')
         text=_fetch_html(base+path,min(node.get('timeout', 7),max(.1,deadline-time.monotonic())))
+        if _soft_block(text) and not extract_quark_links_and_pwd(text):raise ProviderRateLimited('challenge')
         rows=parse_download_rows(text)
         if not rows:
             tm=re.search(r'<title[^>]*>(.*?)</title>',text,re.S|re.I)
             name=html.unescape(re.sub('<[^>]+>','',tm.group(1))).strip() if tm else keyword
             rows=[{'title':name,'url':url} for url in extract_quark_links_and_pwd(text)]
         return [{'source':node['key'],'name':r['title'],'share_url':r['url']} for r in rows]
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures=[pool.submit(detail,path) for path in paths[:limit]]
-        for future in as_completed(futures):
-            try:items.extend(future.result());report['details']+=1
-            except Exception as exc:report['errors']+=1;report['error_type']=type(exc).__name__
+    todo = iter(paths[:limit])
+    pending = set()
+    exhausted = False
+    while not exhausted or pending:
+        while not exhausted and len(pending) < 2 and time.monotonic() < deadline:
+            path = next(todo, None)
+            if path is None:
+                exhausted = True
+                break
+            future = _start_task(detail, path)
+            if future is None:
+                report["errors"] += 1
+            else:
+                pending.add(future)
+        if not pending or time.monotonic() >= deadline:
+            if pending or not exhausted:
+                report["errors"] += len(pending) or 1
+                report["truncated"] = True
+            break
+        done, _ = wait(pending, timeout=max(0,deadline-time.monotonic()), return_when=FIRST_COMPLETED)
+        if not done:
+            report["errors"] += len(pending)
+            report["truncated"] = True
+            break
+        for future in done:
+            pending.remove(future)
+            try:
+                items.extend(future.result())
+                report["details"] += 1
+            except Exception as exc:
+                report["errors"] += 1
+                report["error_type"] = type(exc).__name__
+                report["http_status"] = _error_status(exc, report.get("http_status", 200))
+                report["redirect"] = bool(getattr(exc, "redirect", False))
+    if report["errors"] <= 2 and report["errors"] and not report.get("search_failed") and len(items) >= 8:
+        report["degraded"] = True
     report.update(seconds=round(time.monotonic()-start,3),candidates=len(items))
     return items,report
 
@@ -246,23 +458,30 @@ def _fetch_json_node(node, keyword, limit, max_pages):
             if (not isinstance(row, dict) or not isinstance(row.get('name'), str)
                 or not row['name'].strip() or len(row['name']) > 1000
                 or not isinstance(row.get('share_url'), str)
-                or len(row['share_url']) > 4096
-                or not canonical_share(row['share_url'])):
+                or len(row['share_url']) > 4096):
                 report['errors'] += 1
+                continue
+            if not canonical_share(row['share_url']):
                 continue
             items.append({'source': node['key'], 'name': row['name'].strip(),
                           'share_url': row['share_url']})
     except Exception as exc:
         report['errors'] += 1
         report['error_type'] = type(exc).__name__
+        report["http_status"] = _error_status(exc)
+        report["redirect"] = bool(getattr(exc, "redirect", False))
+        report["rate_limited"] = report["http_status"] == 429 or isinstance(exc, ProviderRateLimited)
     report.update(seconds=round(time.monotonic()-start, 3), candidates=len(items))
     return items, report
 
 
 def _fetch_provider(node, keyword, limit, max_pages):
     provider = node.get('provider', 'html')
+    from .search_providers import fetch_tg_web, fetch_pansou
     handler = (_fetch_node if provider == 'html' else
-               _fetch_json_node if provider == 'json' else search_plugins.get_provider(provider))
+               _fetch_json_node if provider == 'json' else
+               fetch_tg_web if provider == 'tg_web' else
+               fetch_pansou if provider == 'pansou' else search_plugins.get_provider(provider))
     started = time.monotonic()
     try:
         if handler is None:
@@ -281,7 +500,7 @@ def _fetch_provider(node, keyword, limit, max_pages):
                 invalid += 1
                 continue
             normalized.append({'name': row['name'], 'share_url': row['share_url'],
-                               'source': node['key']})
+                               'source': node['key'], **({'published_at': row['published_at']} if isinstance(row.get('published_at'), str) and re.fullmatch(r'[0-9TZ:+. -]{10,40}', row['published_at']) else {})})
         # Retain diagnostic counters only. Plugins must not leak upstream URLs
         # or arbitrary error text into the public report.
         safe = {'node': node['key'], 'provider': provider,
@@ -290,16 +509,33 @@ def _fetch_provider(node, keyword, limit, max_pages):
                 'details': max(0, min(int(report.get('details', 0)), 10000)),
                 'truncated': bool(report.get('truncated')),
                 'partial': bool(report.get('partial')),
+                'degraded': bool(report.get('degraded')),
+                'rate_limited': bool(report.get('rate_limited')) or report.get('error_type') == 'ProviderRateLimited',
+                'http_status': max(0,min(int(report.get('http_status',200 if report.get('pages') else 0)),599)),
+                'redirect': bool(report.get('redirect')),
+                'http_status_counts': {str(code): max(0, min(int(count), 10000))
+                    for code, count in report.get('http_status_counts', {}).items()
+                    if str(code).isdigit() and 100 <= int(code) <= 599},
                 'seconds': round(time.monotonic()-started, 3),
                 'candidates': len(normalized)}
+        safe["budget_exhausted"] = _caller_budget_exhausted(node, safe)
+        if safe["budget_exhausted"]:
+            safe["partial"] = True
         if safe['errors']:
-            safe['error_type'] = 'ProviderError'
+            safe['error_type'] = 'SearchDeadline' if safe["budget_exhausted"] else 'ProviderError'
         return normalized, safe
-    except Exception:
-        return [], {'node': node['key'], 'provider': provider, 'pages': 0,
-                    'details': 0, 'errors': 1, 'truncated': False,
-                    'error_type': 'ProviderError', 'candidates': 0,
-                    'seconds': round(time.monotonic()-started, 3)}
+    except Exception as exc:
+        status = _error_status(exc)
+        report = {'node': node['key'], 'provider': provider, 'pages': 0,
+                  'http_status': status, 'redirect': bool(getattr(exc, 'redirect', False)),
+                  'rate_limited': status == 429 or isinstance(exc, ProviderRateLimited),
+                  'details': 0, 'errors': 1, 'truncated': False,
+                  'error_type': 'ProviderError', 'candidates': 0,
+                  'seconds': round(time.monotonic()-started, 3)}
+        report["budget_exhausted"] = _caller_budget_exhausted(node, report)
+        if report["budget_exhausted"]:
+            report.update(partial=True, error_type="SearchDeadline")
+        return [], report
 
 
 def merge_items(items):
@@ -327,27 +563,43 @@ def merge_items(items):
 class PanshareMatrix:
     @classmethod
     def search_report(cls,keyword,limit_per_node=24,max_workers=5,use_cache=True,max_pages=3,
-                      *, snapshot=None, configuration_error=None):
+                      *, snapshot=None, configuration_error=None, category=None, deadline_seconds=None,
+                      deadline_at=None, stop_when=None, reuse_partial_cache=True):
+        caller_limited = deadline_seconds is not None or deadline_at is not None
+        search_started = time.monotonic()
+        deadline_all = search_started + min(NODE_HARD_DEADLINE,
+            max(.001, deadline_seconds if deadline_seconds is not None else NODE_HARD_DEADLINE))
+        if deadline_at is not None:
+            deadline_all = min(deadline_all, deadline_at)
         keyword=' '.join((keyword or '').split())[:120]
         if snapshot is None:
             snapshot, configuration_error = source_snapshot()
-        nodes = [node.as_dict() for node in snapshot.enabled_nodes]
+        nodes = [node.as_dict() for node in snapshot.enabled_nodes
+                 if not category or not node.categories or category in node.categories]
         empty={'items':[],'nodes':[],'partial':not bool(nodes) or bool(configuration_error),
                'cached':False,'configured':bool(nodes),
                'configuration_error':configuration_error,
                'config_fingerprint':snapshot.fingerprint}
         if not keyword:return empty
         max_pages=max(1,min(int(max_pages),3));limit_per_node=max(1,min(int(limit_per_node),30))
-        key=_cache_key(keyword,max_pages,limit_per_node,snapshot.fingerprint)
+        key=_cache_key(keyword,max_pages,limit_per_node,snapshot.fingerprint + ('|category='+str(category) if category else '') +
+                       ('|budget='+str(deadline_seconds) if deadline_seconds else '') + ('|early' if stop_when else ''))
         if use_cache:
             hit=_cache_get(key)
-            if hit is not None:
+            if hit is not None and (reuse_partial_cache or not hit.get("partial")):
                 return cls._filter_dead({**hit,'cached':True,
                     'configuration_error':configuration_error,
                     'partial':bool(hit.get('partial')) or bool(configuration_error)})
         if not nodes:
             return empty
-        if not _search_slots.acquire(timeout=2):return {**empty,'partial':True,'busy':True}
+        remaining = max(0, deadline_all-time.monotonic())
+        if not _search_slots.acquire(timeout=min(2, remaining)):
+            reason = "SearchDeadline" if time.monotonic() >= deadline_all else "SearchCapacity"
+            return {**empty, 'partial': True, 'busy': True, 'nodes': [
+                {"node": node["key"], "provider": node.get("provider", "html"),
+                 "pages": 0, "details": 0, "errors": 1, "partial": True,
+                 "truncated": True, "error_type": reason, "candidates": 0,
+                 "seconds": round(time.monotonic()-search_started, 3)} for node in nodes]}
         try:
             items=[];reports=[]
             try:
@@ -357,12 +609,78 @@ class PanshareMatrix:
                         items.append({'source':'daily_hot','name':row.get('title') or row['clean_name'],'share_url':row.get('quark_url','')})
             except (OSError,ValueError,KeyError,TypeError):pass
             workers = max(1,min(int(max_workers),5,len(nodes)))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures=[pool.submit(_fetch_provider,n,keyword,limit_per_node,max_pages) for n in nodes]
-                for future in as_completed(futures):
-                    found,report=future.result();items.extend(found);reports.append(report)
+            early_stopped = False
+            queue = iter(nodes)
+            pending = {}
+            exhausted = False
+            def failure(node, reason):
+                return {"node":node["key"], "provider":node.get("provider","html"),
+                        "pages":0, "details":0, "errors":1, "partial":True,
+                        "truncated":False, "error_type":reason,
+                        "budget_exhausted":caller_limited and reason in ("ProviderTimeout", "SearchDeadline"),
+                        "seconds":round(time.monotonic()-search_started,3),
+                        "candidates":0}
+            while not exhausted or pending:
+                if time.monotonic() >= deadline_all:
+                    for future, (node, _) in pending.items():
+                        future.cancel()
+                        report = failure(node, "ProviderTimeout")
+                        reports.append(report)
+                        _record_node(node, report)
+                    pending.clear()
+                    for node in queue:
+                        reports.append(failure(node, "SearchDeadline"))
+                    break
+                while not exhausted and len(pending) < workers:
+                    node = next(queue, None)
+                    if node is None:
+                        exhausted = True
+                        break
+                    if not _admit_node(node):
+                        reports.append(failure(node, "CircuitOpen"))
+                        continue
+                    future = _start_task(_fetch_provider, {**node, '_request_deadline':deadline_all-.05,
+                        'timeout':min(node.get('timeout',4),max(.01,deadline_all-time.monotonic()-.05))}, keyword, limit_per_node, max_pages)
+                    if future is None:
+                        report = failure(node, "SearchCapacity")
+                        reports.append(report)
+                        _record_node(node, report)
+                    else:
+                        pending[future] = (node, min(deadline_all, time.monotonic()+NODE_HARD_DEADLINE))
+                if not pending:
+                    continue
+                delay = max(0, min(deadline for _,deadline in pending.values())-time.monotonic())
+                done, _ = wait(pending, timeout=delay, return_when=FIRST_COMPLETED)
+                for future in list(pending):
+                    node, deadline = pending[future]
+                    if future in done:
+                        found, report = future.result()
+                        items.extend(found)
+                    elif time.monotonic() >= deadline:
+                        future.cancel()
+                        report = failure(node, "ProviderTimeout")
+                    else:
+                        continue
+                    pending.pop(future)
+                    reports.append(report)
+                    _record_node(node, report)
+                if stop_when and stop_when(merge_items(items)):
+                    early_stopped = True
+                    for future, (node, _) in pending.items():
+                        future.cancel()
+                        reports.append({"node":node["key"], "provider":node.get("provider","html"),
+                            "errors":0, "pages":0, "details":0, "truncated":True,
+                            "partial":False, "skipped":True, "candidates":0, "seconds":0})
+                        with _health_lock:
+                            state = _health.get(_health_key(node))
+                            if state:state["probing"] = False
+                    pending.clear()
+                    break
             result={**empty,'items':merge_items(items),'nodes':sorted(reports,key=lambda n:n['node']),
-                    'partial':bool(configuration_error) or any(r['errors'] or r.get('partial') for r in reports)}
+                    'degraded_nodes':[r['node'] for r in reports if r.get('degraded')],
+                    'early_stopped':early_stopped,
+                    'partial':bool(configuration_error) or any(
+                        (r['errors'] and not r.get('degraded')) or r.get('partial') for r in reports)}
             if use_cache:_cache_put(key,result)
             return cls._filter_dead(result)
         finally:_search_slots.release()

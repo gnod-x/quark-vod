@@ -5,7 +5,8 @@
 
 - 部署者先设置 `VOD_SEARCH_CONFIG`，创建 `version: 1`、`nodes` 配置；源码 checkout
   可从 `examples/search.example.json` 复制禁用占位项。安装包不会替你提供公共搜索站。
-- 内置 `html` 和 `json` provider 只负责产生夸克分享候选。配置文件变化会自动加载，
+- 内置 `html`、`json`、`tg_web` 和 `pansou` provider 只负责产生夸克分享候选；
+  PanSou 服务须独立部署，TG 仅访问公开频道预览。配置文件变化会自动加载，
   无效替换保留上一份有效快照；没有启用节点时是未完成搜索，不是全网无资源。
 - 需要 Python provider 时，先安装带 `quark_vod.search` entry point 的可信包，再在
   `VOD_SEARCH_PLUGINS` 中显式列出名称并重启服务。JSON 配置不能上传或执行代码。

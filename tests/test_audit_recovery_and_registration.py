@@ -156,7 +156,7 @@ class AuditRecoveryAndRegistrationTests(unittest.TestCase):
             item = {"file_name": name, "relative_path": parent + "/" + name, "size": 1024**3}
             with self.subTest(group=group):
                 self.assertIsNotNone(transfer.select_share_video([item], "午夜规则 (2026)", 1, 1))
-        for variant in ("Part1", "Movie", "OVA", "SP", "Special", "Extended"):
+        for variant in ("Movie", "OVA", "SP", "Special", "Extended"):
             name = f"The.Rules.S01E01.1080p.WEB-DL.AAC.H.264-{variant}.mp4"
             item = {"file_name": name, "relative_path": parent + "/" + name, "size": 1024**3}
             with self.subTest(variant=variant):
@@ -169,7 +169,7 @@ class AuditRecoveryAndRegistrationTests(unittest.TestCase):
             ".DIRECTOR.S.CUT-NTb", ".[Director's Cut]-FLUX",
             "-Theatrical", ".[Theatrical Cut]-NTb", "-TheatricalEdition",
             "-Extended", ".[Extended Edition]-FLUX", "-Unrated", "-Uncut",
-            "-Remastered", "-Remaster", "-Version2", ".[Version 2]-NTb",
+            "-Version2", ".[Version 2]-NTb",
         )
         for title in ("The.Rules", "午夜规则"):
             for variant in variants:

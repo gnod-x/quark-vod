@@ -101,10 +101,18 @@ class UpgradeCompatibilityTests(unittest.TestCase):
     def _assert_release_rows(self, connection):
         for table, row in RELEASE_ROWS.items():
             with self.subTest(table=table):
-                columns = {column[1] for column in connection.execute(f"PRAGMA table_info({table})")}
-                expected = row + (None,) if table == "transfers" and "save_file_fid" in columns else row
-                self.assertEqual([tuple(r) for r in connection.execute(f"SELECT * FROM {table}")],
-                                 [expected])
+                columns = [column[1] for column in connection.execute(f"PRAGMA table_info({table})")]
+                # Migration may append fields or rebuild a primary key. Verify every
+                # public release column by name, independently of the physical order.
+                with closing(sqlite3.connect(":memory:")) as release:
+                    release.executescript(RELEASE_SCHEMA.read_text(encoding="utf-8"))
+                    old_columns = [column[1] for column in release.execute(f"PRAGMA table_info({table})")]
+                projection = ",".join(old_columns)
+                self.assertEqual([tuple(r) for r in connection.execute(f"SELECT {projection} FROM {table}")], [row])
+                if "variant" in columns:
+                    self.assertEqual(connection.execute(f"SELECT variant FROM {table}").fetchone()[0], "")
+                if table == "transfers" and "save_file_fid" in columns:
+                    self.assertIsNone(connection.execute("SELECT save_file_fid FROM transfers").fetchone()[0])
 
     def test_pre3_main_upgrades_without_losing_existing_state(self):
         old_rows = {table: row for table, row in RELEASE_ROWS.items() if table != "playback_access"}
@@ -127,6 +135,63 @@ class UpgradeCompatibilityTests(unittest.TestCase):
         self.assertEqual(tuple(upgraded.execute("SELECT save_task_id,save_target,save_started_at FROM transfers").fetchone()),
                          (None, None, None))
         self.assertEqual(upgraded.execute("SELECT COUNT(*) FROM playback_access").fetchone()[0], 0)
+
+    def test_v2_to_v3_preserves_multiple_episode_mappings_and_allows_hdr_sibling(self):
+        cat,title='欧美剧集','迁移版本剧 (2026)'
+        expected={}
+        with closing(sqlite3.connect(self.state_db)) as previous,previous:
+            # Freeze the released schema, adding only the shipped v2 file identity column.
+            previous.executescript(RELEASE_SCHEMA.read_text(encoding='utf-8'))
+            previous.execute('ALTER TABLE transfers ADD COLUMN save_file_fid TEXT')
+            previous.execute('PRAGMA user_version=2')
+            for episode in (1,2,3):
+                path=f'/library/{title}/Season 01/{title} - S01E{episode:02d}.strm'
+                remote=f'/夸克网盘/点播/vod_legacy_{episode}/episode.mkv'
+                previous.execute(
+                    'INSERT INTO transfers(id,cat,title,season,episode,status,remote_path,created_at,updated_at,save_file_fid) '
+                    'VALUES (?,?,?,?,?,?,?,?,?,?)',
+                    (episode,cat,title,1,episode,'done',remote,10,20,'legacy-fid-'+str(episode)))
+                previous.execute('INSERT INTO strm_map(cat,title,season,episode,strm_path) VALUES (?,?,?,?,?)',
+                                 (cat,title,1,episode,path))
+                previous.execute(
+                    'INSERT INTO source_audits(id,cat,title,season,episode,has_quark_source,is_4k,best_share_url,checked_at,check_status) '
+                    'VALUES (?,?,?,?,?,?,?,?,?,?)',
+                    (episode,cat,title,1,episode,1,0,'https://example.invalid/legacy-'+str(episode),30,'valid_hd'))
+                previous.execute('INSERT INTO cleanup_queue(transfer_id,remote_path,due_at) VALUES (?,?,?)',
+                                 (episode,remote,100+episode))
+                expected[episode]=(path,remote,'legacy-fid-'+str(episode))
+        upgraded=db.init_db()
+        self.assertEqual(upgraded.execute('PRAGMA user_version').fetchone()[0],3)
+        for episode,(path,remote,fid) in expected.items():
+            with self.subTest(legacy_episode=episode):
+                transfer=db.get_transfer(cat,title,1,episode)
+                self.assertEqual((transfer['id'],transfer['variant'],transfer['status'],
+                                  transfer['remote_path'],transfer['save_file_fid']),
+                                 (episode,'','done',remote,fid))
+                self.assertEqual(db.get_strm_path(cat,title,1,episode),path)
+                audit=db.get_source_audit(cat,title,1,episode)
+                self.assertEqual((audit['variant'],audit['best_share_url']),
+                                 ('','https://example.invalid/legacy-'+str(episode)))
+                queue=upgraded.execute('SELECT remote_path,due_at FROM cleanup_queue WHERE transfer_id=?',
+                                       (episode,)).fetchone()
+                self.assertEqual(tuple(queue),(remote,100+episode))
+        hdr_path='/library/'+title+'/Season 01/'+title+' - S01E01 - 4K HDR 原声.strm'
+        db.save_strm_map(cat,title,1,1,hdr_path,variant='hdr')
+        hdr_id=db.upsert_transfer(cat,title,1,1,variant='hdr',status='saving',save_file_fid='hdr-fid')
+        db.save_source_audit(cat,title,1,1,True,True,'https://example.invalid/hdr',variant='hdr')
+        self.assertNotIn(hdr_id,expected)
+        self.assertEqual(db.get_strm_path(cat,title,1,1,variant='hdr'),hdr_path)
+        self.assertEqual(db.get_transfer(cat,title,1,1,variant='hdr')['status'],'saving')
+        self.assertEqual(db.get_source_audit(cat,title,1,1,variant='hdr')['best_share_url'],
+                         'https://example.invalid/hdr')
+        for episode,(path,remote,fid) in expected.items():
+            self.assertEqual(db.get_strm_path(cat,title,1,episode),path)
+            self.assertEqual(db.get_transfer(cat,title,1,episode)['remote_path'],remote)
+            self.assertEqual(db.get_source_audit(cat,title,1,episode)['best_share_url'],
+                             'https://example.invalid/legacy-'+str(episode))
+        self.assertEqual(upgraded.execute('SELECT COUNT(*) FROM strm_map').fetchone()[0],4)
+        self.assertEqual(upgraded.execute('SELECT COUNT(*) FROM transfers').fetchone()[0],4)
+        self.assertEqual(upgraded.execute('SELECT COUNT(*) FROM source_audits').fetchone()[0],4)
 
     def test_public_release_upgrades_and_wal_backup_restores_old_version(self):
         previous = self._create_release_database()

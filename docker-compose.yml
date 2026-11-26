@@ -3,9 +3,9 @@ services:
     build:
       context: .
       args:
-        VOD_VERSION: "${QUARK_VOD_IMAGE_VERSION:-3.0.1}"
+        VOD_VERSION: "${QUARK_VOD_IMAGE_VERSION:-3.1.1rc3}"
         VCS_REF: "${QUARK_VOD_IMAGE_REVISION:-unknown}"
-    image: quark-vod:${QUARK_VOD_IMAGE_VERSION:-3.0.1}
+    image: quark-vod:${QUARK_VOD_IMAGE_VERSION:-3.1.1rc3}
     restart: unless-stopped
     env_file:
       - .env

@@ -24,11 +24,14 @@ dependencies = [
   "uvicorn>=0.30,<1",
   "pydantic>=2.7,<3",
   "requests>=2.32,<3",
+  "httpx>=0.27,<1",
+  "pypinyin>=0.53,<1",
   "python-dotenv>=1.0,<2",
 ]
 
 [project.optional-dependencies]
-test = ["httpx>=0.27,<1", "build>=1.2,<2"]
+test = ["build>=1.2,<2"]
+wishlist = ["cryptography>=44,<50"]
 
 [project.scripts]
 quark-vod = "quark_vod.cli:main"

@@ -346,9 +346,62 @@ class StateTests(unittest.TestCase):
         ]) as called:
             self.assertEqual(tr._get_quark_fid('/夸克网盘/点播'), '2')
             self.assertEqual(called.call_count, 2)
-        with patch.object(tr, '_request', side_effect=TransferFailed('network unavailable')):
-            with self.assertRaises(TransferFailed):
+        # Force a cache miss so the injected network failure reaches the API.
+        tr._path_fids.clear()
+        with patch.object(tr, '_request', side_effect=TransferFailed('network unavailable')) as called:
+            with self.assertRaisesRegex(TransferFailed, 'network unavailable'):
                 tr._get_quark_fid('/夸克网盘/点播')
+            called.assert_called_once()
+
+    def test_path_root_fid_cache_reuses_result_within_five_minutes(self):
+        tr = QuarkTransfer(None)
+        response = {'code': 0, 'data': {'_total': 1, 'list': [
+            {'file_name': '点播', 'fid': 'cached-root'}
+        ]}}
+        with patch('quark_vod.transfer.time.monotonic', return_value=100), \
+             patch.object(tr, '_request', return_value=response) as called:
+            self.assertEqual(tr._get_quark_fid('/夸克网盘/点播'), 'cached-root')
+            called.assert_called_once()
+            self.assertIn('pdir_fid=0', called.call_args.args[0])
+        with patch('quark_vod.transfer.time.monotonic', return_value=399), \
+             patch.object(tr, '_request') as called:
+            self.assertEqual(tr._get_quark_fid('/夸克网盘/点播'), 'cached-root')
+            called.assert_not_called()
+        # The five-minute boundary must resume authoritative directory lookup.
+        with patch('quark_vod.transfer.time.monotonic', return_value=400), \
+             patch.object(tr, '_request', return_value=response) as called:
+            self.assertEqual(tr._get_quark_fid('/夸克网盘/点播'), 'cached-root')
+            called.assert_called_once()
+            self.assertIn('pdir_fid=0', called.call_args.args[0])
+
+    def test_path_root_fid_404_invalidates_cache_and_requeries_official_directory(self):
+        tr = QuarkTransfer(None)
+        old_root = {'code': 0, 'data': {'_total': 1, 'list': [
+            {'file_name': '点播', 'fid': 'old-root'}
+        ]}}
+        new_root = {'code': 0, 'data': {'_total': 1, 'list': [
+            {'file_name': '点播', 'fid': 'new-root'}
+        ]}}
+        empty_directory = {'code': 0, 'data': {'_total': 0, 'list': []}}
+        with patch('quark_vod.transfer.time.monotonic', return_value=100), \
+             patch.object(tr, '_request', return_value=old_root):
+            self.assertEqual(tr._get_quark_fid('/夸克网盘/点播'), 'old-root')
+        with patch('quark_vod.transfer.time.monotonic', return_value=101), \
+             patch.object(tr, '_request', side_effect=TransferFailed('夸克 HTTP 404')) as called:
+            with self.assertRaisesRegex(TransferFailed, '404'):
+                tr._quark_list('/夸克网盘/点播')
+            called.assert_called_once()
+            self.assertIn('pdir_fid=old-root', called.call_args.args[0])
+        self.assertNotIn('/夸克网盘/点播', tr._path_fids)
+        with patch('quark_vod.transfer.time.monotonic', return_value=102), \
+             patch.object(tr, '_request', side_effect=[new_root, empty_directory]) as called:
+            self.assertEqual(tr._quark_list('/夸克网盘/点播'), [])
+            self.assertEqual(called.call_count, 2)
+            urls = [call.args[0] for call in called.call_args_list]
+            self.assertTrue(all(url.startswith(tr.QUARK_FILE_SORT) for url in urls))
+            self.assertIn('pdir_fid=0', urls[0])
+            self.assertIn('pdir_fid=new-root', urls[1])
+        self.assertEqual(tr._path_fids['/夸克网盘/点播'][1], 'new-root')
 
     def test_partial_listing_not_treated_as_complete(self):
         tr = QuarkTransfer(None)

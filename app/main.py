@@ -19,13 +19,14 @@ from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from quark_vod import __version__, cleaner, cleanup, config, db, search as search_mod, selfheal, server as legacy_srv, strm_manager
 from quark_vod.transfer import QuarkTransfer
 from quark_vod import coordination
 from quark_vod import media_cache
 from quark_vod import search_plugins
-from quark_vod import download_http
+from quark_vod import download_http, prefetch, notifier, notification_settings
 
 
 class MediaResponse(StreamingResponse):
@@ -121,9 +122,12 @@ async def lifespan(app: FastAPI):
         _probe_capability()
 
     print(f"[{config.SERVICE_NAME}] Cookie: {config.redact_cookie(config.get_quark_cookie())}", flush=True)
+    if os.getenv("VOD_PREFETCH_ENABLED","0")=="1":
+        prefetch.prefetcher.start()
     try:
         yield
     finally:
+        prefetch.prefetcher.close()
         stop_event.set()
         db.close()
 
@@ -160,6 +164,53 @@ async def admin_auth(request: Request, call_next):
 @app.exception_handler(coordination.Busy)
 async def maintenance_busy(request, exc):
     return JSONResponse(status_code=409,content={'error':str(exc),'code':'busy'})
+
+
+def _notification_error(exc):
+    headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after is not None else None
+    return JSONResponse(status_code=exc.status, content={"error": exc.code}, headers=headers)
+
+
+async def _notification_body(request):
+    length = request.headers.get("content-length")
+    if length is not None:
+        if not length.isdecimal() or len(length) > 8 or int(length) > notification_settings.MAX_BYTES:
+            notification_settings.invalid()
+    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        notification_settings.invalid()
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(chunk) > notification_settings.MAX_BYTES - len(raw):
+            notification_settings.invalid()
+        raw.extend(chunk)
+    return notification_settings.parse_request(bytes(raw))
+
+
+@app.get("/api/admin/notifications", tags=["Administration"])
+def admin_notifications_get():
+    try:
+        return notification_settings.get_settings()
+    except notification_settings.SettingsError as exc:
+        return _notification_error(exc)
+
+
+@app.put("/api/admin/notifications", tags=["Administration"])
+async def admin_notifications_put(request: Request):
+    try:
+        value = await _notification_body(request)
+        return await run_in_threadpool(notification_settings.update_settings, value)
+    except notification_settings.SettingsError as exc:
+        return _notification_error(exc)
+
+
+@app.post("/api/admin/notifications/test", tags=["Administration"])
+async def admin_notifications_test(request: Request):
+    try:
+        value = await _notification_body(request)
+        revision = notification_settings.validate_test(value)
+        return await run_in_threadpool(notification_settings.send_test, revision)
+    except notification_settings.SettingsError as exc:
+        return _notification_error(exc)
 
 
 # ==============================================================================
@@ -241,7 +292,8 @@ def admin_probe_capability():
 def admin_plugins():
     registry = search_plugins.get_registry()
     registry.snapshot()
-    return registry.status()
+    from quark_vod.panshare_matrix import node_health
+    return {**registry.status(),"health":node_health()}
 
 
 @app.post("/api/admin/plugins/reload", tags=["Administration"])
@@ -261,13 +313,14 @@ def pending(
     t: str = Query("", description="影片标题"),
     s: int = Query(0, description="季数 (电影为 0)"),
     e: int = Query(0, description="集数 (电影为 0)"),
+    variant: str = "",
 ):
     ua = request.headers.get("user-agent", "")
     client_ip = request.client.host if request.client else "unknown"
     print(f"[{config.SERVICE_NAME}] {request.method} {request.url.path} S{s}E{e}", flush=True)
 
     if request.method == "HEAD":
-        row = db.find_done_transfer(cat, t, s, e)
+        row = db.find_done_transfer(cat, t, s, e, **({"variant":variant} if variant else {}))
         if row and row["remote_path"]:
             url = legacy_srv._direct_url(row["remote_path"])
             url = cleaner.clean_url_if_obfuscated(url)
@@ -280,10 +333,12 @@ def pending(
 
     try:
         from quark_vod.identity import Work
-        work = Work(cat,t,s,e)
+        work = Work(cat,t,s,e,variant)
         if not work.cat:
             raise ValueError('missing cat')
         result = legacy_srv.resolve_playback(work)
+        if os.getenv("VOD_PREFETCH_ENABLED","0")=="1":
+            prefetch.prefetcher.schedule(work)
         return RedirectResponse(result.url,status_code=302,headers={'Cache-Control':'no-store'})
     except ValueError as exc:
         return JSONResponse(status_code=400,content={'error':str(exc)})
@@ -304,7 +359,7 @@ def cached_media(request: Request,transfer_id: int,v: str='',skip: int=0):
     try:
         with coordination.playback_lease():
             status,headers,chunks=media_cache.cache.open(v,legacy_srv._direct_url(row['remote_path']),skip,request.headers.get('range',''))
-            if request.method!='HEAD':db.record_access(transfer_id)
+            if request.method!='HEAD':_record_access_throttled(transfer_id)
         if request.method=='HEAD':
             chunks.close();media_cache.stream_slots.release()
             return Response(status_code=status,headers=headers)
@@ -457,6 +512,7 @@ def admin_search_debug(
     cat: str = Query("", description="专区分类（可选，用于判断电影/剧集/动漫）"),
     season: int = Query(0, description="季数 (0=电影)"),
     episode: int = Query(0, description="集数 (0=电影)"),
+    aliases: list[str] = Query(default=[]),
 ):
     """白盒搜索与五维打分调试器：展示所有盘搜候选、得分高低与淘汰原因。"""
     t0 = time.time()
@@ -464,7 +520,8 @@ def admin_search_debug(
     locked_url, is_4k, l_title = db.get_locked_4k_share(cat, title, season, episode)
 
     candidates = []
-    report = search_mod.search_report(title, season=season, episode=episode)
+    identity_title, library_aliases = strm_manager.library_search_identity(cat,title,season)
+    report = search_mod.search_report(identity_title, aliases=tuple(dict.fromkeys([*library_aliases,*(aliases if isinstance(aliases,list) else [])])), season=season, episode=episode)
     raw_results = report['results']
     for r in raw_results:
         sc = search_mod.score_search_result(r, title, season=season, episode=episode)
@@ -553,11 +610,13 @@ def admin_check_quota():
 
 @app.delete("/api/admin/transfer/{transfer_id}", tags=["Whitebox Admin"])
 @coordination.maintenance
-def admin_reset_transfer(transfer_id: int):
+def admin_reset_transfer(transfer_id: int, force: int = 0):
     """重置可确认的记录；未决保存意图必须先核对，避免重复提交。"""
+    if force:
+        return _force_reset(transfer_id)
     con = db._conn()
     row = con.execute(
-        "SELECT id, cat, title, season, episode, remote_path, status, "
+        "SELECT id, cat, title, season, episode, variant, remote_path, status, "
         "save_target, save_task_id, save_started_at, save_file_fid FROM transfers WHERE id=?", (transfer_id,)
     ).fetchone()
     if not row:
@@ -569,11 +628,11 @@ def admin_reset_transfer(transfer_id: int):
             "code": "save_intent_unconfirmed",
         })
     cat, title, s, e = row["cat"], row["title"], row["season"], row["episode"]
-    sp = db.get_strm_path(cat, title, s, e)
+    sp = db.get_strm_path(cat, title, s, e, **({"variant":row["variant"]} if row["variant"] else {}))
     restored = False
     if sp and os.path.isfile(sp):
         try:
-            restored = strm_manager.restore_pending(sp, cat, title, s, e)
+            restored = strm_manager.restore_pending(sp, cat, title, s, e, **({"variant":row["variant"]} if row["variant"] else {}))
             if not strm_manager.is_pending(strm_manager.read_strm(sp)):
                 raise OSError("STRM is still live")
         except Exception as exc:
@@ -584,5 +643,225 @@ def admin_reset_transfer(transfer_id: int):
         (int(time.time()), transfer_id),
     )
     con.commit()
+    db.clear_source_audit(cat,title,s,e,**({"variant":row["variant"]} if row["variant"] else {}))
     legacy_srv.invalidate_transfer_cache(transfer_id)
     return {"ok": True, "id": transfer_id, "strm_restored": restored}
+
+
+_access_touch_ts = {}
+_access_touch_lock = threading.Lock()
+
+def _record_access_throttled(transfer_id):
+    key=(config.STATE_DB,transfer_id)
+    timestamp=time.monotonic()
+    with _access_touch_lock:
+        if timestamp-_access_touch_ts.get(key,-1e9)<120:
+            return
+        db.record_access(transfer_id)
+        _access_touch_ts[key]=timestamp
+        if len(_access_touch_ts)>4096:
+            for old,ts in list(_access_touch_ts.items()):
+                if ts<timestamp-120: _access_touch_ts.pop(old,None)
+
+
+def _force_reset(transfer_id):
+    row=db.get_transfer_by_id(transfer_id)
+    if not row:
+        return JSONResponse(status_code=404,content={"error":"记录不存在"})
+    row=dict(row); options={"variant":row["variant"]} if row["variant"] else {}
+    # Without a task identity, neither an empty target nor elapsed time proves
+    # that a submitted save cannot create an object after this reset returns.
+    if (row.get("save_started_at") or row["status"]=="saving") and not row.get("save_task_id"):
+        return JSONResponse(status_code=409,content={"error":"保存提交结果未知且缺少可确认终态的任务标识；已保留原任务和播放入口","code":"save_intent_unconfirmed"})
+    transfer=legacy_srv.get_transfer()
+    if not transfer:
+        return JSONResponse(status_code=503,content={"error":"存储后端未就绪"})
+    # A running remote task may create an object after deletion; prove terminal first.
+    if row.get("save_task_id"):
+        try: transfer._wait_saved_task(row["save_task_id"])
+        except Exception:
+            return JSONResponse(status_code=409,content={"error":"远端保存任务尚不能确认终态","code":"save_intent_unconfirmed"})
+    target=row.get("remote_path") or row.get("save_target")
+    if not target and (row.get("save_started_at") or row["status"]=="saving"):
+        return JSONResponse(status_code=409,content={"error":"保存意图没有可确认的精确目标","code":"save_intent_unconfirmed"})
+    if target:
+        target=config.write_path(target)
+        root=config.write_path(config.QUARK_VOD_ROOT).rstrip("/")
+        if not target.startswith(root+"/vod_") or ".." in target.split("/"):
+            return JSONResponse(status_code=409,content={"error":"远端对象不属于点播专用槽位"})
+        def overlap(path):
+            path=config.write_path(path or "").rstrip("/")
+            return path and (path==target or path.startswith(target+"/") or target.startswith(path+"/"))
+        others=db._conn().execute("SELECT * FROM transfers WHERE id<>? AND status<>'cleaned'",(transfer_id,))
+        if any(overlap(other["remote_path"]) or overlap(other["save_target"]) for other in others):
+            return JSONResponse(status_code=409,content={"error":"目标仍被其他转存记录引用，已保留"})
+    sp=db.get_strm_path(row["cat"],row["title"],row["season"],row["episode"],**options)
+    restored=False
+    if sp:
+        try:
+            if not os.path.isfile(sp): raise OSError("mapped STRM missing")
+            restored=strm_manager.restore_pending(sp,row["cat"],row["title"],row["season"],row["episode"],**options)
+            if not strm_manager.is_pending(strm_manager.read_strm(sp)): raise OSError("restore failed")
+        except Exception:
+            return JSONResponse(status_code=409,content={"error":"STRM 还原失败；保留远端对象与保存状态"})
+    elif config.VOD_JELLYFIN_ENABLED:
+        return JSONResponse(status_code=409,content={"error":"无法确认媒体库入口，已停止远端删除"})
+    if target:
+        try: transfer.delete_remote(target)
+        except Exception:
+            return JSONResponse(status_code=503,content={"error":"远端未确认删除；保存状态保留，可重试"})
+    with db._conn() as con:
+        con.execute("UPDATE transfers SET status='cleaned',remote_path=NULL,save_target=NULL,save_task_id=NULL,save_started_at=NULL,save_file_fid=NULL,error='管理员确认清理',updated_at=? WHERE id=?",(db.now(),transfer_id))
+        con.execute("UPDATE cleanup_queue SET cleaned=1 WHERE transfer_id=?",(transfer_id,))
+    db.clear_source_audit(row["cat"],row["title"],row["season"],row["episode"],**options)
+    legacy_srv.invalidate_transfer_cache(transfer_id)
+    return {"ok":True,"id":transfer_id,"strm_restored":restored}
+
+
+class ResolveRequest(BaseModel):
+    cat: str = Field(max_length=100)
+    title: str = Field(max_length=200)
+    season: int = Field(default=0,ge=0,le=1000)
+    episode: int = Field(default=0,ge=0,le=10000)
+    variant: str = Field(default="",pattern="^(hdr|sdr|dubbed|remux)?$")
+    share_url: str = Field(max_length=500)
+    selected_fid: str = Field(default="",max_length=200)
+    reason: str = Field(default="corrupted",pattern="^(dv_color_issue|wrong_audio|wrong_episode|hardcoded_ad|corrupted|quality_upgrade)$")
+
+
+def _resolve_selected(req):
+    from quark_vod.identity import Work
+    from quark_vod.panshare_matrix import canonical_share
+    if not canonical_share(req.share_url):
+        return JSONResponse(status_code=422,content={"error":"只接受夸克分享"})
+    work=Work(req.cat,req.title,req.season,req.episode,req.variant)
+    transfer=legacy_srv.get_transfer()
+    if not transfer:
+        return JSONResponse(status_code=503,content={"error":"存储后端未就绪"})
+    options={"variant":req.variant} if req.variant else {}
+    if req.selected_fid: options["selected_fid"]=req.selected_fid
+    try:
+        tid,remote=transfer.transfer(*work.args,req.share_url,**options)
+        legacy_srv._finish(work,tid,remote)
+        return {"ok":True,"transfer_id":tid,"state":"ready"}
+    except Exception as exc:
+        return JSONResponse(status_code=503,content={"error":"所选文件保存或读取尚未就绪","type":type(exc).__name__})
+
+
+@app.post("/api/admin/resolve")
+def admin_resolve(req: ResolveRequest):
+    return _resolve_selected(req)
+
+
+@app.post("/api/admin/replace")
+@coordination.maintenance
+def admin_replace(req: ResolveRequest):
+    from quark_vod.replacement import replace, ReplacementUnavailable
+    transfer=legacy_srv.get_transfer()
+    if transfer is None:
+        return JSONResponse(status_code=503,content={"error":"存储后端未就绪"})
+    try:
+        return replace(req,transfer,legacy_srv._finish,legacy_srv.invalidate_transfer_cache)
+    except ReplacementUnavailable as exc:
+        return JSONResponse(status_code=exc.status,content={"error":str(exc),"code":exc.code})
+    except Exception as exc:
+        return JSONResponse(status_code=503,content={"error":"新源保存或激活尚未完成；旧文件已保留，可重试原选择","type":type(exc).__name__})
+
+
+@app.get("/api/admin/transfers")
+def admin_transfers(status: str="", q: str="", page: int=Query(1,ge=1), size: int=Query(30,ge=1,le=100)):
+    where=[];args=[]
+    if status:
+        if status not in ("pending","searching","found","saving","done","failed","cleaned"):
+            return JSONResponse(status_code=422,content={"error":"未知任务状态"})
+        where.append("status=?");args.append(status)
+    if q: where.append("instr(title,?)>0");args.append(q[:200])
+    clause=(" WHERE "+" AND ".join(where)) if where else ""
+    con=db._conn()
+    total=con.execute("SELECT COUNT(*) FROM transfers"+clause,args).fetchone()[0]
+    rows=con.execute("SELECT id,cat,title,season,episode,variant,status,error,file_size,created_at,updated_at,(SELECT COUNT(*) FROM plays p WHERE p.transfer_id=transfers.id) AS play_count FROM transfers"+clause+" ORDER BY updated_at DESC,id DESC LIMIT ? OFFSET ?",[*args,size,(page-1)*size])
+    return {"items":[dict(row) for row in rows],"total":total,"page":page,"size":size}
+
+
+@app.get("/api/admin/lifecycle")
+def admin_lifecycle():
+    con=db._conn()
+    return {"pins":[dict(row) for row in con.execute("SELECT * FROM user_pinned ORDER BY pinned_at DESC LIMIT 500")],
+            "queue":[dict(row) for row in con.execute("SELECT q.id,q.transfer_id,q.due_at,t.title,t.cat FROM cleanup_queue q JOIN transfers t ON t.id=q.transfer_id WHERE cleaned=0 ORDER BY due_at LIMIT 500")],
+            "bans":[dict(row) for row in con.execute("SELECT source_url,reason,expires_at FROM dead_sources WHERE expires_at>? ORDER BY created_at DESC LIMIT 500",(db.now(),))]}
+
+
+class LifecycleRequest(BaseModel):
+    action: str
+    cat: str = ""
+    title: str = Field(default="",max_length=200)
+    id: int = 0
+    source_url: str = Field(default="",max_length=500)
+
+@app.post("/api/admin/lifecycle")
+def admin_lifecycle_update(req: LifecycleRequest):
+    con=db._conn()
+    if req.action=="pin": db.pin_item(req.cat,req.title,reason="manual")
+    elif req.action=="unpin":
+        with con: con.execute("DELETE FROM user_pinned WHERE cat=? AND (title=? OR title=?)",(req.cat,req.title,req.title.rsplit(" (",1)[0]))
+    elif req.action=="extend":
+        with con: con.execute("UPDATE cleanup_queue SET due_at=MAX(due_at,?)+? WHERE id=? AND cleaned=0",(db.now(),7*86400,req.id))
+    elif req.action=="ban": db.mark_dead_source(req.source_url,reason="manual")
+    elif req.action=="unban":
+        with con: con.execute("DELETE FROM dead_sources WHERE source_url=?",(db._canonical_source(req.source_url),))
+    else: return JSONResponse(status_code=422,content={"error":"未知操作"})
+    return {"ok":True}
+
+
+@app.get("/api/admin/plugins/config")
+def admin_plugin_config():
+    snapshot=search_plugins.get_registry().snapshot()
+    return {"version":1,"nodes":[{k:v for k,v in node.as_dict().items() if k!="key"} for node in snapshot.nodes]}
+
+
+@app.put("/api/admin/plugins/config")
+def admin_save_plugin_config(document: dict):
+    import tempfile
+    registry=search_plugins.get_registry()
+    if not registry.path:
+        return JSONResponse(status_code=409,content={"error":"搜索配置文件未设置"})
+    try:
+        if set(document)!={"version","nodes"} or document["version"]!=1:
+            raise ValueError("schema")
+        search_plugins.snapshot_from_nodes(document["nodes"])
+        raw=json.dumps(document,ensure_ascii=False,indent=2).encode()
+        if len(raw)>search_plugins.MAX_CONFIG_BYTES: raise ValueError("size")
+        parent=registry.path.parent
+        descriptor,tmp=tempfile.mkstemp(dir=parent,prefix=".search-")
+        try:
+            with os.fdopen(descriptor,"wb") as stream:
+                stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+            os.chmod(tmp,0o600)
+            os.replace(tmp,registry.path)
+        finally:
+            if os.path.exists(tmp): os.unlink(tmp)
+        return registry.reload()
+    except (ValueError,search_plugins.PluginConfigError) as exc:
+        return JSONResponse(status_code=422,content={"error":getattr(exc,"code","invalid_plugin_configuration")})
+    except OSError:
+        return JSONResponse(status_code=503,content={"error":"配置目录不可写，请在宿主配置后重载"})
+
+
+@app.post("/api/admin/plugins/test-node")
+def admin_test_node(payload: dict):
+    from quark_vod.panshare_matrix import PanshareMatrix
+    registry=search_plugins.get_registry(); snapshot=registry.snapshot()
+    node=next((n for n in snapshot.nodes if n.id==payload.get("id")),None)
+    keyword=str(payload.get("keyword") or "流浪地球")[:100]
+    if not node: return JSONResponse(status_code=404,content={"error":"搜索节点不存在"})
+    from dataclasses import replace
+    node=replace(node,enabled=True)
+    single=search_plugins.SearchSnapshot((node,),snapshot.fingerprint+"-"+node.id,snapshot.generation)
+    started=time.monotonic()
+    report=PanshareMatrix.search_report(keyword,use_cache=False,snapshot=single)
+    return {"elapsed_ms":round((time.monotonic()-started)*1000),"count":len(report.get("items",[])),"nodes":report.get("nodes",[]),"partial":report.get("partial",False)}
+
+
+@app.get("/api/admin/staging")
+def admin_staging():
+    return {"items":db.list_staging_media(status=None),"calendar":db.list_airing_calendar()}

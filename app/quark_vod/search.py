@@ -2,8 +2,11 @@
 # -*- coding: utf-8 -*-
 """Quark candidate search and deterministic identity scoring."""
 
+import math
 import re
 import sys
+import time
+from concurrent.futures import wait, FIRST_COMPLETED
 import unicodedata
 
 
@@ -94,39 +97,197 @@ def sanitize_title(text):
 
 
 def normalize_keyword(kw):
-    """规范化片名关键词（罗马数字替换、全角字符转换）。"""
-    res = kw
-    for r_char, a_num in ROMAN_NUM_MAP.items():
-        res = res.replace(r_char, a_num)
-    return res
+    """Normalize full-width/Unicode and standalone ASCII Roman numerals."""
+    text = str(kw or "")
+    for roman, number in ROMAN_NUM_MAP.items():
+        text = text.replace(roman, number)
+    text = unicodedata.normalize("NFKC", text)
+    romans = {"II": "2", "III": "3", "IV": "4", "V": "5",
+              "VI": "6", "VII": "7", "VIII": "8", "IX": "9", "X": "10"}
+    return re.sub(r"(?<![A-Za-z])(?:VIII|VII|III|VI|IV|IX|II|V|X)(?![A-Za-z])",
+                  lambda match: romans[match.group()], text)
+
+
+def _chinese_number(number):
+    digits = "零一二三四五六七八九"
+    if number < 10:
+        return digits[number]
+    if number < 100:
+        return (digits[number//10] if number >= 20 else "") + "十" + (digits[number%10] if number%10 else "")
+    return str(number)
 
 
 def query_variants(title, aliases=(), season=0):
     core = normalize_keyword(sanitize_title(title))
     variants = [core]
     if season > 1:
-        variants.append(f"{core} 第{season}季")
+        variants.extend((f"{core} 第{_chinese_number(season)}季",
+                         f"{core}第{_chinese_number(season)}季",
+                         f"{core} 第{season}季", f"{core} S{season:02d}"))
     year = re.search(r"[(（](\d{4})[)）]\s*$", title)
     if year:
         variants.append(core + year.group(1))
-    variants.extend(sanitize_title(a) for a in aliases if a)
-    return list(dict.fromkeys(q for q in variants if q))[:4]
+    for alias in aliases:
+        if alias:
+            variants.append(normalize_keyword(sanitize_title(alias)))
+    # Add compact forms without dropping the verified full title.
+    for value in tuple(variants):
+        if re.search(r"[一-龥]", value) and " " in value:
+            variants.append(re.sub(r"\s+", "", value))
+    # A subtitle is a recall term only; it never relaxes identity verification.
+    parts = re.split(r"[:：]", core, maxsplit=1)
+    if len(parts) > 1 and len(parts[1].strip()) >= 3:
+        variants.append(parts[1].strip())
+    return list(dict.fromkeys(q for q in variants if q))[:16]
 
 
-def search_report(title, *, aliases=(), season=0, episode=0, use_cache=True):
-    from .panshare_matrix import PanshareMatrix, merge_items, source_snapshot
+def trusted_initial_alias(title, candidate, *, year=None, season=0, episode=0):
+    """Abbreviation is auxiliary evidence: require exact year and SxxExx."""
+    if not year or episode < 1:
+        return False
+    years = set(re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", candidate))
+    markers = re.findall(r"(?i)(?<![A-Za-z0-9])S(\d{1,2})[ ._-]*E(?:P)?(\d{1,4})(?![A-Za-z0-9])", candidate)
+    if years != {str(year)} or markers != [(str(int(season)).zfill(2), str(int(episode)).zfill(2))]:
+        # Numeric padding is flexible; duplicate/conflicting markers are not.
+        if years != {str(year)} or len(markers) != 1 or tuple(map(int, markers[0])) != (season, episode):
+            return False
+    core = sanitize_title(title)
+    chinese = "".join(re.findall(r"[一-龥]", core))
+    if len(chinese) < 2:
+        return False
+    try:
+        from pypinyin import lazy_pinyin, Style
+        initials = "".join(lazy_pinyin(chinese, style=Style.FIRST_LETTER)).upper()
+    except ImportError:
+        return False
+    prefix = re.split(r"(?i)(?<![A-Za-z0-9])S\d{1,2}[ ._-]*E", candidate, maxsplit=1)[0]
+    prefix = re.sub(r"(?<!\d)(?:19|20)\d{2}(?!\d)", "", prefix).strip(" ._-")
+    return bool(re.fullmatch(re.escape(initials) + (r"(?:" + str(season) + r")?" if season > 1 else ""), prefix, re.I))
+
+
+SEARCH_DEADLINE_SECONDS = 3.8
+SEARCH_DEEP_DEADLINE_SECONDS = 22.0
+
+
+def search_report(title, *, aliases=(), season=0, episode=0, use_cache=True, category=None,
+                  deadline_seconds=None):
+    from .panshare_matrix import PanshareMatrix, merge_items, source_snapshot, _start_task
+    from .quality import quality_hint
+    budget = SEARCH_DEADLINE_SECONDS if deadline_seconds is None else deadline_seconds
+    if (isinstance(budget, bool) or not isinstance(budget, (int, float))
+            or not math.isfinite(budget) or not .05 <= budget <= SEARCH_DEEP_DEADLINE_SECONDS):
+        raise ValueError("search deadline must be between 0.05 and 22 seconds")
+    started = time.monotonic()
+    deadline = started + budget
     snapshot, configuration_error = source_snapshot()
     queries = query_variants(title, aliases, season)
-    reports = [PanshareMatrix.search_report(q, use_cache=use_cache, snapshot=snapshot,
-                configuration_error=configuration_error) for q in queries]
-    items = merge_items([row for report in reports for row in report['items']])
-    results = [SearchResult(engine='panshare', source=r['source'], name=r['name'], year='', poster='', episodes=[],
-               share_url=r['share_url'], pan_type='quark', names=r['names'], sources=r['sources']) for r in items]
-    return {'results': results, 'queries': queries, 'nodes': [n for r in reports for n in r['nodes']],
-            'partial': any(r['partial'] for r in reports) or not bool(snapshot.enabled_nodes),
-            'cached': bool(reports) and all(r['cached'] for r in reports),
-            'configured': bool(snapshot.enabled_nodes), 'configuration_error': configuration_error,
-            'config_fingerprint': snapshot.fingerprint}
+    reports, executed, query_reports = [], [], []
+    early_stopped = False
+    deadline_exhausted = False
+
+    def sufficient(items):
+        matches = []
+        for row in items:
+            result = SearchResult("panshare", row["source"], row["name"], "", "", [],
+                                  share_url=row["share_url"], names=row.get("names"))
+            if score_search_result(result, title, season=season, episode=episode, aliases=aliases) >= 85:
+                matches.append(result)
+        return len(matches) >= 5 and any(quality_hint(row.name)["level"] == "4k" for row in matches)
+
+    def record(query, report, status="completed"):
+        # Copy cached reports: adding the query must not mutate shared cache data.
+        reports.append({**report, "nodes": [{**node, "query": query} for node in report["nodes"]]})
+        query_reports.append({"query": query, "status": status,
+                              "partial": bool(report["partial"])})
+
+    def failure(query, reason):
+        record(query, {"items": [], "nodes": [
+            {"node": node.id, "provider": node.provider, "errors": 1, "partial": True,
+             "pages": 0, "details": 0, "candidates": 0, "truncated": True,
+             "error_type": reason, "seconds": round(time.monotonic()-started, 3)}
+            for node in snapshot.enabled_nodes
+            if not category or not node.categories or category in node.categories],
+            "partial": True, "cached": False}, reason)
+
+    def run(query, stage_budget):
+        # The absolute deadline also includes waiting for matrix search slots.
+        return PanshareMatrix.search_report(query, use_cache=use_cache, snapshot=snapshot,
+            configuration_error=configuration_error, category=category,
+            deadline_seconds=stage_budget, deadline_at=deadline-.01, stop_when=sufficient,
+            reuse_partial_cache=budget <= SEARCH_DEADLINE_SECONDS)
+
+    # All stages share one round budget; aliases never obtain a fresh round.
+    for stage, stage_queries in enumerate((queries[:2], queries[2:])):
+        queue = iter(stage_queries)
+        pending = {}
+        exhausted = False
+        while not exhausted or pending:
+            while not exhausted and len(pending) < 2 and time.monotonic() < deadline-.05:
+                query = next(queue, None)
+                if query is None:
+                    exhausted = True
+                    break
+                stage_budget = min(3.5 if stage == 0 else 7.0,
+                                   max(.001, deadline-time.monotonic()))
+                future = _start_task(run, query, stage_budget)
+                if future is None:
+                    failure(query, "SearchCapacity")
+                else:
+                    executed.append(query)
+                    pending[future] = query
+            if not pending:
+                if time.monotonic() >= deadline-.05:
+                    deadline_exhausted = True
+                    break
+                continue
+            done, _ = wait(pending, timeout=max(0, deadline-time.monotonic()),
+                           return_when=FIRST_COMPLETED)
+            for future in done:
+                query = pending.pop(future)
+                record(query, future.result())
+            items = merge_items([row for report in reports for row in report["items"]])
+            if sufficient(items):
+                early_stopped = True
+                for future, query in pending.items():
+                    future.cancel()
+                    query_reports.append({"query": query, "status": "early_stopped", "partial": False})
+                pending.clear()
+                break
+            if time.monotonic() >= deadline:
+                deadline_exhausted = True
+                for future, query in pending.items():
+                    future.cancel()
+                    failure(query, "SearchDeadline")
+                pending.clear()
+                break
+        if early_stopped or deadline_exhausted:
+            break
+    unexecuted = [query for query in queries if query not in executed]
+    # A matrix may finish just before the outer wait with its own deadline report.
+    deadline_exhausted = deadline_exhausted or any(
+        node.get("error_type") in ("SearchDeadline", "ProviderTimeout")
+        for report in reports for node in report["nodes"])
+    if unexecuted and not early_stopped and time.monotonic() >= deadline:
+        deadline_exhausted = True
+    if deadline_exhausted:
+        recorded = {row["query"] for row in query_reports}
+        for query in unexecuted:
+            if query not in recorded:
+                failure(query, "SearchDeadline")
+    items = merge_items([row for report in reports for row in report["items"]])
+    results = [SearchResult(engine="panshare", source=row["source"], name=row["name"], year="", poster="", episodes=[],
+               share_url=row["share_url"], pan_type="quark", names=row["names"], sources=row["sources"]) for row in items]
+    return {"results": results, "queries": executed, "planned_queries": queries,
+            "unexecuted_queries": unexecuted, "query_reports": query_reports,
+            "incomplete_queries": [row["query"] for row in query_reports if row["partial"]],
+            "deadline_exhausted": deadline_exhausted, "budget_seconds": float(budget),
+            "nodes": [node for report in reports for node in report["nodes"]],
+            "degraded_nodes": sorted({node for report in reports for node in report.get("degraded_nodes", [])}),
+            "early_stopped": early_stopped, "seconds": round(time.monotonic()-started, 3),
+            "partial": deadline_exhausted or any(report["partial"] for report in reports) or not bool(snapshot.enabled_nodes),
+            "cached": bool(reports) and all(report["cached"] for report in reports),
+            "configured": bool(snapshot.enabled_nodes), "configuration_error": configuration_error,
+            "config_fingerprint": snapshot.fingerprint}
 
 
 def search(keyword, prefer_panshare=False, season=0, episode=0, *, aliases=()):
@@ -247,10 +408,15 @@ def _extract_season_from_name(name):
     注意：返回 None 表示「未标注季数」，通常视为第一季（由调用方决定）。
     """
     t = name or ""
-    m = re.search(r"第\s*([0-9]{1,2}|[一二两三四五六七八九十])\s*季", t)
+    m = re.search(r"第\s*([0-9]{1,2}|[一二两三四五六七八九十]{1,3})\s*季", t)
     if m:
         v = m.group(1)
-        return int(v) if v.isdigit() else CN_NUM.get(v)
+        if v.isdigit():return int(v)
+        if v in CN_NUM:return CN_NUM[v]
+        if "十" in v:
+            left, right = v.split("十", 1)
+            return CN_NUM.get(left, 1) * 10 + CN_NUM.get(right, 0)
+        return None
     m = re.search(r"[Ss]eason\s*([0-9]{1,2})", t)
     if m:
         return int(m.group(1))
@@ -296,10 +462,10 @@ def score_search_result(r, title, year=None, season=0, episode=0, *, aliases=())
 
 def _score_name(r, title, year=None, season=0, episode=0, *, full_alias=False):
     """计算搜索结果与目标标题的相关度得分。完全不相关或弱匹配返回 -1。"""
-    core = sanitize_title(title)
+    core = normalize_keyword(sanitize_title(title))
     if not core:
         return -1
-    rn = sanitize_title(r.name or "")
+    rn = normalize_keyword(sanitize_title(r.name or ""))
     if not rn:
         return -1
 
@@ -342,7 +508,7 @@ def _score_name(r, title, year=None, season=0, episode=0, *, full_alias=False):
             is_movie_meta, is_tv_meta = False, True
         else:
             is_movie_meta = is_tv_meta = False
-        want_tv = (season > 0)
+        want_tv = (season > 0 or episode > 0)
         if want_tv and is_movie_meta:
             return -1
         if (not want_tv) and is_tv_meta:
@@ -351,7 +517,7 @@ def _score_name(r, title, year=None, season=0, episode=0, *, full_alias=False):
     # ── 分季硬隔离（2026-10-20《钻石王牌》事故根治）──
     # 请求 S02 时，绝不能命中「第三季 / 第四季 / OAD」等其它季的包。
     # 旧实现只看片名，导致 S02E20 被写入第三季第 20 集。
-    if season > 0:
+    if season > 0 or episode > 0:
         req_season = int(season)
         cand_season = _extract_season_from_name(rn)
         # 未标注季数的资源视为第一季（如「钻石王牌」2013 = 第 1 季）
@@ -377,7 +543,7 @@ def _score_name(r, title, year=None, season=0, episode=0, *, full_alias=False):
     # 注意：中文与英文之间不存在 \b 边界（都是 \w），故不能用 \bOAD\b。
     _sp_re = r"OAD|OVA|特别篇|番外篇|剧场版|总集篇|特典"
     if re.search(_sp_re, rn, re.IGNORECASE):
-        if not re.search(_sp_re, core, re.IGNORECASE):
+        if not re.search(_sp_re, core, re.IGNORECASE) and not (season == 0 and episode > 0):
             return -1
 
     # 电影形态硬隔离：若点播为电影 (season=0, episode=0)

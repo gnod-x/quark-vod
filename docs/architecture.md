@@ -11,6 +11,8 @@ flowchart LR
     API --> Search[Search registry snapshot]
     Search --> HTML[HTML provider]
     Search --> JSON[JSON provider]
+    Search --> TG[Telegram Web Preview]
+    Search --> PanSou[Optional PanSou sidecar]
     Search --> Trusted[Allowlisted Python providers]
     API --> Resolve[Playback coordinator]
     Resolve --> State[SQLite state]
@@ -37,8 +39,12 @@ authorization, official save requests, and task polling stay in
 Episode basenames in an unknown Latin translation may inherit an exact work
 label from their enumerated parent directory only after season, episode, year,
 and technical suffix checks. Generic release-group suffixes are allowed, while
-explicit cut/edition labels such as Director's Cut, Theatrical, Extended, Unrated,
-Remastered, and numbered Version labels remain identity conflicts. The checks
+explicit conflicting cut/edition labels such as Director's Cut, Theatrical,
+Extended, Unrated and mismatched numbered Version/Part labels remain identity
+conflicts. Technical Remastered and compatible Part labels do not alone reject
+an otherwise exact episode. Deterministic `episode_rules` is shared by parsing
+and file selection; dates require exact local aired metadata rather than a guessed
+episode number. The checks
 apply before release-group removal and also preserve known title/version
 conflicts; a release-group prefix alone is not an edition label.
 
@@ -82,6 +88,10 @@ configured independently; cross-process lock files live under
 `app/quark_vod/db.py` owns the monotonic schema version in SQLite
 `PRAGMA user_version`. Schema version 2 adds the nullable save_file_fid
 recovery field to existing databases without changing version-1 migration SQL.
+The 3.1 development candidate adds migration 3: variant-qualified transfers,
+audits and STRM mappings; staging, airing-calendar, notification and wishlist
+state; and `replacement_commits` receipts. The released migration-2 SQL is
+unchanged. Default variants retain their existing IDs, references and paths.
 A version-0 database from the supported legacy schema is
 checked with SQLite `quick_check` and upgraded transactionally during application
 startup, before stale-transfer cleanup or background work begins. Startup
@@ -103,6 +113,24 @@ service process and host-side state writer before starting a new version. Startu
 locking serializes schema initialization, but it cannot prevent an already-running
 older binary from continuing to write after a migration. Schema changes that need
 overlap require an explicitly staged, backward-compatible migration.
+
+## Source replacement
+
+Replacement runs under the maintenance lease and exact Work/variant lock.
+It validates the selected share file, creates an independent candidate row,
+and durably records an intent plus the previous STRM contents. The previous
+done row and audit remain authoritative until the new file is saved and ready,
+all exact mapped STRMs are activated and read back, and a single SQLite
+transaction publishes the candidate, audit, old-share ban and unique commit
+receipt. Sharing a URL is not proof that this particular replacement committed.
+
+Before commit, failures restore this attempt’s STRM snapshot and preserve the
+previous cloud file. Ambiguous saves resume the same candidate instead of
+submitting again. After commit, cleanup only removes the exact old leaf when
+the active entry still belongs to the candidate and no shared reference exists.
+`cleanup_pending=true` means the new source is ready but old-file cleanup
+requires retry; it never means permission to delete the parent slot or recycle
+bin. See [transfer recovery](transfer-evolution.md).
 
 ## Playback modes
 
@@ -190,6 +218,18 @@ The command cleanup --enforce-quota retains its quota/mismatch-only scope.
 Operators who also want the expiry queue drained must add --with-expiry;
 this is an explicit schedule change. Image cleanup remains separate and
 requires its configured metadata roots and a completed library scan.
+
+## Notification settings
+
+The authenticated admin page stores Telegram credentials and the P2 preference
+in a private, atomically replaced file under the shared data directory. Runtime
+delivery reloads this file for each event; environment configuration remains the
+fallback until the first save. The management API returns credential presence,
+never the bot token. Explicit test delivery uses a fixed Telegram endpoint and
+message with a persistent cooldown. Invalid private state stops delivery instead
+of falling back to potentially disabled credentials. Other transports retain
+their configuration, and all P2 delivery follows the effective viewing setting.
+See [notification settings](notification-settings.md) for the API and precedence.
 
 ## Deployment
 

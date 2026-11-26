@@ -36,19 +36,30 @@ class Work:
     title: str
     season: int = 0
     episode: int = 0
+    variant: str = ""
+    media_type: str = ""
 
     def __post_init__(self):
         object.__setattr__(self, 'cat', normalize(self.cat))
         object.__setattr__(self, 'title', normalize(self.title))
         if not self.title or self.season < 0 or self.episode < 0:
             raise ValueError('标题或季集参数无效')
-        if bool(self.season) != bool(self.episode):
-            raise ValueError('剧集须同时指定季和集；电影使用 0/0')
+        if self.variant not in ('', 'hdr', 'sdr', 'dubbed', 'remux'):
+            raise ValueError('未知播放版本')
+        if (self.season > 0 and self.episode == 0
+                or self.season == 0 and self.episode > 0
+                and self.media_type not in ('tv','anime')
+                and media_kind(self.cat) == 'movie'):
+            raise ValueError('电影使用 0/0；特别篇使用 Season 00 与明确剧集分类')
 
     @property
     def key(self):
-        return (self.cat, self.title.casefold(), self.season, self.episode)
+        return (self.cat, self.title.casefold(), self.season, self.episode, self.variant)
 
     @property
     def args(self):
         return self.cat, self.title, self.season, self.episode
+
+    @property
+    def options(self):
+        return {'variant': self.variant} if self.variant else {}

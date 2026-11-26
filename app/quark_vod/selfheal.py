@@ -43,11 +43,17 @@ def _remote_exists_batch(tr, remote_paths):
     An incomplete/auth/network response is unknown, never deletion evidence.
     """
     cache = {}
+    fids = {}
     root = config.QUARK_VOD_ROOT.rstrip('/')
     def listing(path):
         if path not in cache:
             try:
-                cache[path] = {entry['name']:entry for entry in tr._quark_list(path)}
+                entries = (tr._quark_list_fid(fids[path]) if path in fids and
+                           callable(getattr(tr,'_quark_list_fid',None)) else tr._quark_list(path))
+                cache[path] = {entry['name']:entry for entry in entries}
+                for name,item in cache[path].items():
+                    if item.get('is_dir') and item.get('fid'):
+                        fids[path+'/'+name]=item['fid']
             except Exception as exc:
                 cache[path] = {} if '不存在该目录' in str(exc) else None
         return cache[path]
@@ -77,13 +83,13 @@ def _remote_exists(tr, remote_path):
 
 def _pending_from_map(strm_path):
     rows = db._conn().execute(
-        'SELECT cat,title,season,episode FROM strm_map WHERE strm_path=?', (strm_path,)).fetchall()
+        'SELECT cat,title,season,episode,variant FROM strm_map WHERE strm_path=?', (strm_path,)).fetchall()
     if not rows:
         return ''
     parts = os.path.relpath(strm_path, config.CINEMA2_DIR).split(os.sep)
     row = rows[0]
     cat, title = (parts[0],parts[1]) if len(parts)>=3 and '..' not in parts else (row['cat'],row['title'])
-    query=urllib.parse.urlencode({'cat':cat,'t':title,'s':row['season'],'e':row['episode']})
+    query=urllib.parse.urlencode({'cat':cat,'t':title,'s':row['season'],'e':row['episode'],**({'variant':row['variant']} if row['variant'] else {})})
     return strm_manager.PENDING_PREFIX+'?'+query
 
 
@@ -117,7 +123,7 @@ def _restore_missing_batch(tr, groups):
                     if not params or not os.path.isfile(path):
                         local_failed+=1
                         continue
-                    strm_manager.restore_pending(path,params['cat'],params['title'],params['season'],params['episode'])
+                    strm_manager.restore_pending(path,params['cat'],params['title'],params['season'],params['episode'],**({'variant':params['variant']} if params.get('variant') else {}))
                     if strm_manager.is_pending(strm_manager.read_strm(path)):
                         restored+=1
                     else:
@@ -198,12 +204,17 @@ def heal_loop(stop_event=None, verbose=True):
     while stop_event is None or not stop_event.is_set():
         interval=config.SELFHEAL_INTERVAL
         try:
-            _,_,_,skipped=scan_and_heal(verbose=verbose)
-            if skipped:
-                interval=60
+            if config.MAINTENANCE_ENABLED:
+                from .subtitles import schedule_pending
+                schedule_pending()
+                _,_,_,skipped=scan_and_heal(verbose=verbose)
+                if skipped:
+                    interval=max(900,min(1800,config.SELFHEAL_INTERVAL))
         except Exception as exc:
-            interval=60
+            interval=max(300,min(1800,config.SELFHEAL_INTERVAL))
             print(f'[selfheal] 检查失败: {type(exc).__name__}',flush=True)
+        finally:
+            db.close()
         if wait(interval):
             return
 

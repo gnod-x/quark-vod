@@ -26,6 +26,12 @@ from . import config
 from . import db
 from . import cleaner, download_http
 
+VARIANT_LABELS={'hdr':'4K HDR 原声','sdr':'SDR 兼容','dubbed':'1080P 国配','remux':'4K REMUX'}
+
+def variant_from_path(path):
+    stem=os.path.splitext(os.path.basename(path))[0]
+    return next((key for key,label in VARIANT_LABELS.items() if stem.endswith(' - '+label)),'')
+
 PENDING_PREFIX = f"{config.PENDING_BASE_URL}/pending"
 
 # 后台限流刷新队列（解决全季 40 集连带激活时并发发起 40 个 FullRefresh 挤占首播带宽）
@@ -82,24 +88,46 @@ def _ensure_refresh_worker():
                     pass
                 finally:
                     _refresh_queue.task_done()
+                    db.close()
                 time.sleep(1.5)  # 限流：每 1.5s 串行刷新一集，保护首播带宽与 Jellyfin2 CPU
 
         threading.Thread(target=_worker, daemon=True, name="jf2-refresh-limiter").start()
 
 
-def strm_path_for(cat, title, season, episode):
+def strm_path_for(cat, title, season, episode, *, variant=""):
     """推导 cinema2 中的 strm 路径。
 
     电影:   cinema2/<cat>/<title> (<year>)/<title> (<year>).strm
     剧集:   cinema2/<cat>/<title>/Season NN/<title> - SNNENN.strm
     """
-    if season:
+    if variant not in ("",*VARIANT_LABELS):raise ValueError("未知版本")
+    if episode:
         d = os.path.join(config.CINEMA2_DIR, cat, title, f"Season {season:02d}")
         f = f"{title} - S{season:02d}E{episode:02d}.strm"
     else:
         d = os.path.join(config.CINEMA2_DIR, cat, title)
         f = f"{title}.strm"
+    if variant:f=f[:-5]+' - '+VARIANT_LABELS[variant]+'.strm'
     return os.path.join(d, f)
+
+
+def ensure_variant(cat, title, season, episode, variant):
+    """Create an opt-in version beside an existing, validated work directory."""
+    from pathlib import Path
+    from .identity import Work
+    work=Work(cat,title,season,episode,variant)
+    if not variant:raise ValueError('必须指定版本')
+    root=Path(config.CINEMA2_DIR).resolve(strict=True)
+    path=Path(strm_path_for(*work.args,variant=variant))
+    if (any(value in ('.','..') or '/' in value or chr(92) in value for value in (cat,title))
+            or root not in path.parent.resolve(strict=True).parents):
+        raise ValueError('版本路径越界')
+    if path.is_symlink():raise ValueError('版本入口不能是符号链接')
+    if not path.exists():
+        query=urllib.parse.urlencode({'cat':cat,'t':title,'s':season,'e':episode,'variant':variant})
+        _atomic_write(str(path),PENDING_PREFIX+'?'+query)
+    db.save_strm_map(*work.args,str(path),variant=variant)
+    return str(path)
 
 
 def library_search_identity(cat, title, season):
@@ -112,7 +140,7 @@ def library_search_identity(cat, title, season):
     if any(not part or part in ('.', '..') or '/' in part or chr(92) in part for part in (cat, title)):
         return title, ()
     root = Path(config.CINEMA2_DIR).absolute()
-    kind = 'tvshow' if season else 'movie'
+    kind = 'tvshow' if season or os.path.isfile(os.path.join(config.CINEMA2_DIR,cat,title,'tvshow.nfo')) else 'movie'
     path = root / cat / title / (kind + '.nfo')
     try:
         if path.resolve() != path or not path.is_file():
@@ -135,7 +163,19 @@ def library_search_identity(cat, title, season):
     if len(years) > 1:
         return title, ()
     original = normalize(metadata.findtext('originaltitle'))
-    aliases = (original,) if 0 < len(original) <= 120 and original.casefold() != name.casefold() else ()
+    aliases=[]
+    for value in [original]+[element.text or '' for element in metadata.findall('aka')]:
+        value=normalize(value)
+        if 0<len(value)<=120 and value.casefold()!=name.casefold() and value not in aliases:aliases.append(value)
+    if season:
+        season_nfo=root/cat/title/f'Season {season:02d}'/'season.nfo'
+        try:
+            if season_nfo.resolve()==season_nfo and season_nfo.stat().st_size<=128*1024:
+                season_metadata=ET.fromstring(season_nfo.read_bytes())
+                value=normalize(season_metadata.findtext('title'))
+                if value and not re.fullmatch(r'(?i)Season\s*\d+|第\s*\d+\s*季',value):aliases.append(value)
+        except (OSError,ValueError,RuntimeError,ET.ParseError):pass
+    aliases=tuple(aliases)
     return f'{name} ({next(iter(years))})' if years else title, aliases
 
 
@@ -165,8 +205,8 @@ def scan_and_register():
                 title = title_dir.strip()
                 for fn in sorted(os.listdir(tdir)):
                     path = os.path.join(tdir, fn)
-                    if fn.endswith(".strm") and " - S" not in fn and os.path.isfile(path):
-                        rows.append((cat, title, 0, 0, path))
+                    if fn.endswith(".strm") and not re.search(r" - S\d+E\d+", fn) and os.path.isfile(path):
+                        rows.append((cat, title, 0, 0, path, variant_from_path(path)))
                 for sub in sorted(os.listdir(tdir)):
                     if not sub.startswith("Season "):
                         continue
@@ -178,12 +218,12 @@ def scan_and_register():
                     except (IndexError, ValueError):
                         continue
                     for fn in sorted(os.listdir(sdir)):
-                        match = re.search(r"- S(\d{1,3})E(\d{1,4})\.strm$", fn)
+                        match = re.search(r"- S(\d{1,3})E(\d{1,4})(?: - [^.]+)?\.strm$", fn)
                         if not match or int(match.group(1)) != season:
                             continue
                         path = os.path.join(sdir, fn)
                         if os.path.isfile(path):
-                            rows.append((cat, title, season, int(match.group(2)), path))
+                            rows.append((cat, title, season, int(match.group(2)), path, variant_from_path(path)))
         root_after = os.stat(root)
         if (root_before.st_dev, root_before.st_ino) != (root_after.st_dev, root_after.st_ino):
             raise RuntimeError("library root changed during registration scan")
@@ -192,21 +232,21 @@ def scan_and_register():
         con.execute("BEGIN IMMEDIATE")
         try:
             con.executemany(
-                "INSERT OR REPLACE INTO strm_map (cat,title,season,episode,strm_path) VALUES (?,?,?,?,?)",
+                "INSERT OR REPLACE INTO strm_map (cat,title,season,episode,strm_path,variant) VALUES (?,?,?,?,?,?)",
                 rows,
             )
             stale = []
             prefix = root.rstrip(os.sep) + os.sep
-            for row in con.execute("SELECT cat,title,season,episode,strm_path FROM strm_map"):
+            for row in con.execute("SELECT cat,title,season,episode,strm_path,variant FROM strm_map"):
                 path = os.path.abspath(row["strm_path"])
                 if not path.startswith(prefix):
                     continue
                 try:
                     os.stat(path)
                 except FileNotFoundError:
-                    stale.append((row["cat"], row["title"], row["season"], row["episode"], row["strm_path"]))
+                    stale.append((row["cat"], row["title"], row["season"], row["episode"], row["strm_path"],row["variant"]))
             con.executemany(
-                "DELETE FROM strm_map WHERE cat=? AND title=? AND season=? AND episode=? AND strm_path=?",
+                "DELETE FROM strm_map WHERE cat=? AND title=? AND season=? AND episode=? AND strm_path=? AND variant=?",
                 stale,
             )
             con.commit()
@@ -298,6 +338,7 @@ def parse_pending_params(content):
             "title": (q.get("t") or [""])[0],
             "season": int((q.get("s") or ["0"])[0] or 0),
             "episode": int((q.get("e") or ["0"])[0] or 0),
+            "variant": (q.get("variant") or [""])[0],
         }
     except Exception:
         return None
@@ -354,7 +395,7 @@ def write_live(path, direct_url, force=False):
     return True
 
 
-def restore_pending(path, cat, title, season, episode):
+def restore_pending(path, cat, title, season, episode, *, variant=None):
     """把 strm 还原为 pending 占位（清理后调用）。
 
     ⚠️ 严禁剥离年份后缀：pending 的 t 参数必须与 cinema2 目录名保持一致
@@ -368,7 +409,12 @@ def restore_pending(path, cat, title, season, episode):
     from .search import strip_invisible
     safe_title = strip_invisible(title) or title
     import urllib.parse
-    q = urllib.parse.urlencode({"cat": cat, "t": safe_title, "s": season, "e": episode})
+    if variant is None:
+        variant=variant_from_path(path)
+    if variant not in ("",*VARIANT_LABELS):raise ValueError('未知版本')
+    params={"cat":cat,"t":safe_title,"s":season,"e":episode}
+    if variant:params['variant']=variant
+    q = urllib.parse.urlencode(params)
     url = f"{PENDING_PREFIX}?{q}"
     cur = read_strm(path)
     if is_pending(cur):
@@ -377,20 +423,23 @@ def restore_pending(path, cat, title, season, episode):
     return True
 
 
-def activate(cat, title, season, episode, direct_url, background_batch=False):
-    """Activate only paths whose folder identity agrees with the requested work."""
+def activation_paths(cat, title, season, episode, *, variant=""):
+    """Return exact identity-matched paths used by activation and replacement rollback."""
     from .identity import same_title, media_kind
-    actual_title = db.library_title(cat, title, season, episode)
+    opts={"variant":variant} if variant else {}
+    actual_title = db.library_title(cat, title, season, episode, **opts)
     rows = db._conn().execute(
-        'SELECT cat,title,strm_path FROM strm_map WHERE season=? AND episode=?',
-        (season, episode)).fetchall()
+        'SELECT cat,title,strm_path FROM strm_map WHERE season=? AND episode=? AND variant=?',
+        (season, episode,variant)).fetchall()
     paths = set()
     for row in rows:
         path = row['strm_path']
-        if not os.path.isfile(path):
+        if (not os.path.isfile(path) or os.path.islink(path)
+                or variant_from_path(path)!=variant
+                or os.path.commonpath((os.path.realpath(path),os.path.realpath(config.CINEMA2_DIR)))!=os.path.realpath(config.CINEMA2_DIR)):
             continue
         import re
-        episode_hint = re.search(r'S(\d+)E(\d+)\.strm$', os.path.basename(path))
+        episode_hint = re.search(r'S(\d+)E(\d+)(?: - [^.]+)?\.strm$', os.path.basename(path))
         if episode_hint and tuple(map(int, episode_hint.groups())) != (season, episode):
             continue
         kind, name, year = _work_identity(path)
@@ -398,11 +447,21 @@ def activate(cat, title, season, episode, direct_url, background_batch=False):
         if kind == media_kind(cat, season) and same_title(actual_title, path_title):
             paths.add(path)
     # Support newly generated files not yet registered by a background scan.
-    fallback = _fuzzy_find(cat, actual_title, season, episode)
-    if fallback:
+    fallback = _fuzzy_find(cat, actual_title, season, episode, **opts)
+    if (fallback and not os.path.islink(fallback)
+            and variant_from_path(fallback)==variant
+            and os.path.commonpath((os.path.realpath(fallback),os.path.realpath(config.CINEMA2_DIR)))==os.path.realpath(config.CINEMA2_DIR)):
         paths.add(fallback)
     if not paths:
         raise FileNotFoundError(f'找不到同一作品的 STRM: {cat}/{title} S{season}E{episode}')
+    return sorted(paths)
+
+
+def activate(cat, title, season, episode, direct_url, background_batch=False, *, variant=""):
+    """Activate only paths whose folder identity agrees with the requested work."""
+    opts={"variant":variant} if variant else {}
+    paths=activation_paths(cat,title,season,episode,variant=variant)
+    if not paths:raise FileNotFoundError('没有可激活的同作品 STRM')
     remote = parse_live_remote_path(direct_url)
     changed = False
     for path in sorted(paths):
@@ -411,28 +470,20 @@ def activate(cat, title, season, episode, direct_url, background_batch=False):
             # Every new playback returns through the resolver. Deleting a leaf
             # or expiring a save can no longer leave a permanent direct dead link.
             rel = os.path.relpath(path, config.CINEMA2_DIR).split(os.sep)
-            query = urllib.parse.urlencode({'cat':rel[0], 't':rel[1], 's':season, 'e':episode, 'r':remote})
+            query = urllib.parse.urlencode({'cat':rel[0], 't':rel[1], 's':season, 'e':episode, 'r':remote, **opts})
             url = config.PENDING_BASE_URL + '/play?' + query
         wrote = write_live(path, url)
         changed = changed or wrote
         if wrote:
             trigger_jellyfin_refresh_item(path, throttled=background_batch)
     primary = next((p for p in sorted(paths) if os.path.relpath(p, config.CINEMA2_DIR).split(os.sep)[0] == cat), sorted(paths)[0])
-    db.save_strm_map(cat, title, season, episode, primary)
-    _sync_transfer_done(cat, [title], season, episode, parse_live_remote_path(direct_url))
+    db.save_strm_map(cat, title, season, episode, primary, **opts)
+    _sync_transfer_done(cat, [title], season, episode, parse_live_remote_path(direct_url), variant=variant)
     return changed
 
 
-def _sync_transfer_done(cat, title_candidates, season, episode, remote_path):
-    """把 (cat, title, season, episode) 对应的 transfers 记录覆盖为 done。
-
-    2026-10-21 新增：activate() 的 DB 自愈步骤。处理三类历史脏数据：
-      1) status 为 cleaned/failed 但 strm 已是活链（自愈作废与转存成功竞态）；
-      2) cat 不一致（同片被放进多个专区，upsert 时用了另一个 cat）；
-      3) title 带/不带年份两种形态各有一条记录，只更新了一条。
-    找不到任何记录时不插入（避免为从未走转存流程的条目造假），
-    仅打印提示交由调用方判断。
-    """
+def _sync_transfer_done(cat, title_candidates, season, episode, remote_path, *, variant=""):
+    """仅修复同分类、标题、季集、版本且精确远端一致的既有记录。"""
     import time as _time
     if not remote_path:
         return
@@ -444,16 +495,9 @@ def _sync_transfer_done(cat, title_candidates, season, episode, remote_path):
         for t_cand in title_candidates:
             cur = con.execute(
                 "SELECT id FROM transfers WHERE cat=? AND title=? AND season=? AND episode=? "
-                "AND remote_path IN (?,?)",
-                (cat, t_cand, season, episode, *remote_candidates))
+                "AND variant=? AND remote_path IN (?,?)",
+                (cat, t_cand, season, episode, variant, *remote_candidates))
             ids = [r["id"] for r in cur.fetchall()]
-            if not ids:
-                # 退化：忽略 cat 与 title 年份形态，只按 season/episode + 名称包含
-                cur = con.execute(
-                    "SELECT id, title FROM transfers WHERE season=? AND episode=? "
-                    "AND title=? AND remote_path IN (?,?)",
-                    (season, episode, t_cand, *remote_candidates))
-                ids = [r["id"] for r in cur.fetchall()]
             for tid in ids:
                 con.execute(
                     "UPDATE transfers SET status='done', error=NULL, updated_at=? WHERE id=? AND status<>'done'",
@@ -563,13 +607,13 @@ def _same_work(path_a, path_b):
     return True
 
 
-def _all_strm_paths_by_title(title, season, episode):
+def _all_strm_paths_by_title(title, season, episode, *, variant=""):
     """返回该片所有存在的 strm 路径（多专区时需全部回写）。"""
     out = []
     try:
         rows = db._conn().execute(
-            "SELECT strm_path FROM strm_map WHERE title=? AND season=? AND episode=?",
-            (title, season, episode)).fetchall()
+            "SELECT strm_path FROM strm_map WHERE title=? AND season=? AND episode=? AND variant=?",
+            (title, season, episode,variant)).fetchall()
     except Exception:
         return out
     for r in rows:
@@ -579,7 +623,7 @@ def _all_strm_paths_by_title(title, season, episode):
     return out
 
 
-def _fuzzy_find(cat, title, season, episode):
+def _fuzzy_find(cat, title, season, episode, *, variant=""):
     """目录名带年份等情况时模糊匹配。
 
     2026-10-16 修复：目录名与文件名存在年份差异时自适应匹配。
@@ -604,19 +648,55 @@ def _fuzzy_find(cat, title, season, episode):
 
     for cand in cands:
         base = os.path.join(catdir, cand)
-        if season:
+        if episode:
             d = os.path.join(base, f"Season {season:02d}")
             if os.path.isdir(d):
                 target_token = f"S{season:02d}E{episode:02d}"
                 for fn in sorted(os.listdir(d)):
-                    if fn.endswith(".strm") and re.search(rf'S0*{season}E0*{episode}\.strm$', fn):
+                    if fn.endswith(".strm") and variant_from_path(fn)==variant and re.search(rf'S0*{season}E0*{episode}(?: - [^.]+)?\.strm$', fn):
                         fp = os.path.join(d, fn)
                         if os.path.isfile(fp):
                             return fp
         else:
             for fn in sorted(os.listdir(base)):
-                if fn.endswith(".strm") and (" - S" not in fn):
+                if fn.endswith(".strm") and (not re.search(r" - S\d+E\d+", fn)) and variant_from_path(fn)==variant:
                     fp = os.path.join(base, fn)
                     if os.path.isfile(fp):
                         return fp
     return None
+
+def episode_context(cat, title, season, episode):
+    """Read bounded local episode metadata; incomplete previous seasons give no offset."""
+    from pathlib import Path
+    import xml.etree.ElementTree as ET
+    if any(not value or value in ('.','..') or '/' in value or chr(92) in value for value in (cat,title)):
+        return 0,''
+    root=Path(config.CINEMA2_DIR).absolute()
+    work=root/cat/title
+    if work.resolve()!=work or not work.is_dir():return 0,''
+    offset=0
+    for number in range(1,season):
+        directory=work/f'Season {number:02d}'
+        try:
+            episodes=set()
+            for path in list(directory.glob('*.nfo'))[:1001]:
+                if path.is_symlink() or path.stat().st_size>128*1024:continue
+                doc=ET.fromstring(path.read_bytes())
+                if doc.tag!='episodedetails':continue
+                if int(doc.findtext('season','-1'))==number:
+                    episodes.add(int(doc.findtext('episode','-1')))
+            if not episodes or episodes!=set(range(1,max(episodes)+1)):return 0,''
+            offset+=len(episodes)
+        except (OSError,ValueError,ET.ParseError):return 0,''
+    aired=''
+    try:
+        for path in list((work/f'Season {season:02d}').glob('*.nfo'))[:1001]:
+            if path.is_symlink() or path.stat().st_size>128*1024:continue
+            doc=ET.fromstring(path.read_bytes())
+            if (doc.tag=='episodedetails' and int(doc.findtext('season','-1'))==season
+                    and int(doc.findtext('episode','-1'))==episode):
+                aired=doc.findtext('aired','').replace('-','')
+                if len(aired)!=8 or not aired.isdigit():aired=''
+                break
+    except (OSError,ValueError,ET.ParseError):pass
+    return offset,aired

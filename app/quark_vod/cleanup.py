@@ -281,6 +281,9 @@ def enforce_vod_quota(ol=None, max_bytes=None, target_bytes=None,
     # 安全护栏：点播本身很小时不做任何淘汰。
     # 空间被 /视频、/游戏 等非本系统目录占用时，删点播既救不了空间、又会误伤资源。
     if total_bytes <= VOD_MIN_EVICT_BYTES:
+        if not dry_run:
+            from .operational_events import emit
+            emit('quota_cleanup_blocked')
         if verbose:
             print(f"[quota] ⚠️ 使用率超水位，但点播仅占 {total_bytes / gb:.2f} GB "
                   f"(低于 {VOD_MIN_EVICT_BYTES / gb:.0f}GB 淘汰底线)，不执行淘汰。"
@@ -457,6 +460,9 @@ def enforce_vod_quota(ol=None, max_bytes=None, target_bytes=None,
             freed_bytes += sz
             evicted_cnt += 1
 
+    if not dry_run and freed_bytes < evict_goal:
+        from .operational_events import emit
+        emit('quota_cleanup_blocked')
     print(f"[quota] 配额淘汰完成！共清理 {evicted_cnt} 部冷门影片，释放 {freed_bytes / gb:.2f} GB，当前点播网盘占用: {total_bytes / gb:.2f} GB",
           flush=True)
     return evicted_cnt, freed_bytes, total_bytes
@@ -571,18 +577,20 @@ def _restore_all(tr, verbose=True):
     """本次 remote 对应的 STRM 全部恢复才返回 True；其他源的文件不动。"""
     cat, title = tr["cat"], tr["title"]
     season, episode = tr["season"], tr["episode"]
+    variant=dict(tr).get("variant","")
+    opts={"variant":variant} if variant else {}
     paths = set()
 
     # 1) strm_map 精确
-    p = db.get_strm_path(cat, title, season, episode)
+    p = db.get_strm_path(cat, title, season, episode, **opts)
     if p and os.path.isfile(p):
         paths.add(p)
     # 2) strm_map 仅按 title
-    for q in strm_manager._all_strm_paths_by_title(title, season, episode):
+    for q in strm_manager._all_strm_paths_by_title(title, season, episode, **opts):
         paths.add(q)
     # 3) 路径推导 + 模糊查找
-    for q in (strm_manager.strm_path_for(cat, title, season, episode),
-              strm_manager._fuzzy_find(cat, title, season, episode)):
+    for q in (strm_manager.strm_path_for(cat, title, season, episode, **opts),
+              strm_manager._fuzzy_find(cat, title, season, episode, **opts)):
         if q and os.path.isfile(q):
             paths.add(q)
 
@@ -595,7 +603,7 @@ def _restore_all(tr, verbose=True):
                 continue
             parts = os.path.relpath(q, config.CINEMA2_DIR).split(os.sep)
             target_cat, target_title = (parts[0], parts[1]) if len(parts)>=3 else (cat, title)
-            changed = strm_manager.restore_pending(q, target_cat, target_title, season, episode)
+            changed = strm_manager.restore_pending(q, target_cat, target_title, season, episode, **opts)
             if not strm_manager.is_pending(strm_manager.read_strm(q)):
                 failed = True
             if changed and verbose:
@@ -621,7 +629,7 @@ def clean_mismatched_short_dramas(dry_run=False, verbose=True):
     con = db._conn()
     cur = con.cursor()
 
-    cur.execute("SELECT id, cat, title, season, episode, remote_path FROM transfers WHERE season=0 AND episode=0 AND status='done' AND remote_path IS NOT NULL")
+    cur.execute("SELECT id, cat, title, season, episode, variant, remote_path FROM transfers WHERE season=0 AND episode=0 AND status='done' AND remote_path IS NOT NULL")
     done_movies = cur.fetchall()
     unresolved = _unresolved_cloud_references(con)
     protected_titles = get_protected_titles()

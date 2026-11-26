@@ -43,12 +43,15 @@ class SearchNode:
     enabled: bool = True
     path: str = "/search"
     query_param: str = "q"
+    channels: tuple = ()
+    categories: tuple = ()
 
     def as_dict(self):
         return {"id": self.id, "key": self.id, "name": self.name,
                 "provider": self.provider, "base": self.base,
                 "timeout": self.timeout, "enabled": self.enabled,
-                "path": self.path, "query_param": self.query_param}
+                "path": self.path, "query_param": self.query_param,
+                "channels": list(self.channels), "categories": list(self.categories)}
 
     def public_dict(self):
         return {"id": self.id, "name": self.name, "provider": self.provider,
@@ -68,7 +71,7 @@ class SearchSnapshot:
 
 def provider_names():
     with _PROVIDER_LOCK:
-        return tuple(sorted({"html", "json"} | set(_PROVIDERS)))
+        return tuple(sorted({"html", "json", "tg_web", "pansou"} | set(_PROVIDERS)))
 
 
 def register_provider(name: str, fetch: Callable):
@@ -77,7 +80,7 @@ def register_provider(name: str, fetch: Callable):
     Built-ins cannot be replaced. Registration is startup-only; configuration
     hot reload changes nodes, not the code of an executing provider.
     """
-    if not isinstance(name, str) or not _ID.fullmatch(name) or name in ("html", "json") or not callable(fetch):
+    if not isinstance(name, str) or not _ID.fullmatch(name) or name in ("html", "json", "tg_web", "pansou") or not callable(fetch):
         raise PluginConfigError("invalid_provider_registration")
     with _PROVIDER_LOCK:
         if name in _PROVIDERS and _PROVIDERS[name] is not fetch:
@@ -94,7 +97,7 @@ def load_entrypoints(names=None):
     """Load only names explicitly selected by VOD_SEARCH_PLUGINS."""
     names = names if names is not None else config._value("VOD_SEARCH_PLUGINS").split(",")
     names = tuple(dict.fromkeys(n.strip() for n in names if n.strip()))
-    if any(not _ID.fullmatch(n) or n in ("html", "json") for n in names):
+    if any(not _ID.fullmatch(n) or n in ("html", "json", "tg_web", "pansou") for n in names):
         raise PluginConfigError("invalid_entrypoint_selection")
     if not names:
         return {}
@@ -137,7 +140,7 @@ def _valid_base(value):
 
 
 def _node(raw):
-    if not isinstance(raw, dict) or set(raw) - {"id", "key", "name", "provider", "base", "timeout", "enabled", "path", "query_param"}:
+    if not isinstance(raw, dict) or set(raw) - {"id", "key", "name", "provider", "base", "timeout", "enabled", "path", "query_param", "channels", "categories"}:
         raise PluginConfigError("invalid_node_fields")
     identifier = raw.get("id", raw.get("key"))
     if not isinstance(identifier, str) or not _ID.fullmatch(identifier):
@@ -158,15 +161,26 @@ def _node(raw):
     timeout = raw.get("timeout", 4.0)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not .1 <= timeout <= 7:
         raise PluginConfigError("invalid_timeout")
-    path = raw.get("path", "/search")
+    path = raw.get("path", "/api/search" if provider == "pansou" else "/search")
     if (not isinstance(path, str) or not path.startswith("/") or path.startswith("//")
         or len(path) > 1024 or any(ord(c) < 33 for c in path) or "?" in path or "#" in path):
         raise PluginConfigError("invalid_search_path")
     query_param = raw.get("query_param", "q")
     if not isinstance(query_param, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", query_param):
         raise PluginConfigError("invalid_query_parameter")
-    return SearchNode(identifier, name.strip(), provider, _valid_base(raw.get("base")),
-                      float(timeout), enabled, path, query_param)
+    channels = raw.get("channels", [])
+    categories = raw.get("categories", [])
+    if (not isinstance(channels, (list, tuple)) or len(channels) > 64
+        or any(not isinstance(c, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,63}", c) for c in channels)):
+        raise PluginConfigError("invalid_channels")
+    if (not isinstance(categories, (list, tuple)) or len(categories) > 32
+        or any(not isinstance(c, str) or not c.strip() or len(c) > 80
+               or any(ord(ch) < 32 for ch in c) for c in categories)):
+        raise PluginConfigError("invalid_categories")
+    base = raw.get("base", "https://t.me" if provider == "tg_web" else None)
+    return SearchNode(identifier, name.strip(), provider, _valid_base(base),
+                      float(timeout), enabled, path, query_param,
+                      tuple(dict.fromkeys(channels)), tuple(dict.fromkeys(c.strip() for c in categories)))
 
 
 def snapshot_from_nodes(nodes, generation=0):

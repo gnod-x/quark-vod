@@ -95,6 +95,9 @@ class VodAuditor:
         targets = sorted(set(episodes))[:500]
         cached = {ep: db.get_source_audit(cat, title, season, ep) for ep in targets}
         invalid_status = {'dead', 'not_found', 'invalid', 'expired'}
+        if not force and targets and all(row and row['check_status'] == 'no_source'
+                and db.now() - row['checked_at'] < 86400 for row in cached.values()):
+            return False, False, '', 'cached scoped no_source'
         if not force and all(row and row['has_quark_source'] and row['best_share_url']
                 and str(row['check_status'] or '').lower() not in invalid_status
                 and db.now()-row['checked_at'] < 86400 and not db.is_dead_source(row['best_share_url'])
@@ -104,6 +107,8 @@ class VodAuditor:
         best = {}
         missing = set()
         attempted = set()
+        search_complete = False
+        inspection_errors = []
 
         def inspect_source(url, label):
             if url in attempted or db.is_dead_source(url):
@@ -125,6 +130,7 @@ class VodAuditor:
                         best[ep] = (is4k, url, label)
             except Exception:
                 # A timeout or incomplete traversal does not prove a dead source.
+                inspection_errors.append(True)
                 return
 
         # Existing file evidence is independent of search coverage. Recheck up
@@ -138,16 +144,24 @@ class VodAuditor:
             inspect_source(url, label)
         if not all(ep in best and best[ep][0] for ep in targets):
             try:
+                report = search_mod.search_report(search_title, season=season,
+                    episode=targets[0] if targets else 0, aliases=aliases)
+                search_complete = bool(report.get('configured')) and not report.get('partial') and not report.get('configuration_error')
                 candidates = search_mod.rank_candidates(
-                    search_mod.search(search_title, prefer_panshare=True, season=season,
-                                      episode=targets[0] if targets else 0, aliases=aliases),
-                    search_title, season, targets[0] if targets else 0, cat, aliases=aliases)
+                    report['results'], search_title, season, targets[0] if targets else 0, cat, aliases=aliases)
+                if len(candidates) > 6:
+                    search_complete = False
             except Exception:
                 candidates = []
             for candidate in candidates[:6]:
                 inspect_source(candidate.share_url, candidate.name)
                 if all(ep in best and best[ep][0] for ep in targets):
                     break
+        if search_complete and not inspection_errors:
+            for ep in set(targets) - best.keys():
+                # Complete configured search plus successful enumerations is scoped absence evidence.
+                db.save_source_audit(cat, title, season, ep, has_quark_source=0, is_4k=0,
+                                     check_status='no_source')
         # Complete enumeration can disprove this episode without disproving the
         # public share or changing evidence for episodes outside this request.
         for ep in missing - best.keys():

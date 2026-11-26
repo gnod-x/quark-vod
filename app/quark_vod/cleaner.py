@@ -20,6 +20,7 @@
   3. 纯净流零开销：对未混淆的绝大多数正常资源直接放行原生直链，0 性能损失。
 """
 
+from collections import OrderedDict
 import re
 import threading
 import time
@@ -166,48 +167,37 @@ def open_clean_stream(url, skip, range_header="", request_headers=None, *, opene
         raise
 
 
-def detect_stream_obfuscation(direct_url, timeout=2.5):
-    """检测直链是否被注入了文件头伪装（图种混淆）。
+_probe_cache = OrderedDict()
+_probe_lock = threading.Lock()
 
-    发送轻量 Range: bytes=0-63 请求（仅 64 字节）：
-      - 若前 8 字节为 PNG 魔数，且后续包含 MKV 或 MP4 签名：
-        返回 (True, 8, "matroska" 或 "mp4")
-      - 纯净流：
-        返回 (False, 0, "")
-    """
+def remember_probe(direct_url, data):
+    with _probe_lock:
+        _probe_cache[direct_url]=(time.monotonic()+300, bytes(data))
+        _probe_cache.move_to_end(direct_url)
+        while len(_probe_cache)>64:_probe_cache.popitem(last=False)
+
+def detect_stream_obfuscation(direct_url, timeout=2.5):
+    """Reuse the readiness probe; only remove a proven video prefix."""
     if not direct_url or not direct_url.startswith("http"):
         return False, 0, ""
-
-    try:
-        req = urllib.request.Request(direct_url)
-        req.add_header("Range", "bytes=0-63")
-        req.add_header("User-Agent", "curl/8.14.1")
-        with download_http.urlopen(req, timeout=timeout) as resp:
-            data = resp.read(64)
-            if not data or len(data) < 16:
-                return False, 0, ""
-            hex_data = data.hex()
-
-            # 1. 8 字节 PNG 伪装
-            if hex_data.startswith(PNG_MAGIC_HEX):
-                if hex_data[16:24] == MKV_MAGIC_HEX:
-                    return True, 8, "matroska"
-                if MP4_FTYP_HEX in hex_data[16:]:
-                    return True, 8, "mp4"
-                return True, 8, "matroska"
-
-            # 2. 纯净 MKV
-            if hex_data.startswith(MKV_MAGIC_HEX):
-                return False, 0, "matroska"
-
-            # 3. 纯净 MP4 (offset 4 为 ftyp)
-            if len(hex_data) >= 16 and hex_data[8:16] == MP4_FTYP_HEX:
-                return False, 0, "mp4"
-
-    except Exception:
-        pass
-
-    return False, 0, ""
+    with _probe_lock:
+        cached=_probe_cache.get(direct_url)
+    data=cached[1] if cached and cached[0]>time.monotonic() else None
+    if data is None:
+        try:
+            req=urllib.request.Request(direct_url,headers={"Range":"bytes=0-63","User-Agent":"curl/8.14.1"})
+            with download_http.urlopen(req,timeout=timeout) as response:
+                data=response.read(64)
+            remember_probe(direct_url,data)
+        except Exception:return False,0,""
+    if not data or len(data)<16:return False,0,""
+    if data.startswith(bytes.fromhex(PNG_MAGIC_HEX)):
+        if data[8:12]==bytes.fromhex(MKV_MAGIC_HEX):return True,8,"matroska"
+        if data[12:16]==b"ftyp":return True,8,"mp4"
+        return False,0,""
+    if data[:4]==bytes.fromhex(MKV_MAGIC_HEX):return False,0,"matroska"
+    if data[4:8]==b"ftyp":return False,0,"mp4"
+    return False,0,""
 
 
 def clean_url_if_obfuscated(direct_url):
@@ -291,7 +281,10 @@ def _trigger_selfheal_for(raw_url, ttl=600):
                 from . import selfheal
                 selfheal.heal_remote(remote)
             except Exception as ex:
-                print(f"[{config.SERVICE_NAME}] [clean自愈] 回退失败 {remote}: {ex}", flush=True)
+                print(f"[{config.SERVICE_NAME}] [clean自愈] 回退失败: {type(ex).__name__}", flush=True)
+            finally:
+                from . import db
+                db.close()
 
         threading.Thread(target=_bg, daemon=True, name="clean-heal").start()
     except Exception:

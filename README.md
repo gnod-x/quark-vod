@@ -9,11 +9,19 @@ maintenance are explicit opt-ins.
 
 ## What is included
 
-- HTML and JSON search providers, configurable independently of playback.
+- Built-in HTML, JSON, Telegram Web Preview (`tg_web`) and PanSou providers,
+  configurable independently of playback; pooled HTTP, bounded search budgets
+  and per-node circuit-breaker diagnostics.
 - Atomic search configuration reload: new requests use the new snapshot while
   running requests finish with their original snapshot.
 - Exact movie/episode identity matching before quality ranking.
 - Durable transfer intents to recover ambiguous upstream results.
+- Variant-isolated movie/episode state, precise file selection, optional
+  companion subtitles and scout-account read/write separation.
+- Source replacement that verifies and activates the candidate before retiring
+  the previous file; durable journals and SQLite commit receipts support recovery.
+- Optional next-episode prefetch and deduplicated Telegram/Bark/WeCom/Webhook
+  notifications. Unconfigured integrations remain disabled.
 - Stable `/play` STRM links and bounded streaming caches.
 - Token-protected management APIs and a packaged administration page.
 - A standalone data directory with no required home-server layout.
@@ -27,6 +35,14 @@ by the service and player. Standalone mode returns ready playback URLs without
 generating STRM files; optional Jellyfin mode uses an existing stable STRM library
 mapping. No external AI, cloud-write probe, self-healing loop or maintenance is
 enabled by default.
+
+This local candidate is **3.1.1rc3**, based on 3.1.0, with state schema 3. See the
+[release notes and upgrade requirements](docs/releases/3.1.0.md) and the
+[transfer/recovery contract](docs/transfer-evolution.md). The
+[development record](docs/development-20261125.md) documents earlier isolated
+testing; it is not a claim of complete production playback validation.
+Existing 3.0.1 deployments use schema 2: stop all old writers and verify a
+SQLite backup before migration.
 
 ## Quick start with Docker
 
@@ -73,7 +89,9 @@ Changes are checked on subsequent searches; the authenticated reload endpoint ca
 validate and apply them immediately. An invalid replacement keeps the last valid
 snapshot.
 
-Built-in `html` and `json` providers require no code installation. Trusted Python
+Built-in `html`, `json`, `tg_web` and `pansou` providers require no Python
+plugin installation. PanSou itself is a separately deployed service; configuring
+the provider does not install or start that service. Trusted Python
 providers can be registered through `quark_vod.search` entry points and explicitly
 enabled with `VOD_SEARCH_PLUGINS`. Installing new Python code requires a process
 restart; changing the nodes of an installed provider does not.
@@ -116,3 +134,9 @@ exclude legacy bundled FFmpeg/jq binaries.
 
 [MIT](LICENSE). Third-party dependencies retain their original licenses; see
 [NOTICE](NOTICE).
+
+## 本机 3.1.1rc3 通知设置
+
+本机固定候选，未发布到公共包索引或镜像 registry。管理员可在管理台的“通知”页填写 Telegram Bot token 和数字 Chat ID，保存后立即生效，再用“发送测试通知”检查 Telegram 是否接受消息。页面不回显密钥，留空保留已有密钥；保存不会自动发送消息。完整使用与配置优先级见[通知设置](docs/notification-settings.md)。
+
+未保存网页设置时，通知器沿用显式 `VOD_ENV_FILE` 与进程配置；密钥支持对应 `_FILE`，进程显式空值优先，不隐式读取 `.env`。网页保存后，服务端持久文件对 Telegram 与 P2 开关生效，Bark、企业微信及通用 Webhook 仍沿用原配置。schema 保持 3。宿主心愿单使用独立配置，不因启用通知而自动启用。

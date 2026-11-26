@@ -5,7 +5,7 @@ result means the saved file is readable. With Jellyfin enabled, its exact librar
 STRM must also be activated; standalone playback does not write a media library.
 A timeout never starts a second save while the original job is still running.
 """
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed
 from collections import OrderedDict
 from dataclasses import dataclass
 import json
@@ -29,10 +29,12 @@ _client_lock = threading.RLock()
 _in_flight_lock = threading.Lock()
 _in_flight_transfers = {}
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='vod-resolve')
+_inspection_executor=ThreadPoolExecutor(max_workers=3,thread_name_prefix='vod-preview')
+_inspection_slots=threading.BoundedSemaphore(6)
 MAX_PENDING_JOBS = 16
 _ready_results = OrderedDict()
 _ready_lock = threading.Lock()
-READY_TTL = 30
+READY_TTL = 300
 DEAD_SHARE_MARKERS = ('41011', '41012', '41031', '41010', '已取消了分享', '已失效', '已过期', '违规', '封禁')
 
 
@@ -60,6 +62,8 @@ def get_openlist():
             _ol = OpenListClient()
             _ol_err = ''
         except Exception as exc:
+            from .operational_events import emit
+            emit('playback_backend_failed',exc)
             _ol_err = type(exc).__name__
             _ol_retry_at = time.monotonic() + 10
         return _ol
@@ -81,28 +85,29 @@ def _direct_url(remote_path):
     return config.OPENLIST_PUBLIC + '/d' + urllib.parse.quote(config.play_path(remote_path))
 
 
-def _wait_direct_url_ready(direct_url, remote_path=None, max_wait=12):
-    deadline = time.monotonic() + max_wait
-    refreshed = False
-    while time.monotonic() < deadline:
-        try:
-            req = urllib.request.Request(direct_url, headers={'Range': 'bytes=0-31', 'User-Agent': 'curl/8.5.0'})
-            with download_http.urlopen(req, timeout=min(4, max(.1, deadline-time.monotonic()))) as response:
-                head = response.read(32)
-                content_type = response.headers.get('Content-Type', '').lower()
-                if response.status in (200, 206) and head and not any(t in content_type for t in ('text/html', 'application/json')):
-                    return True
-        except Exception:
-            pass
-        if not refreshed and remote_path:
-            refreshed = True
-            ol = get_openlist()
+def _wait_direct_url_ready(direct_url, remote_path=None, max_wait=13):
+    deadline=time.monotonic()+max_wait
+    delays=iter((.5,1.,2.,3.5,5.))
+    while time.monotonic()<deadline:
+        if remote_path:
+            ol=get_openlist()
             if ol:
-                try:
-                    ol.refresh_path_tree(config.play_path(remote_path))
-                except Exception:
-                    pass
-        time.sleep(.3)
+                try:ol.refresh_path_tree(config.play_path(remote_path))
+                except Exception:pass
+        try:
+            req=urllib.request.Request(direct_url,headers={'Range':'bytes=0-63','User-Agent':'curl/8.5.0'})
+            with download_http.urlopen(req,timeout=min(4,max(.1,deadline-time.monotonic()))) as response:
+                head=response.read(64)
+                content_type=response.headers.get('Content-Type','').lower()
+                if response.status in (200,206) and head and not any(value in content_type for value in ('text/html','application/json')):
+                    cleaner.remember_probe(direct_url,head)
+                    return True
+        except Exception:pass
+        delay=next(delays,5)
+        if time.monotonic()+delay>=deadline:break
+        time.sleep(delay)
+    from .operational_events import emit
+    emit('playback_backend_failed')
     return False
 
 
@@ -140,25 +145,38 @@ def _finish(work, tid, remote):
     # activation gate for integrated deployments (including mapping failures).
     if config.VOD_JELLYFIN_ENABLED:
         try:
-            strm_manager.activate(*work.args, url)
+            strm_manager.activate(*work.args, url, **work.options)
         except Exception as exc:
             raise PlaybackUnavailable('文件可读，但片库映射更新失败', 'activation_failed') from exc
     # This is a successful resolution/access, not proof of actual watch progress.
     # No automatic permanent pin; real watch/favourite protection comes from Jellyfin.
     db.record_access(tid)
+    try:
+        from .subtitles import schedule_pending
+        schedule_pending()
+    except Exception:pass
     if remote.lower().endswith(('.mp4','.m4v','.mov','.mp41')):
         from . import media_cache
         skip=int((urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get('skip') or ['0'])[0]) if '/clean?' in url else 0
         url=media_cache.playback_url(db.get_transfer_by_id(tid),skip)
+    if os.environ.get('VOD_PREFETCH_ENABLED','0').lower() in ('1','true','yes'):
+        try:
+            from .prefetch import prefetcher
+            prefetcher.schedule(work)
+        except Exception:pass
     return PlaybackResult(url, tid, remote)
 
 
 def _resolve_once(work):
     from . import search
-    # The season-level lock also prevents two episodes saving the same package.
-    lock_name = 'work:' + repr((work.cat, work.title.casefold(), work.season))
+    # Saved playback never waits behind a slow save of another episode.
+    with coordination.playback_lease():
+        row=db.find_done_transfer(*work.args, **work.options)
+        if row and _remote_still_exists(row['remote_path']):
+            return _finish(work,row['id'],row['remote_path'])
+    lock_name = 'work:' + repr(work.key)
     with coordination.playback_lease(), coordination.file_lock(lock_name, timeout=config.TRANSFER_TIMEOUT):
-        row = db.find_done_transfer(*work.args)
+        row = db.find_done_transfer(*work.args, **work.options)
         if row and not _remote_still_exists(row['remote_path']):
             if not cleanup._restore_all(row, verbose=False):
                 raise PlaybackUnavailable('远端文件已失效，但片库占位恢复失败', 'restore_failed')
@@ -183,12 +201,12 @@ def _resolve_once(work):
             tried.add(candidate.share_url)
             try:
                 # transfer validates the target file before saving it.
-                tid, remote = tr.transfer(*work.args, candidate.share_url)
+                tid, remote = tr.transfer(*work.args, candidate.share_url, **work.options)
             except Exception as exc:
                 from .transfer import TransferNotReady
                 if isinstance(exc, TransferNotReady):
                     raise PlaybackUnavailable(str(exc), 'transfer_unconfirmed') from exc
-                state = db.get_transfer(*work.args)
+                state = db.get_transfer(*work.args, **work.options)
                 if state and state['save_started_at']:
                     raise PlaybackUnavailable('上次转存结果尚未确认，请稍后重试', 'transfer_unconfirmed') from exc
                 last_error = exc
@@ -203,7 +221,7 @@ def _resolve_once(work):
             return _finish(work, tid, remote)
 
         # Resume a durable save before consulting public search or switching source.
-        unfinished = db.get_transfer(*work.args)
+        unfinished = db.get_transfer(*work.args, **work.options)
         if unfinished and unfinished['save_started_at'] and unfinished['share_url']:
             pending = search.SearchResult(engine='panshare',source='resume',name=work.title,year='',
                                           poster='',episodes=[],share_url=unfinished['share_url'],pan_type='quark')
@@ -212,7 +230,7 @@ def _resolve_once(work):
                 return result
 
         # Locked shares remain useful even when public search nodes are down.
-        locked, _, locked_title = db.get_locked_4k_share(*work.args)
+        locked, _, locked_title = db.get_locked_4k_share(*work.args, **work.options)
         if locked:
             candidate = search.SearchResult(engine='panshare', source='locked', name=locked_title or work.title,
                                            year='', poster='', episodes=[], share_url=locked, pan_type='quark')
@@ -229,6 +247,36 @@ def _resolve_once(work):
                                                 work.cat, aliases=aliases)
         except Exception as exc:
             raise PlaybackUnavailable('片源搜索暂不可用，请稍后重试', 'search_unavailable') from exc
+        if hasattr(tr,'inspect_share_video') and len(candidates)>1:
+            from .quality import video_rank
+            ranked=[]
+            previews={}
+            def preview(candidate):
+                try:
+                    return tr.inspect_share_video(candidate.share_url,title,work.season,work.episode,
+                                                  timeout=8,aliases=aliases,**work.options)
+                finally:db.close()
+            for candidate in candidates[:3]:
+                if not _inspection_slots.acquire(blocking=False):break
+                try:
+                    future=_inspection_executor.submit(preview,candidate)
+                    future.add_done_callback(lambda _: _inspection_slots.release())
+                    previews[future]=candidate
+                except Exception:
+                    _inspection_slots.release()
+            try:
+                for future in as_completed(previews,timeout=9):
+                    try:
+                        checked=future.result()
+                        if isinstance(checked,dict):ranked.append((video_rank(checked),previews[future]))
+                    except Exception:pass
+            except FutureTimeout:pass
+            finally:
+                for future in previews:
+                    if not future.done():future.cancel()
+            if ranked:
+                order=[candidate for _,candidate in sorted(ranked,key=lambda pair:pair[0],reverse=True)]
+                candidates=order+[candidate for candidate in candidates if candidate not in order]
         search_deadline = time.monotonic() + config.TRANSFER_TIMEOUT
         for candidate in candidates[:8]:
             if time.monotonic() > search_deadline:
@@ -258,6 +306,8 @@ def _run(work):
     except Exception as exc:
         print(f'[{config.SERVICE_NAME}] 点播失败 {work.title}: {type(exc).__name__}', flush=True)
         raise PlaybackUnavailable('点播暂时失败，请稍后重试') from exc
+    finally:
+        db.close()
 
 
 def _submit(work):
@@ -288,7 +338,7 @@ def invalidate_transfer_cache(transfer_id):
 def resolve_playback(work):
     # Recover the unique dated library identity for legacy undated URLs before
     # reserving a task; otherwise aliases could save the same film concurrently.
-    work = Work(work.cat, db.library_title(*work.args), work.season, work.episode)
+    work = Work(work.cat, db.library_title(*work.args, **work.options), work.season, work.episode, work.variant)
     # A player can reopen hundreds of byte ranges for one MP4 seek. Repeating
     # cloud existence/readiness checks for each one adds a network round trip
     # per packet. Reuse only successful resolutions for a fixed short interval,
@@ -297,7 +347,7 @@ def resolve_playback(work):
         cached=_ready_results.get(work.key)
     if cached and cached[0]>time.monotonic():
         with coordination.playback_lease():
-            row=db.find_done_transfer(*work.args)
+            row=db.find_done_transfer(*work.args, **work.options)
             if row and row['id']==cached[1].transfer_id and row['remote_path']==cached[1].remote_path:
                 return cached[1]
     future, _ = _submit(work)
@@ -312,9 +362,9 @@ def resolve_playback(work):
         raise PlaybackUnavailable('转存仍在后台执行，请稍后重试', 'in_progress') from exc
 
 
-def trigger_preheat_task(cat, title, season=0, episode=0):
+def trigger_preheat_task(cat, title, season=0, episode=0, *, variant=""):
     cat, season, episode, _ = _resolve_strm_row(cat, title, season, episode)
-    work = Work(cat, db.library_title(cat,title,season,episode), season, episode)
+    work = Work(cat, db.library_title(cat,title,season,episode, **({"variant":variant} if variant else {})), season, episode, variant)
     _, started = _submit(work)  # reservation precedes background execution
     if started:
         db.pin_item(work.cat, work.title, reason='preheated')
@@ -326,7 +376,7 @@ class Handler:
     def _handle_pending(self, q):
         try:
             work = Work(q.get('cat', [''])[0], q.get('t', [''])[0],
-                        int(q.get('s', ['0'])[0]), int(q.get('e', ['0'])[0]))
+                        int(q.get('s', ['0'])[0]), int(q.get('e', ['0'])[0]), q.get('variant',[''])[0])
             if not work.cat:
                 raise ValueError('missing cat')
             result = resolve_playback(work)
@@ -339,7 +389,8 @@ class Handler:
     def _handle_preheat(self, q):
         try:
             ok, status = trigger_preheat_task(q.get('cat',[''])[0], q.get('t',[''])[0],
-                                             int(q.get('s',['0'])[0]), int(q.get('e',['0'])[0]))
+                                             int(q.get('s',['0'])[0]), int(q.get('e',['0'])[0]),
+                                             variant=q.get('variant',[''])[0])
             return self._json(202, {'ok':ok,'status':status})
         except ValueError as exc:
             return self._json(400, {'error':str(exc)})
