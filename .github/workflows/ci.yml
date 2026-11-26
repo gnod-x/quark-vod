@@ -39,7 +39,7 @@ jobs:
             python - "$scratch/regression.log" <<'PY'
           import pathlib, sys
           # Annotations remain available through the public checks API when raw logs need login.
-          message = pathlib.Path(sys.argv[1]).read_text(errors="replace")[-12000:]
+          message = pathlib.Path(sys.argv[1]).read_text(errors="replace")[-3500:]
           message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
           print("::error title=Source distribution regression failure::" + message)
           PY
