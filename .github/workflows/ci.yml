@@ -26,25 +26,64 @@ jobs:
           docker compose config --quiet
       - run: python -m build
       - name: Run the shipped regression suite from the source distribution
+        env:
+          REGRESSION_LOG: ${{ runner.temp }}/quark-vod-sdist-regression-${{ matrix.python-version }}.log
         run: |
           scratch=$(mktemp -d)
           trap 'rm -rf -- "$scratch"' EXIT
           tar -xzf dist/*.tar.gz -C "$scratch"
           cd "$scratch"/quark_vod-*
           test ! -e Makefile.homelab
-          if make test > "$scratch/regression.log" 2>&1; then
-            cat "$scratch/regression.log"
+          if make test > "$REGRESSION_LOG" 2>&1; then
+            grep -E '^(Ran [0-9]+ tests?|OK|FAILED \()' "$REGRESSION_LOG" || true
           else
-            cat "$scratch/regression.log"
-            python - "$scratch/regression.log" <<'PY'
-          import pathlib, sys
-          # Annotations remain available through the public checks API when raw logs need login.
-          message = pathlib.Path(sys.argv[1]).read_text(errors="replace")[-3500:]
-          message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            python - "$REGRESSION_LOG" <<'PY'
+          import pathlib, re, sys
+
+          lines = pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          selected = []
+          i = 0
+          while i < len(lines):
+              line = lines[i]
+              if re.match(r"^(FAIL|ERROR): ", line):
+                  selected.append(line)
+              if line.startswith("Traceback (most recent call last):"):
+                  block = [line]
+                  i += 1
+                  while i < len(lines) and lines[i].strip():
+                      block.append(lines[i])
+                      i += 1
+                  selected.extend(block[:2] + (["... traceback frames omitted ..."] if len(block) > 10 else []) + block[-8:])
+              elif re.match(r"^(Ran [0-9]+ tests?|OK|FAILED \()", line):
+                  selected.append(line)
+              i += 1
+          if not selected:
+              selected = ["No unittest failure markers found; inspect uploaded regression log."]
+          # Escape only the workflow-command metacharacters; cap encoded UTF-8 bytes.
+          def escape(value):
+              return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          chunks = []
+          size = 0
+          for line in reversed(selected):
+              chunk = escape(line)
+              if size + len(chunk.encode()) + 3 > 3500:
+                  break
+              chunks.append(chunk)
+              size += len(chunk.encode()) + 3
+          message = "%0A".join(reversed(chunks))
+          if not message:
+              message = "Failure detail exceeds annotation limit; inspect uploaded regression log."
           print("::error title=Source distribution regression failure::" + message)
           PY
             exit 1
           fi
+      - name: Upload source distribution regression log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist-regression-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/quark-vod-sdist-regression-${{ matrix.python-version }}.log
+          if-no-files-found: ignore
       - name: Start both installed distributions outside the source tree
         run: |
           artifacts=("$PWD"/dist/*.whl "$PWD"/dist/*.tar.gz)

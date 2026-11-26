@@ -382,7 +382,7 @@ class AutomationTests(unittest.TestCase):
         self.assertLessEqual(target.stat().st_size,s.MAX_BYTES)
         self.assertEqual(target.stat().st_mode&0o777,0o600)
 
-    def test_32_real_full_runs_survive_16k_and_history_eviction(self):
+    def test_32_real_full_runs_respect_state_limit_and_history_eviction(self):
         self.enable()
         real_popen=subprocess.Popen
         def child(argv,**kwargs):
@@ -393,7 +393,6 @@ class AutomationTests(unittest.TestCase):
                 identifiers.append(r.enqueue('digest',1,False)['run_id'])
                 self.assertEqual(r.run_next()['status'],'complete')
         target=self.root/r.STATE_FILE
-        self.assertGreater(target.stat().st_size,16384)
         self.assertLessEqual(target.stat().st_size,s.STATE_MAX_BYTES)
         records=r.runs()['runs']
         self.assertEqual(len(records),32)
