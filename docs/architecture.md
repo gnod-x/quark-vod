@@ -1,7 +1,8 @@
 # Architecture
 
-Quark-VOD is a single-process FastAPI service for discovering Quark shares,
-saving selected media, and resolving playback. Search providers are configurable;
+Quark-VOD provides a single-worker FastAPI service for discovering Quark shares,
+saving selected media, and resolving playback. An optional independent automation
+worker executes packaged cinema/library tasks; it is not started by the API. Search providers are configurable;
 Quark authorization and save-task handling remain part of the core. OpenList is
 the current adapter for remote storage and playback URLs.
 
@@ -106,8 +107,11 @@ that backup.
 
 The supported service topology is one process and one ASGI worker. Resolver
 reservations, semaphores, and caches are process-local; they are not a distributed
-job queue. Host-side jobs that share a library must also use the data directory's
-lock files so maintenance cannot race playback or another maintenance run.
+job queue. Packaged integration jobs and other host-side jobs sharing a library must use
+the data directory's lock files so maintenance cannot race playback or another
+maintenance run. The independent automation queue is described in
+[automation](automation.md); cinema and code ownership are described in
+[unified architecture](unified-cinema.md).
 Upgrades are single-writer operations, not rolling deployments: stop every old
 service process and host-side state writer before starting a new version. Startup
 locking serializes schema initialization, but it cannot prevent an already-running

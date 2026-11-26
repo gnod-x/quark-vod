@@ -3,9 +3,9 @@ services:
     build:
       context: .
       args:
-        VOD_VERSION: "${QUARK_VOD_IMAGE_VERSION:-3.1.1rc3}"
+        VOD_VERSION: "${QUARK_VOD_IMAGE_VERSION:-3.2.0a1}"
         VCS_REF: "${QUARK_VOD_IMAGE_REVISION:-unknown}"
-    image: quark-vod:${QUARK_VOD_IMAGE_VERSION:-3.1.1rc3}
+    image: quark-vod:${QUARK_VOD_IMAGE_VERSION:-3.2.0a1}
     restart: unless-stopped
     env_file:
       - .env
@@ -41,6 +41,43 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+  # Optional independent task worker. Enable with --profile automation.
+  # Configure tasks in the management page before enabling any schedule.
+  quark-vod-worker:
+    profiles: ["automation"]
+    image: quark-vod:${QUARK_VOD_IMAGE_VERSION:-3.2.0a1}
+    command: ["jobs", "worker", "--execute"]
+    restart: unless-stopped
+    depends_on:
+      quark-vod:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      VOD_BASE_DIR: /data
+      VOD_API_BASE: http://quark-vod:8099
+      VOD_SEARCH_CONFIG: /config/search.json
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - quark_vod_data:/data
+      - ./examples:/config:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 128
+    stop_grace_period: 30s
 
 volumes:
   quark_vod_data:

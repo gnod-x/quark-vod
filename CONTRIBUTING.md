@@ -1,6 +1,6 @@
 # Contributing
 
-Quark-VOD is developed as a portable Python service. Keep tests independent of real Quark accounts, OpenList credentials, private media libraries and operator AI services. The public package and the local home-server integration have separate ownership and validation paths.
+Quark-VOD is developed as a portable Python service. Keep tests independent of real Quark accounts, OpenList credentials, private media libraries and operator AI services. The package includes opt-in cinema and hometheater integrations; deployment-specific data and configuration remain outside the source tree.
 
 ## Development setup
 
@@ -20,10 +20,11 @@ python -m build --sdist --wheel
 
 Runtime dependencies remain declared as supported compatibility ranges in `pyproject.toml`, not frozen to one machine's resolution. CI resolves those ranges on each supported Python version. Update dependency bounds intentionally and keep the 3.11–3.13 test matrix green; do not copy a local environment's exact package versions into the runtime contract.
 
-Deployment-specific portal, host-job and playback-wrapper tests are maintained
-with the deployment adapter. Its optional Makefile targets and fixtures are not
-shipped in this standalone source tree or source distribution. Run those checks
-from the deployment checkout when changing an integration.
+The cinema API, task settings/runner and portable integration regressions ship
+with the source distribution. Run them without real credentials. Browser checks
+use local fixtures and must verify desktop/mobile behavior, authorization,
+revision conflicts and unavailable integrations. FFmpeg wrapper checks use fake
+executables or synthetic media; do not point tests at a real playback session.
 
 ## Publishing a release
 
@@ -47,3 +48,24 @@ Release creation fails if a release with that tag already exists. Investigate a 
 - Preserve existing source ownership and third-party notices. Do not add bundled binaries without the corresponding redistribution rights and notices.
 
 Never commit cookies, tokens, signed media URLs, account databases, user state, private deployment paths, generated build output or local search configuration. See [security boundaries](SECURITY.md) before changing authentication, network access or maintenance behavior.
+
+## Unified browser and business wiring checks
+
+With Playwright and Chromium available in the development environment:
+
+```sh
+PYTHONPATH=app python tests/verify_unified_ui.py
+PYTHONPATH=app python tests/verify_unified_live.py
+PYTHONPATH=app python tests/verify_cinema_wiring.py
+```
+
+These tests start local fixtures or an isolated API with temporary state, use
+synthetic management credentials and clean their own processes. They do not
+contact a real Quark account or AI model. Browser evidence is kept outside the
+source distribution.
+
+After installing a wheel or source distribution in a fresh virtual environment,
+run its Python outside the checkout with `-BI /absolute/path/tests/verify_installed.py`.
+This verifies the installed CLI, HTTP authentication, model settings, shared
+API/worker state, nine disabled task defaults, package-local imports and wrapper
+export with temporary state. CI and release checks use this same verifier.

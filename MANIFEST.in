@@ -1,10 +1,11 @@
-include README.md LICENSE NOTICE SECURITY.md CONTRIBUTING.md pyproject.toml requirements.txt Makefile Dockerfile docker-compose.yml .env.example .dockerignore .gitignore
-recursive-include app/quark_vod *.py *.html
+include README.md CLAUDE.md LICENSE NOTICE SECURITY.md CONTRIBUTING.md pyproject.toml requirements.txt Makefile Dockerfile docker-compose.yml .env.example .dockerignore .gitignore
+recursive-include app/quark_vod *.py *.html *.js *.css *.json
+recursive-include app/quark_vod/integrations/jellyfin/scripts *
 include app/main.py
 recursive-include examples *.json
 exclude examples/search.json
 recursive-include .github/workflows *.yml *.yaml
-include tests/test_*.py
+recursive-include tests *.py *.js *.sql *.json
 include tests/check_sync.py
 recursive-include tests/fixtures *.sql
 recursive-include docs *.md

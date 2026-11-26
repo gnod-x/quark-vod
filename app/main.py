@@ -27,6 +27,9 @@ from quark_vod import coordination
 from quark_vod import media_cache
 from quark_vod import search_plugins
 from quark_vod import download_http, prefetch, notifier, notification_settings
+from quark_vod.admin_auth import require_admin
+from quark_vod.automation_api import router as automation_router
+from quark_vod.cinema_api import create_router as create_cinema_router
 
 
 class MediaResponse(StreamingResponse):
@@ -138,6 +141,10 @@ app = FastAPI(
     version=__version__,
     lifespan=lifespan,
 )
+
+
+app.include_router(automation_router)
+app.include_router(create_cinema_router(require_admin))
 
 
 @app.middleware("http")

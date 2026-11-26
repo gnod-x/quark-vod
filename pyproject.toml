@@ -27,10 +27,11 @@ dependencies = [
   "httpx>=0.27,<1",
   "pypinyin>=0.53,<1",
   "python-dotenv>=1.0,<2",
+  "tzdata>=2025.1",
 ]
 
 [project.optional-dependencies]
-test = ["build>=1.2,<2"]
+test = ["build>=1.2,<2", "cryptography>=44,<50"]
 wishlist = ["cryptography>=44,<50"]
 
 [project.scripts]
@@ -46,7 +47,7 @@ where = ["app"]
 include = ["quark_vod", "quark_vod.*"]
 
 [tool.setuptools.package-data]
-quark_vod = ["static/*.html"]
+quark_vod = ["static/*.html", "static/*.js", "static/*.css", "integrations/hometheater/*.json", "integrations/jellyfin/scripts/*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "quark_vod.__version__"}

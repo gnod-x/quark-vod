@@ -44,6 +44,37 @@ testing; it is not a claim of complete production playback validation.
 Existing 3.0.1 deployments use schema 2: stop all old writers and verify a
 SQLite backup before migration.
 
+## Unified cinema and automation (3.2 alpha)
+
+The packaged administration page now includes Cinema and Tasks & Models. Cinema
+supports discovery, movie/season/episode selection, exact-file inspection,
+subscriptions, source replacement and task progress using authenticated APIs.
+Optional Jellyfin integration owns STRM activation, protection checks and refresh.
+The hometheater integration is shipped in this package; a sibling checkout is
+not required. TV/IPTV and the general home-server dashboard remain separate.
+
+Automatic scheduling and every task start disabled. Configure task schedules,
+timezone, model endpoint, primary/fallback model names and per-stage reasoning
+in Tasks & Models. Model credentials still come only from explicit environment
+or credential files. Settings are revisioned and atomically stored in the data
+directory. A separate worker executes tasks; the HTTP process never starts a
+nightly batch merely because the page was opened.
+
+```sh
+quark-vod serve --env /path/to/private.env
+quark-vod jobs --env /path/to/private.env list
+quark-vod jobs --env /path/to/private.env worker --execute
+```
+
+Docker deployments can opt into the separate worker with
+`docker compose --profile automation up -d`. The default Compose start still
+runs only the API.
+
+Workers and the API must use the same installed version, data directory and
+configuration. See [automation](docs/automation.md), [unified architecture](docs/unified-cinema.md)
+and [migration](docs/unified-migration.md). The Jellyfin FFmpeg/ffprobe wrappers
+ship as source scripts only; third-party binaries are installed separately.
+
 ## Quick start with Docker
 
 Requires Docker Engine with Compose v2.

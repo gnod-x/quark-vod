@@ -5,10 +5,11 @@ distribution. Python dependencies and container base-system components retain
 their own licenses. The Docker image installs those dependencies; its complete
 contents are not relicensed under this project's MIT license.
 
-Legacy host-provided FFmpeg, ffprobe, jq and associated media shared-library
-bundles are excluded from the Python wheel, source distribution and image build
-context. This notice describes the packaging boundary, not an exhaustive
-historical provenance or dependency-license audit.
+The optional Jellyfin integration includes project-owned FFmpeg/ffprobe wrapper
+scripts. Actual FFmpeg, ffprobe, jq and media shared-library binaries are not
+bundled in the wheel or source distribution. Install these upstream components
+separately under their own licenses. This notice describes the packaging boundary,
+not an exhaustive historical provenance or dependency-license audit.
 
 Quark and other product names identify integrations with independent services.
 This project is not an official client of those services.

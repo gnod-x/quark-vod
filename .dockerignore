@@ -23,3 +23,9 @@ openlist
 custom-ffmpeg
 .backups
 tests
+
+incoming
+.evidence
+CLAUDE.md
+
+evidence/

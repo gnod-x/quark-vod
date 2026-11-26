@@ -25,3 +25,8 @@ jellyfin2/
 openlist/
 examples/search.json
 .backups/
+
+incoming/
+.evidence/
+
+evidence/

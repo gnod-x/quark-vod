@@ -36,6 +36,7 @@ jobs:
       - name: Start both installed distributions outside the source tree
         run: |
           artifacts=("$PWD"/dist/*.whl "$PWD"/dist/*.tar.gz)
+          verifier="$PWD/tests/verify_installed.py"
           scratch=$(mktemp -d)
           trap 'rm -rf -- "$scratch"' EXIT
           cd "$scratch"
@@ -45,33 +46,7 @@ jobs:
             "$venv/bin/python" -m pip install --no-cache-dir "$artifact"
             "$venv/bin/quark-vod" --help
             "$venv/bin/quark-vod" --version
-            "$venv/bin/python" -BI - <<'PY'
-          import asyncio
-          from importlib.metadata import version
-          from importlib.resources import files
-          import os
-          from pathlib import Path
-          import sys
-          import tempfile
-
-          import quark_vod
-          from quark_vod.api import create_app
-
-          assert Path(quark_vod.__file__).is_relative_to(sys.prefix)
-          assert files("quark_vod").joinpath("static/admin.html").is_file()
-
-          async def start():
-              app = create_app()
-              from quark_vod import db
-
-              assert app.version == quark_vod.__version__ == version("quark-vod")
-              async with app.router.lifespan_context(app):
-                  assert db._conn().execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
-
-          with tempfile.TemporaryDirectory() as state:
-              os.environ["VOD_BASE_DIR"] = state
-              asyncio.run(start())
-          PY
+            "$venv/bin/python" -BI "$verifier"
           done
       - uses: actions/upload-artifact@v4
         with:

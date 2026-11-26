@@ -357,3 +357,17 @@ remain errors. Dangling symlinks escaping the external root, including links
 toward missing library images, are rejected. Library references retain their
 strict completeness checks. Configure paths for each executing process; host
 filesystem visibility does not imply that a container has the same mounts.
+
+## Optional unified cinema and task worker
+
+The same packaged administration page exposes Cinema and Tasks & Models.
+Configure TMDB metadata credentials and optional Jellyfin integration explicitly.
+Task scheduling, each task and AI start disabled. Model IDs and schedules are
+page-managed settings; API secrets stay in environment/files.
+
+For a native installation, run a separate process using the same version, data
+directory and environment: `quark-vod jobs --env /path/to/private.env worker --execute`.
+Docker users may enable the optional worker using
+`docker compose --profile automation up -d`. Do not leave the old cron tasks
+active for the same library. See [automation](automation.md) and the
+[migration guide](unified-migration.md) before switching an existing deployment.

@@ -15,4 +15,4 @@ __all__ = [
     "strm_manager", "server", "cleanup",
 ]
 
-__version__ = "3.1.1rc3"
+__version__ = "3.2.0a1"
